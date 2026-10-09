@@ -178,6 +178,10 @@ func (r Releases) Install(ctx context.Context, version, arch, path string) error
 	if err == nil {
 		err = f.Sync()
 	}
+	if err == nil {
+		// On the open file, not by name, like WriteResult.
+		err = f.Chmod(0o755)
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -186,9 +190,6 @@ func (r Releases) Install(ctx context.Context, version, arch, path string) error
 	}
 	if got := h.Sum(nil); !bytes.Equal(got, want) {
 		return fmt.Errorf("upgrade: %s does not match its sum in %s: got %x, want %x", asset, Sums, got, want)
-	}
-	if err := os.Chmod(f.Name(), 0o755); err != nil {
-		return fmt.Errorf("upgrade: %w", err)
 	}
 	// The old binary stays reachable as a second name of the same file,
 	// so path always names a whole binary: the old one until the rename,
@@ -225,12 +226,14 @@ func WriteResult(path, text string) error {
 	if err != nil {
 		return err
 	}
+	// The mode is set on the open file, not by name: the name could be
+	// swapped for a link by then.
 	_, err = f.WriteString(text + "\n")
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
-	}
-	if err == nil {
-		err = os.Chmod(f.Name(), 0o644)
 	}
 	if err == nil {
 		err = os.Rename(f.Name(), Result(path))
