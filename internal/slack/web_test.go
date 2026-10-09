@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,18 +27,20 @@ type request struct {
 }
 
 // testSlack stands in for Slack's Web API. answer gets each request and
-// returns the HTTP status and the JSON body; a 429 comes with Retry-After: 2.
-// answer runs with mu held, so a test changes what it answers under mu.
+// returns the HTTP status and the JSON body; a 429 comes with retryAfter
+// in Retry-After. answer runs with mu held, so a test changes what it
+// answers under mu.
 type testSlack struct {
-	mu       sync.Mutex
-	requests []request
-	waits    []time.Duration
+	mu         sync.Mutex
+	retryAfter string
+	requests   []request
+	waits      []time.Duration
 }
 
 // newTestWeb returns a Web that calls a test server answering with answer,
 // and records the waits it is asked for instead of sleeping.
 func newTestWeb(t *testing.T, answer func(r request) (int, string)) (*Web, *testSlack, *httptest.Server) {
-	ts := &testSlack{}
+	ts := &testSlack{retryAfter: "2"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, hr *http.Request) {
 		if err := hr.ParseForm(); err != nil {
 			t.Error(err)
@@ -46,10 +49,10 @@ func newTestWeb(t *testing.T, answer func(r request) (int, string)) (*Web, *test
 		ts.mu.Lock()
 		ts.requests = append(ts.requests, r)
 		status, body := answer(r)
-		ts.mu.Unlock()
 		if status == http.StatusTooManyRequests {
-			w.Header().Set("Retry-After", "2")
+			w.Header().Set("Retry-After", ts.retryAfter)
 		}
+		ts.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		w.Write([]byte(body))
@@ -194,6 +197,18 @@ func TestWebRateLimit(t *testing.T) {
 	rs, waits = ts.got()
 	if len(rs) != 3+maxRetries+1 || len(waits) != 2+maxRetries {
 		t.Errorf("%d requests and %d waits in all, want %d and %d", len(rs), len(waits), 3+maxRetries+1, 2+maxRetries)
+	}
+
+	ts.mu.Lock()
+	limited = 1
+	ts.retryAfter = strconv.Itoa(int(maxWait/time.Second) + 1)
+	ts.mu.Unlock()
+	if _, err := w.Post(ctx, "C1", "hi"); !errors.As(err, &rl) {
+		t.Errorf("Post asked to wait longer than maxWait: err = %v, want a rate limit error", err)
+	}
+	rs, waits = ts.got()
+	if len(rs) != 3+maxRetries+2 || len(waits) != 2+maxRetries {
+		t.Errorf("asked to wait longer than maxWait, it sent %d requests and waited %d times in all, want %d and %d", len(rs), len(waits), 3+maxRetries+2, 2+maxRetries)
 	}
 }
 

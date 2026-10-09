@@ -13,6 +13,11 @@ import (
 // each after the wait Slack asks for in Retry-After, before it fails.
 const maxRetries = 3
 
+// maxWait is the longest Retry-After a call waits out; a longer one fails
+// the call at once, so a call cannot wait without bound even when its
+// context has no deadline.
+const maxWait = time.Minute
+
 // Web is the API backed by Slack's Web API. It calls Slack with the bot
 // token it was made with, and writes no logs.
 type Web struct {
@@ -38,13 +43,14 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // call runs f, the Web API method named method, again while Slack
-// rate-limits it, at most maxRetries times. A request Slack rate-limits is
+// rate-limits it, at most maxRetries times and each time for at most
+// maxWait. A request Slack rate-limits is
 // not carried out, so running f again does not post twice.
 func (w *Web) call(ctx context.Context, method string, f func() error) error {
 	for retries := 0; ; retries++ {
 		err := f()
 		var limited *slackgo.RateLimitedError
-		if !errors.As(err, &limited) || retries == maxRetries {
+		if !errors.As(err, &limited) || retries == maxRetries || limited.RetryAfter > maxWait {
 			return wrap(method, err)
 		}
 		if err := w.sleep(ctx, limited.RetryAfter); err != nil {
