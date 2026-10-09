@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -514,5 +515,65 @@ func TestCloseRefusesHandshakeInFlight(t *testing.T) {
 	h.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("%d sessions registered after Close", n)
+	}
+}
+
+// waitForGoroutine polls the goroutine stacks until one contains every
+// substring in want, as a barrier on where another goroutine has got to.
+func waitForGoroutine(t *testing.T, want ...string) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	waitFor(t, "a goroutine at "+strings.Join(want, " and "), func() bool {
+		for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+			ok := true
+			for _, w := range want {
+				ok = ok && strings.Contains(g, w)
+			}
+			if ok {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestClosingAConnectionDoesNotWaitOnPing pins the interleaving in which a
+// ping callback is blocked on the hub's lock while the lock holder goes on
+// to close that same connection: closing waits for the reader, which is
+// inside the callback. Both ways of closing a connection are covered.
+func TestClosingAConnectionDoesNotWaitOnPing(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		waits string
+		close func(h *Hub, srv *httptest.Server)
+	}{
+		{"Close", "link.(*Hub).Close", func(h *Hub, _ *httptest.Server) { h.Close() }},
+		{"replacement", "link.(*Hub).register", func(_ *Hub, srv *httptest.Server) { dialHub(t, srv, "a").CloseRead(t.Context()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, srv := testHub(t, nil)
+			conn := dialHub(t, srv, "a")
+			conn.CloseRead(t.Context())
+			waitForGoroutine(t, "link.(*Hub).readAcks", "websocket.(*Conn).Read")
+
+			// Hold the lock so that the closer queues on it first and the
+			// ping callback, holding the connection's reader, queues behind.
+			h.mu.Lock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				tc.close(h, srv)
+			}()
+			waitForGoroutine(t, tc.waits, "sync.(*Mutex).Lock")
+			go conn.Ping(t.Context())
+			waitForGoroutine(t, "link.(*Hub).heartbeat", "sync.(*Mutex).Lock")
+			h.mu.Unlock()
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("closing the connection did not return: it waits for the reader, which waits for the lock")
+			}
+		})
 	}
 }

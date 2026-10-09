@@ -114,10 +114,16 @@ func (h *Hub) heartbeat(client string) {
 func (h *Hub) Close() {
 	h.mu.Lock()
 	h.closed = true
+	open := make([]*session, 0, len(h.sessions))
 	for _, s := range h.sessions {
-		s.conn.CloseNow()
+		open = append(open, s)
 	}
 	h.mu.Unlock()
+	// Closing a connection waits for its reader, and the reader may be in
+	// the ping callback waiting for h.mu, so close outside the lock.
+	for _, s := range open {
+		s.conn.CloseNow()
+	}
 	h.wg.Wait()
 }
 
@@ -127,18 +133,20 @@ var errClosed = errors.New("hub closed")
 // register makes s the client's session, dropping any earlier one.
 func (h *Hub) register(client string, s *session) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
+		h.mu.Unlock()
 		return errClosed
 	}
-	if old := h.sessions[client]; old != nil {
-		old.conn.CloseNow()
-	}
+	old := h.sessions[client]
 	if h.sessions == nil {
 		h.sessions = make(map[string]*session)
 	}
 	h.sessions[client] = s
 	h.wg.Add(1)
+	h.mu.Unlock()
+	if old != nil {
+		old.conn.CloseNow()
+	}
 	return nil
 }
 
