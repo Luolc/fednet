@@ -223,3 +223,42 @@ func TestThreads(t *testing.T) {
 		t.Fatalf("threads of a client with none = %+v, %v; want none", got, err)
 	}
 }
+
+func TestUsers(t *testing.T) {
+	s, _ := testServer(t)
+	s.Users = map[string]string{"U2": "", "U1": "maintainer"}
+	got, err := answer(t, s, "workstation", Request{Cmd: Users})
+	want := []User{{ID: "U1", Name: "maintainer"}, {ID: "U2"}}
+	if err != nil || !slices.Equal(got.Users, want) {
+		t.Fatalf("users = %+v, %v; want %+v", got, err, want)
+	}
+}
+
+func TestDM(t *testing.T) {
+	s, f := testServer(t)
+	s.Users = map[string]string{"U1": "maintainer"}
+	if _, err := answer(t, s, "workstation", Request{Cmd: DM, User: "U1", Text: "daily report"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.DMs("U1"); !slices.Equal(got, []string{"daily report"}) {
+		t.Fatalf("DMs to U1 = %q, want the report", got)
+	}
+
+	tests := []struct {
+		name string
+		req  Request
+		want error
+	}{
+		{"a user not on the list", Request{Cmd: DM, User: "U9", Text: "x"}, link.ErrDenied},
+		{"no user", Request{Cmd: DM, Text: "x"}, link.ErrBadRequest},
+		{"no text", Request{Cmd: DM, User: "U1"}, link.ErrBadRequest},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, tt.want) {
+			t.Errorf("%s: dm = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if got := f.DMs("U9"); len(got) != 0 {
+		t.Fatalf("DMs to the user not on the list = %q, want none", got)
+	}
+}

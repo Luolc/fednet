@@ -43,6 +43,7 @@ type Request struct {
 	Thread  string `json:"thread,omitempty"`
 	Channel string `json:"channel,omitempty"`
 	Text    string `json:"text,omitempty"`
+	User    string `json:"user,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -53,6 +54,7 @@ type Response struct {
 	Text     string          `json:"text,omitempty"`
 	Thread   string          `json:"thread,omitempty"`
 	Threads  []string        `json:"threads,omitempty"`
+	Users    []hubapi.User   `json:"users,omitempty"`
 	Error    string          `json:"error,omitempty"`
 	Kind     string          `json:"kind,omitempty"`
 }
@@ -225,7 +227,8 @@ func (s *Server) handle(ctx context.Context, req Request) Response {
 	switch req.Cmd {
 	case Post:
 		return s.post(ctx, req)
-	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext:
+	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
+		hubapi.Users, hubapi.DM:
 		return s.ask(ctx, req)
 	default:
 		return badRequest(fmt.Sprintf("unknown command %q", req.Cmd))
@@ -264,7 +267,7 @@ var kinds = []struct {
 
 // ask hands req to the hub and replies with the hub's answer.
 func (s *Server) ask(ctx context.Context, req Request) Response {
-	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text})
+	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -285,7 +288,7 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err := json.Unmarshal(answer, &reply); err != nil {
 		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
 	}
-	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads}
+	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An

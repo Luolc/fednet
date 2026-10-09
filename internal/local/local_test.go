@@ -347,7 +347,7 @@ func TestAsk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hub := &link.Hub{Store: hs, Answer: (&hubapi.Server{Store: hs, Slack: f}).Answer}
+	hub := &link.Hub{Store: hs, Answer: (&hubapi.Server{Store: hs, Slack: f, Users: map[string]string{"U1": "maintainer"}}).Answer}
 	srv := httptest.NewServer(hub.Handler())
 	t.Cleanup(func() {
 		hub.Close()
@@ -364,6 +364,14 @@ func TestAsk(t *testing.T) {
 	if err != nil || res.Error != "" || res.Text != "repo: fednet" {
 		t.Fatalf("Do(channel-context-get) = %+v, %v; want the purpose", res, err)
 	}
+	res, err = Do(ctx, path, Request{Cmd: hubapi.Users})
+	if users := []hubapi.User{{ID: "U1", Name: "maintainer"}}; err != nil || res.Error != "" || !slices.Equal(res.Users, users) {
+		t.Fatalf("Do(users) = %+v, %v; want %+v", res, err, users)
+	}
+	res, err = Do(ctx, path, Request{Cmd: hubapi.DM, User: "U1", Text: "daily report"})
+	if err != nil || res.Error != "" || !slices.Equal(f.DMs("U1"), []string{"daily report"}) {
+		t.Fatalf("Do(dm) = %+v, %v; DMs to U1 = %q", res, err, f.DMs("U1"))
+	}
 
 	tests := []struct {
 		name string
@@ -372,6 +380,7 @@ func TestAsk(t *testing.T) {
 	}{
 		{"a malformed thread key", Request{Cmd: hubapi.ReadThread, Thread: "C1"}, BadRequest},
 		{"a thread that does not exist", Request{Cmd: hubapi.ReadThread, Thread: "C1/1600000000.000001"}, NotFound},
+		{"a dm to a user not on the list", Request{Cmd: hubapi.DM, User: "U9", Text: "x"}, Denied},
 	}
 	for _, tt := range tests {
 		res, err := Do(ctx, path, tt.req)

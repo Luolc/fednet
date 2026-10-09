@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,7 +37,9 @@ const usage = `usage: fednet <command> [flags]
 commands:
   hub -listen ADDR -db PATH [-config PATH]
         run the hub; the JSON config file says which clients may open
-        threads in which channel: {"channels": {"C123": {"open_thread": ["CLIENT-ID"]}}}
+        threads in which channel, and lists the Slack users fednet serves,
+        each with a name for the agents, which may be empty:
+        {"channels": {"C123": {"open_thread": ["CLIENT-ID"]}}, "users": {"U123": "NAME"}}
   hub register -db PATH CLIENT-ID HASH
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
@@ -64,6 +67,10 @@ commands:
         print a channel's description (its Slack purpose)
   client channel-context set -socket PATH -body-file FILE [-json] CHANNEL
         replace a channel's description with the contents of FILE
+  client users -socket PATH [-json]
+        print the user list: each user's Slack id and name
+  client dm -socket PATH -user USER-ID [-json] [--] TEXT
+        send TEXT as a direct message to a user on the user list
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   version
@@ -179,6 +186,9 @@ type hubConfig struct {
 		// OpenThread lists the clients that may open threads in the channel.
 		OpenThread []string `json:"open_thread"`
 	} `json:"channels"`
+	// Users maps the Slack user id of each person fednet serves to a name
+	// for the agents, which may be empty.
+	Users map[string]string `json:"users"`
 }
 
 // readHubConfig reads the config file at path. An unknown field is an
@@ -243,7 +253,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	hub := &link.Hub{
 		Store:    st,
 		Identify: (&auth.Authenticator{Store: st}).Identify,
-		Answer:   (&hubapi.Server{Store: st, Slack: hubSlack, OpenThread: cfg.openThread()}).Answer,
+		Answer:   (&hubapi.Server{Store: st, Slack: hubSlack, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
 	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -353,6 +363,10 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientAdopt(ctx, args[1:], stdout)
 		case "channel-context":
 			return clientChannelContext(ctx, args[1:], stdout)
+		case "users":
+			return clientUsers(ctx, args[1:], stdout)
+		case "dm":
+			return clientDM(ctx, args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -607,6 +621,51 @@ func clientChannelContext(ctx context.Context, args []string, stdout io.Writer) 
 		_, err = fmt.Fprintln(stdout, res.Text)
 	}
 	return err
+}
+
+// clientUsers prints the user list, one user a line: the id, then the name
+// if there is one.
+func clientUsers(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client users", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" {
+		return usageError("fednet client users: -socket is required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Users})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	for _, u := range res.Users {
+		if _, err := fmt.Fprintln(stdout, strings.TrimSpace(u.ID+" "+u.Name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clientDM sends a direct message to a user on the user list through the
+// hub, and waits for the hub to send it.
+func clientDM(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client dm", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	user := fs.String("user", "", "Slack id of the user to message (required)")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || *user == "" || fs.Arg(0) == "" {
+		return usageError("fednet client dm: -socket, -user and a non-empty TEXT are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.DM, User: *user, Text: fs.Arg(0)})
+	if err != nil || !*asJSON {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(res)
 }
 
 // clientInit creates the credential file and prints the client id and the
