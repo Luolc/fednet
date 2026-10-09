@@ -17,17 +17,23 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/hubapi"
+	"github.com/Luolc/fednet/internal/inbound"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/local"
+	"github.com/Luolc/fednet/internal/outbound"
+	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	"github.com/Luolc/fednet/internal/watch"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -37,13 +43,18 @@ const usage = `usage: fednet <command> [flags]
 
 commands:
   hub -listen ADDR -db PATH [-config PATH]
-        run the hub; the JSON config file says, for each channel, which
+      [-slack-app-token-file PATH -slack-bot-token-file PATH] [-alert-webhook-file PATH]
+        run the hub; with the two Slack token files it also takes in the
+        messages people post in Slack and posts the clients' posts there,
+        and with the webhook file it sends alerts; each file holds one
+        credential; the JSON config file says, for each channel, which
         client takes the threads people start in it and which clients may
         open threads in it, which client takes direct messages, and lists
         the Slack users fednet serves, each with a name for the agents,
         which may be empty:
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
-         "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"}}
+         "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
+         "alerts": {"slack_down": "5m", "offline_queued": "10m"}}
   hub register -db PATH CLIENT-ID HASH
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
@@ -274,22 +285,54 @@ func (c hubConfig) openThread() map[string][]string {
 	return m
 }
 
-// hubSlack is the hub's Slack API. It is nil until the hub connects to
-// Slack, so requests that need Slack fail; tests set a fake.
-var hubSlack slack.API
+// How the hub reaches Slack once it has the tokens; tests replace them
+// with fakes.
+var (
+	newSlack   = func(botToken string) slack.API { return slack.New(botToken) }
+	runInbound = inbound.Run
+)
+
+// Timings tests shorten; zero means each package's default.
+var (
+	hookRetry        hook.Retry
+	outboundInterval time.Duration
+)
+
+// readSecret reads the credential in the file at path, without the white
+// space around it. No error quotes the contents.
+func readSecret(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return "", fmt.Errorf("%s is empty", path)
+	}
+	return s, nil
+}
 
 // hubServe runs the hub until ctx is done. It prints the address it listens
-// on, so that -listen with port 0 is usable.
+// on, so that -listen with port 0 is usable. With the Slack tokens it also
+// runs the inbound and outbound sides and, with the webhook, the alerts;
+// when the Socket Mode connection fails for good, the HTTP server fails,
+// or ctx is done, everything stops.
 func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet hub", flag.ContinueOnError)
 	listen := fs.String("listen", "", "address to listen on, such as 127.0.0.1:8080 (required)")
 	dbPath := fs.String("db", "", "hub database file (required)")
 	configPath := fs.String("config", "", "hub config file; without one, no client may open threads")
+	appTokenPath := fs.String("slack-app-token-file", "", "file holding the Slack app-level token, for Socket Mode")
+	botTokenPath := fs.String("slack-bot-token-file", "", "file holding the Slack bot token, for the Web API")
+	webhookPath := fs.String("alert-webhook-file", "", "file holding the URL of the Slack incoming webhook for alerts; read only with the Slack token files")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
 	if *listen == "" || *dbPath == "" {
 		return usageError("fednet hub: -listen and -db are required")
+	}
+	if (*appTokenPath == "") != (*botTokenPath == "") {
+		return usageError("fednet hub: give both -slack-app-token-file and -slack-bot-token-file, or neither")
 	}
 	var cfg hubConfig
 	if *configPath != "" {
@@ -298,15 +341,42 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 			return err
 		}
 	}
+	if *appTokenPath == "" {
+		// Without Slack nothing sends alerts, so the webhook is not read.
+		*webhookPath = ""
+	}
+	var appToken, botToken, webhookURL string
+	for _, f := range []struct {
+		path string
+		v    *string
+	}{{*appTokenPath, &appToken}, {*botTokenPath, &botToken}, {*webhookPath, &webhookURL}} {
+		if f.path == "" {
+			continue
+		}
+		var err error
+		if *f.v, err = readSecret(f.path); err != nil {
+			return err
+		}
+	}
+	var sl slack.API
+	if botToken != "" {
+		sl = newSlack(botToken)
+	}
+	var webhook *alert.Webhook
+	if webhookURL != "" {
+		webhook = &alert.Webhook{URL: webhookURL, From: inbound.HubName}
+	}
 	st, err := store.OpenHub(ctx, *dbPath)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval}
 	hub := &link.Hub{
 		Store:    st,
 		Identify: (&auth.Authenticator{Store: st}).Identify,
-		Answer:   (&hubapi.Server{Store: st, Slack: hubSlack, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
+		Answer:   (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
+		Uplinked: poster.Nudge,
 	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -316,18 +386,56 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	srv := &http.Server{Handler: hub.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	failed := make(chan error, 1)
+	if sl == nil {
+		slog.Info("hub: Slack not configured, serving the clients only")
+	} else {
+		r := &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Stored: func() {
+			hub.WakeAll()
+			poster.Nudge()
+		}}
+		wg.Go(func() {
+			// Run returns before ctx is done only when Slack rejects the
+			// app token.
+			if err := runInbound(ctx, appToken, r, 0); ctx.Err() == nil {
+				failed <- fmt.Errorf("slack socket mode: %w", err)
+			}
+		})
+		wg.Go(func() { poster.Run(ctx) })
+		if webhook == nil {
+			slog.Warn("hub: no alert webhook, alerts are only logged")
+		} else {
+			w := &watch.Watch{
+				Store: st, Slack: sl, Link: r, Online: hub.Online, Alert: webhook,
+				SlackDown: time.Duration(cfg.Alerts.SlackDown), Offline: time.Duration(cfg.Alerts.OfflineQueued),
+			}
+			wg.Go(func() { w.Run(ctx) })
+		}
+	}
+	stopped := false
 	select {
-	case err := <-served:
-		return err
+	case err = <-served:
+		stopped = true
+	case err = <-failed:
 	case <-ctx.Done():
 	}
+	cancel()
 	// The downlink connections are hijacked WebSockets, which Shutdown
 	// does not know about; the hub closes them itself.
 	hub.Close()
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	err = srv.Shutdown(sctx)
-	<-served
+	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer scancel()
+	if serr := srv.Shutdown(sctx); err == nil {
+		err = serr
+	}
+	if !stopped {
+		<-served
+	}
+	wg.Wait()
 	return err
 }
 
@@ -475,7 +583,7 @@ func clientServe(ctx context.Context, args []string) error {
 	if fs.NArg() == 0 {
 		close(hooked)
 	} else {
-		h := &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout}
+		h := &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c)}
 		c.Received = h.Nudge
 		go func() {
 			defer close(hooked)
@@ -486,6 +594,19 @@ func clientServe(ctx context.Context, args []string) error {
 	err = <-served
 	<-hooked
 	return err
+}
+
+// uplinkAlert returns an alert that goes up to the hub, which sends it to
+// the alerts webhook: the webhook's URL is kept on the hub alone.
+func uplinkAlert(c *link.Client) func(ctx context.Context, text string) error {
+	return func(ctx context.Context, text string) error {
+		b, err := json.Marshal(payload.Message{Type: payload.Alert, Text: text})
+		if err != nil {
+			return err
+		}
+		_, err = c.Post(ctx, b)
+		return err
+	}
 }
 
 // clientPost hands a post to the client daemon through its socket and

@@ -76,6 +76,10 @@ type Receiver struct {
 	Window time.Duration
 	// Now returns the current time; nil means time.Now.
 	Now func() time.Time
+	// Stored, if set, is called each time Handle has committed a message:
+	// it may have queued one for a client, or put a post from the hub in
+	// the hub's inbox. It must not block.
+	Stored func()
 
 	// mu guards the fields below, and serializes Connected's fixing of
 	// the backfill's start with a backfill's clearing of it.
@@ -143,6 +147,9 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	})
 	if err != nil {
 		return fmt.Errorf("inbound: %s: %w", slack.ThreadKey(ev.Channel, ev.TS), err)
+	}
+	if r.Stored != nil {
+		r.Stored()
 	}
 	return nil
 }

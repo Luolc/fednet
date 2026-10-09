@@ -42,6 +42,8 @@ func TestRun(t *testing.T) {
 		{"open-thread without a channel", []string{"client", "open-thread", "-socket", "x", "hello"}, 2, "", "-socket, -channel and a non-empty TEXT are required"},
 		{"threads without a socket", []string{"client", "threads"}, 2, "", "-socket is required"},
 		{"hub with a missing config", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-config", "/nonexistent/hub.json"}, 1, "", "no such file"},
+		{"hub with one Slack token", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-slack-bot-token-file", "/dev/null"}, 2, "", "give both -slack-app-token-file and -slack-bot-token-file"},
+		{"hub with an empty token file", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-slack-app-token-file", "/dev/null", "-slack-bot-token-file", "/dev/null"}, 1, "", "/dev/null is empty"},
 		{"reassign without a target", []string{"hub", "reassign", "-db", "x", "workstation"}, 2, "", "want 2 arguments"},
 		{"register with a bad hash", []string{"hub", "register", "-db", "x", "ws", "nothex"}, 2, "", "HASH must be"},
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
@@ -179,7 +181,9 @@ func TestHubAndClient(t *testing.T) {
 	}
 	hs.Close()
 
-	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB}, &stdout, &stderr)
+	// Without Slack the webhook file is not read, so one that is missing
+	// does not stop the hub.
+	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-alert-webhook-file", "/nonexistent/webhook"}, &stdout, &stderr)
 	var addr string
 	waitFor(t, "the hub to listen", func() bool {
 		m := listening.FindStringSubmatch(stdout.String())
@@ -290,6 +294,10 @@ func TestHubAndClient(t *testing.T) {
 	}
 	if code := stopHub(); code != 0 {
 		t.Errorf("hub exited %d", code)
+	}
+
+	if !strings.Contains(stderr.String(), "Slack not configured") {
+		t.Errorf("stderr %q does not say Slack is not configured", redact(stderr.String()))
 	}
 
 	// Retiring the client, and a client the hub never heard of.

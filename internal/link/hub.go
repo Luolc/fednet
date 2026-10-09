@@ -36,6 +36,9 @@ type Hub struct {
 	// back to the client; any other error is logged and the client only
 	// learns that the request failed. Nil means every request fails.
 	Answer func(ctx context.Context, client string, req []byte) ([]byte, error)
+	// Uplinked, if set, is called after an uplink message is stored in the
+	// inbox, before the client is told. It must not block.
+	Uplinked func()
 
 	mu       sync.Mutex
 	seen     map[string]time.Time
@@ -110,15 +113,7 @@ func (h *Hub) Send(ctx context.Context, client string, payload []byte) (store.Do
 	if err != nil {
 		return d, err
 	}
-	h.mu.Lock()
-	s := h.sessions[client]
-	h.mu.Unlock()
-	if s != nil {
-		select {
-		case s.wake <- struct{}{}:
-		default:
-		}
-	}
+	h.wake(client)
 	return d, nil
 }
 
@@ -295,6 +290,9 @@ func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("link: uplink store", "err", err)
 		http.Error(w, "store failed", http.StatusInternalServerError)
 		return
+	}
+	if h.Uplinked != nil {
+		h.Uplinked()
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

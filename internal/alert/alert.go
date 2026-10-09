@@ -1,7 +1,9 @@
 // Package alert posts alerts to a Slack incoming webhook, which delivers
-// them to the alerts channel without going through the hub: an alert has
-// to get out even when the hub or its Slack connection is what failed.
-// The webhook URL is a credential; it never appears in an error or a log.
+// them to the alerts channel without going through the hub's Slack
+// connection: an alert has to get out even when that connection is what
+// failed. Only the hub has the webhook; a client's alerts reach it over the
+// link. The webhook URL is a credential; it never appears in an error or a
+// log.
 package alert
 
 import (

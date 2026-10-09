@@ -1,0 +1,68 @@
+# systemd unit for `fednet hub`. A template: copy it to
+# /etc/systemd/system/fednet-hub.service and replace the lines marked
+# "replace". It expects:
+#   - a system user and group named fednet, which own nothing else;
+#   - the fednet binary at /usr/local/bin/fednet;
+#   - the hub config at /etc/fednet-hub/hub.json (see hub.example.json);
+#   - three credential files, one credential each, put in place by the
+#     deployment (paths below). systemd copies each into the service's own
+#     credentials directory (%d), readable by this service alone, and the
+#     hub reads them from there. Leave out both Slack lines, and their
+#     flags, to run the hub without Slack; leave out the webhook to run it
+#     without alerts.
+# The database lives in /var/lib/fednet-hub (StateDirectory).
+
+[Unit]
+Description=fednet hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=fednet
+Group=fednet
+# replace: where the deployment keeps the three credential files.
+LoadCredential=slack-app-token:/etc/fednet-hub/credentials/slack-app-token
+LoadCredential=slack-bot-token:/etc/fednet-hub/credentials/slack-bot-token
+LoadCredential=alert-webhook:/etc/fednet-hub/credentials/alert-webhook
+StateDirectory=fednet-hub
+StateDirectoryMode=0700
+# replace: -listen with the address the clients reach the hub at, on the
+# private network between the machines (the hub speaks plain HTTP, so not
+# a public address). If that address belongs to a VPN interface, also order
+# this unit after the VPN's service.
+ExecStart=/usr/local/bin/fednet hub \
+    -listen 127.0.0.1:8080 \
+    -db /var/lib/fednet-hub/hub.db \
+    -config /etc/fednet-hub/hub.json \
+    -slack-app-token-file %d/slack-app-token \
+    -slack-bot-token-file %d/slack-bot-token \
+    -alert-webhook-file %d/alert-webhook
+Restart=on-failure
+RestartSec=5s
+# Exit 2 is a usage error; restarting does not fix it.
+RestartPreventExitStatus=2
+
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

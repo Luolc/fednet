@@ -293,3 +293,59 @@ func TestRun(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// An alert a client raised goes to the webhook as from that client, once.
+// One the webhook does not take stays in the inbox for the next pass, and
+// the posts behind it still go out.
+func TestClientAlertIsRelayed(t *testing.T) {
+	f := newFixture(t)
+	var mu sync.Mutex
+	var alerts []string
+	down := true
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if down {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		var m struct{ Text string }
+		json.NewDecoder(r.Body).Decode(&m)
+		alerts = append(alerts, m.Text)
+	}))
+	defer hook.Close()
+	f.p.Alert = &alert.Webhook{URL: hook.URL, From: "fednet-hub"}
+
+	b, err := json.Marshal(payload.Message{Type: payload.Alert, Text: "dead letter: msg_id d1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := f.putRaw("workstation", b)
+	f.put("workstation", f.thread, "posted behind the alert")
+	if err := f.p.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := texts(f.replies()); !slices.Equal(got, []string{"posted behind the alert"}) {
+		t.Fatalf("thread = %q, want the post", got)
+	}
+	if u := f.undelivered(); !slices.Equal(u, []string{id}) {
+		t.Fatalf("undelivered = %v, want the alert %s", u, id)
+	}
+
+	mu.Lock()
+	down = false
+	mu.Unlock()
+	for range 2 {
+		if err := f.p.Pass(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if u := f.undelivered(); len(u) != 0 {
+		t.Fatalf("undelivered = %v, want none", u)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.HasPrefix(alerts[0], "[workstation] ") || !strings.Contains(alerts[0], "d1") {
+		t.Fatalf("alerts = %q, want one, from workstation, about d1", alerts)
+	}
+}
