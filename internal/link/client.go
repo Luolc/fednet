@@ -25,6 +25,9 @@ type Client struct {
 	Store *store.Client
 	// ID is sent to the hub in ClientHeader.
 	ID string
+	// Header is sent to the hub on every request, in addition to
+	// ClientHeader; the credential goes here.
+	Header http.Header
 	// Hub is the hub's base URL, such as http://fednet-hub:8080.
 	Hub string
 	// Heartbeat is the interval between pings on the downlink. Zero means
@@ -82,7 +85,12 @@ func (c *Client) httpClient() *http.Client {
 }
 
 func (c *Client) header() http.Header {
-	return http.Header{ClientHeader: {c.ID}}
+	h := c.Header.Clone()
+	if h == nil {
+		h = http.Header{}
+	}
+	h.Set(ClientHeader, c.ID)
+	return h
 }
 
 // Post queues payload for the hub and returns its msg_id. The message is
