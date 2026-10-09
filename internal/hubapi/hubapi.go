@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/slack"
@@ -147,6 +148,10 @@ func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {
 	return Reply{Messages: ms}, err
 }
 
+// deleteTimeout bounds the delete that undoes an open-thread whose owner
+// could not be recorded; tests shorten it.
+var deleteTimeout = 30 * time.Second
+
 // openThread posts the thread, then records its owner. If recording fails
 // it deletes the message it posted, so no thread is left in Slack without
 // an owner, and fails.
@@ -169,8 +174,12 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	}
 	key := slack.ThreadKey(r.Channel, ts)
 	if err := s.Store.Claim(ctx, key, client); err != nil {
-		// The caller may have given up already; the message goes anyway.
-		if derr := s.Slack.Delete(context.WithoutCancel(ctx), r.Channel, ts); derr != nil {
+		// The caller may have given up already; the message goes anyway,
+		// within deleteTimeout.
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteTimeout)
+		derr := s.Slack.Delete(dctx, r.Channel, ts)
+		cancel()
+		if derr != nil {
 			return Reply{}, fmt.Errorf("recording the owner of thread %s failed: %w; deleting its message failed too, so it stays in Slack without an owner: %v", key, err, derr)
 		}
 		return Reply{}, fmt.Errorf("recording the owner of thread %s failed, so its message was deleted: %w", key, err)

@@ -287,6 +287,9 @@ func TestDeadLetterAlertsOnce(t *testing.T) {
 	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var m struct{ Text string }
 		json.NewDecoder(r.Body).Decode(&m)
+		// Slow enough that a dead letter is on disk well before its alert
+		// has arrived.
+		time.Sleep(20 * time.Millisecond)
 		mu.Lock()
 		alerts = append(alerts, m.Text)
 		mu.Unlock()
@@ -306,6 +309,8 @@ func TestDeadLetterAlertsOnce(t *testing.T) {
 	f.put("m1", `{"t":"again"}`)
 	f.put("m2", `{"t":"y"}`)
 	waitFor(t, "m2 among the dead letters", func() bool { return len(f.deadLetters()) == 2 })
+	// The alert goes out after the dead letter is written.
+	waitFor(t, "the alert for m2", func() bool { return len(got()) >= 2 })
 	a := got()
 	if len(a) != 2 || !strings.Contains(a[0], "[workstation]") || !strings.Contains(a[0], "m1") ||
 		!strings.Contains(a[0], "no agent here") || !strings.Contains(a[1], "m2") {
@@ -315,10 +320,10 @@ func TestDeadLetterAlertsOnce(t *testing.T) {
 	hook.Close()
 	f.put("m3", `{"t":"z"}`)
 	waitFor(t, "m3 among the dead letters", func() bool { return len(f.deadLetters()) == 3 })
+	waitFor(t, "the failed alert for m3 in the log", func() bool {
+		return strings.Contains(f.logs.String(), `msg="hook: alert" msg_id=m3`)
+	})
 	logs := f.logs.String()
-	if !strings.Contains(logs, "hook: alert") || !strings.Contains(logs, "msg_id=m3") {
-		t.Fatalf("log does not report the failed alert for m3:\n%s", logs)
-	}
 	if strings.Contains(logs, "s3cr3t") {
 		t.Fatalf("log contains the webhook URL:\n%s", logs)
 	}
