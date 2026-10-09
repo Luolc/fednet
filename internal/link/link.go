@@ -1,9 +1,11 @@
 // Package link is the transport between the hub and a client: a WebSocket
-// the client dials for the downlink (hub to client) and HTTP requests for
-// the uplink (client to hub). Each side stores a message before it
-// acknowledges it, and resends until the other side has acknowledged, so a
-// message survives disconnects and restarts and the receiving inbox sees it
-// at least once; the inbox's msg_id dedup turns that into exactly once.
+// the client dials for the downlink (hub to client), HTTP requests for the
+// uplink (client to hub), and HTTP requests the hub answers at once. On the
+// two links each side stores a message before it acknowledges it, and
+// resends until the other side has acknowledged, so a message survives
+// disconnects and restarts and the receiving inbox sees it at least once;
+// the inbox's msg_id dedup turns that into exactly once. A request is not
+// stored or resent: it is answered or fails.
 package link
 
 import (
@@ -20,6 +22,9 @@ const (
 	DownlinkPath = "/link"
 	// UplinkPath takes a POST with one uplink message.
 	UplinkPath = "/inbox"
+	// RequestPath takes a POST with one request and replies with the
+	// answer. Requests are not queued: they are answered or fail.
+	RequestPath = "/request"
 )
 
 // ClientHeader carries the client's id on every request to the hub.
@@ -36,6 +41,22 @@ var maxFrameBytes = int64(base64.StdEncoding.EncodedLen(MaxPayload) + 256)
 
 // ErrPayloadTooBig is returned by Send and Post for a payload over MaxPayload.
 var ErrPayloadTooBig = errors.New("link: payload over MaxPayload")
+
+// maxAnswerBytes bounds an answer to a request; a thread read back from
+// Slack may be much larger than one message.
+const maxAnswerBytes = 16 << 20
+
+// The kinds of refusal, for Refuse. Client.Request returns an error that
+// wraps the kind the hub refused with and reads as the hub's message.
+var (
+	ErrBadRequest = errors.New("link: bad request")
+	ErrDenied     = errors.New("link: denied")
+	ErrNotFound   = errors.New("link: not found")
+)
+
+// ErrUnreachable is wrapped by Client.Request when it got no answer from the
+// hub: the hub could not be reached or did not answer in time.
+var ErrUnreachable = errors.New("link: hub unreachable")
 
 // downlink is a frame the hub sends on the WebSocket: one queued message.
 type downlink struct {

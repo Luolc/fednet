@@ -577,3 +577,87 @@ func TestClosingAConnectionDoesNotWaitOnPing(t *testing.T) {
 		})
 	}
 }
+
+func TestRequest(t *testing.T) {
+	h, srv := testHub(t, nil)
+	h.Answer = func(_ context.Context, client string, req []byte) ([]byte, error) {
+		switch string(req) {
+		case "bad":
+			return nil, Refuse(ErrBadRequest, "no such thing as %s", req)
+		case "denied":
+			return nil, Refuse(ErrDenied, "not for %s", client)
+		case "missing":
+			return nil, Refuse(ErrNotFound, "nothing here")
+		case "broken":
+			return nil, errors.New("disk on fire")
+		}
+		return []byte(client + " asked " + string(req)), nil
+	}
+	c := &Client{ID: "a", Hub: srv.URL, Timeout: testTimeout}
+
+	answer, err := c.Request(t.Context(), []byte("hello"))
+	if err != nil || string(answer) != "a asked hello" {
+		t.Fatalf("Request(hello) = %q, %v; want %q", answer, err, "a asked hello")
+	}
+	tests := []struct {
+		req     string
+		wantErr error
+		wantMsg string
+	}{
+		{"bad", ErrBadRequest, "no such thing as bad"},
+		{"denied", ErrDenied, "not for a"},
+		{"missing", ErrNotFound, "nothing here"},
+		// The cause of a failure stays on the hub.
+		{"broken", nil, "the hub failed to answer"},
+	}
+	for _, tt := range tests {
+		_, err := c.Request(t.Context(), []byte(tt.req))
+		if err == nil || !strings.Contains(err.Error(), tt.wantMsg) || strings.Contains(err.Error(), "fire") {
+			t.Errorf("Request(%s) = %v, want an error saying %q", tt.req, err, tt.wantMsg)
+		}
+		if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+			t.Errorf("Request(%s) = %v, want it to wrap %v", tt.req, err, tt.wantErr)
+		}
+	}
+}
+
+// A request the hub refuses to identify is denied.
+func TestRequestUnauthorized(t *testing.T) {
+	h, srv := testHub(t, nil)
+	h.Identify = func(*http.Request) (string, error) { return "", errors.New("who are you") }
+	h.Answer = func(context.Context, string, []byte) ([]byte, error) { return []byte("{}"), nil }
+	c := &Client{ID: "a", Hub: srv.URL, Timeout: testTimeout}
+	if _, err := c.Request(t.Context(), []byte("hello")); !errors.Is(err, ErrDenied) {
+		t.Fatalf("Request = %v, want ErrDenied", err)
+	}
+}
+
+// A hub that is down, or that does not answer in time, fails a request at
+// once instead of queueing it.
+func TestRequestUnreachable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := "http://" + ln.Addr().String()
+	ln.Close()
+
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-done }))
+	t.Cleanup(func() {
+		close(done)
+		srv.Close()
+	})
+
+	for name, hub := range map[string]string{"down": down, "silent": srv.URL} {
+		c := &Client{ID: "a", Hub: hub, Timeout: testTimeout}
+		start := time.Now()
+		_, err := c.Request(t.Context(), []byte("hello"))
+		if !errors.Is(err, ErrUnreachable) {
+			t.Errorf("%s: Request = %v, want ErrUnreachable", name, err)
+		}
+		if d := time.Since(start); d > 5*testTimeout {
+			t.Errorf("%s: Request took %v, want it bounded by the timeout %v", name, d, testTimeout)
+		}
+	}
+}

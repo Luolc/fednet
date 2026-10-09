@@ -22,11 +22,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/slack"
 )
 
-// Commands a Request can carry.
+// Commands a Request can carry besides those of hubapi, which the daemon
+// hands to the hub and answers with the hub's reply.
 const (
 	// Post queues a message for a thread and replies with its msg_id
 	// without waiting for the hub.
@@ -36,21 +39,40 @@ const (
 // Request is what a caller sends. Cmd selects the command; the other fields
 // are its arguments.
 type Request struct {
-	Cmd    string `json:"cmd"`
-	Thread string `json:"thread,omitempty"`
-	Text   string `json:"text,omitempty"`
+	Cmd     string `json:"cmd"`
+	Thread  string `json:"thread,omitempty"`
+	Channel string `json:"channel,omitempty"`
+	Text    string `json:"text,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
-// BadRequest when it failed because of the request itself.
+// Kind says why when the reason is one of the Kind constants.
 type Response struct {
-	MsgID      string `json:"msg_id,omitempty"`
-	Error      string `json:"error,omitempty"`
-	BadRequest bool   `json:"bad_request,omitempty"`
+	MsgID    string          `json:"msg_id,omitempty"`
+	Messages []slack.Message `json:"messages,omitempty"`
+	Text     string          `json:"text,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Kind     string          `json:"kind,omitempty"`
 }
+
+// Why a request failed, for Response.Kind.
+const (
+	// BadRequest is a request that is wrong in itself.
+	BadRequest = "bad_request"
+	// Denied is a request the hub does not allow this client.
+	Denied = "denied"
+	// NotFound is a request for a thread or channel that does not exist.
+	NotFound = "not_found"
+	// Unreachable is a request for the hub when the hub cannot be reached.
+	Unreachable = "unreachable"
+)
 
 // Timeout bounds one request on either side.
 const Timeout = 10 * time.Second
+
+// hubTimeout bounds the hub's part of a request, so that a hub that does
+// not answer is reported before the request itself times out.
+const hubTimeout = Timeout / 2
 
 // maxRequestBytes bounds a request: a post's text may grow up to six times
 // when escaped as a JSON string.
@@ -150,6 +172,9 @@ type Server struct {
 	// Post queues a payload for the hub and returns its msg_id; it is
 	// link.Client.Post.
 	Post func(ctx context.Context, payload []byte) (string, error)
+	// Request sends a request to the hub and returns its answer; it is
+	// link.Client.Request.
+	Request func(ctx context.Context, req []byte) ([]byte, error)
 }
 
 // Serve answers connections on ln until ctx is done. When it returns it has
@@ -191,13 +216,15 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func badRequest(msg string) Response { return Response{Error: msg, BadRequest: true} }
+func badRequest(msg string) Response { return Response{Error: msg, Kind: BadRequest} }
 
 // handle runs one request. A new command is a new case here.
 func (s *Server) handle(ctx context.Context, req Request) Response {
 	switch req.Cmd {
 	case Post:
 		return s.post(ctx, req)
+	case hubapi.ReadThread, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext:
+		return s.ask(ctx, req)
 	default:
 		return badRequest(fmt.Sprintf("unknown command %q", req.Cmd))
 	}
@@ -220,6 +247,43 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 		return Response{Error: "post: " + err.Error()}
 	}
 	return Response{MsgID: id}
+}
+
+// kinds maps the link's errors to the Kind they are reported with.
+var kinds = []struct {
+	err  error
+	kind string
+}{
+	{link.ErrBadRequest, BadRequest},
+	{link.ErrDenied, Denied},
+	{link.ErrNotFound, NotFound},
+	{link.ErrUnreachable, Unreachable},
+}
+
+// ask hands req to the hub and replies with the hub's answer.
+func (s *Server) ask(ctx context.Context, req Request) Response {
+	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text})
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(ctx, hubTimeout)
+	defer cancel()
+	answer, err := s.Request(ctx, b)
+	if err != nil {
+		res := Response{Error: req.Cmd + ": " + err.Error()}
+		for _, k := range kinds {
+			if errors.Is(err, k.err) {
+				res.Kind = k.kind
+				break
+			}
+		}
+		return res
+	}
+	var reply hubapi.Reply
+	if err := json.Unmarshal(answer, &reply); err != nil {
+		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
+	}
+	return Response{Messages: reply.Messages, Text: reply.Text}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An
