@@ -179,15 +179,20 @@ func TestHubRequests(t *testing.T) {
 	}
 }
 
-// A misspelt field in the hub config is an error, not a silent deny.
+// A misspelt field in the hub config is an error, not a silent deny, and so
+// is anything after the config object.
 func TestReadHubConfig(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.json")
 	typo := filepath.Join(dir, "typo.json")
+	two := filepath.Join(dir, "two.json")
 	if err := os.WriteFile(good, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(typo, []byte(`{"channels": {"C1": {"open_threads": ["workstation"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(two, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}}} {"channels": {}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := readHubConfig(good)
@@ -196,5 +201,8 @@ func TestReadHubConfig(t *testing.T) {
 	}
 	if _, err := readHubConfig(typo); err == nil || !strings.Contains(err.Error(), "open_threads") {
 		t.Fatalf("readHubConfig(typo) = %v, want an error naming the unknown field", err)
+	}
+	if _, err := readHubConfig(two); err == nil {
+		t.Fatal("readHubConfig accepted a second JSON value after the config")
 	}
 }

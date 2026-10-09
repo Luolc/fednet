@@ -182,7 +182,8 @@ type hubConfig struct {
 }
 
 // readHubConfig reads the config file at path. An unknown field is an
-// error, so that a misspelt one does not silently deny.
+// error, so that a misspelt one does not silently deny, and so is anything
+// after the config object.
 func readHubConfig(path string) (hubConfig, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -194,6 +195,9 @@ func readHubConfig(path string) (hubConfig, error) {
 	var cfg hubConfig
 	if err := d.Decode(&cfg); err != nil {
 		return hubConfig{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := d.Decode(&struct{}{}); err != io.EOF {
+		return hubConfig{}, fmt.Errorf("%s: more than one JSON value", path)
 	}
 	return cfg, nil
 }
