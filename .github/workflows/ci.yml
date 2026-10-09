@@ -1,6 +1,8 @@
 # PR gate: full-history secret scan, pre-commit on all files, the
-# docs/design.md length check and its test, then the Go checks (gofmt, vet,
-# race-enabled tests). The job name `check` is the required status check.
+# docs/design.md length check and its test, the tests of the release guards,
+# then the Go checks (gofmt, vet, race-enabled tests). The job name `check`
+# is the required status check. release.yml calls this workflow so that a
+# release passes the same checks.
 
 name: CI
 
@@ -8,6 +10,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -82,6 +85,11 @@ jobs:
 
       - name: Design length (docs/design.md, at most 200 lines)
         run: .github/scripts/design-length.sh
+
+      - name: Release guard tests
+        run: |
+          .github/scripts/release-version.test.sh
+          .github/scripts/release-on-main.test.sh
 
       - uses: actions/setup-go@v7.0.0
         with:
