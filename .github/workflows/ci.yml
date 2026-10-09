@@ -23,7 +23,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: the scan below reads commits, not the working tree,
           # and a shallow clone would hide everything but the latest commit.
@@ -56,7 +56,7 @@ jobs:
           "${bindir}/gitleaks" git --redact --no-banner --verbose .
 
       - id: py
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
@@ -65,7 +65,7 @@ jobs:
       # (patch level included) is part of the key: pre-commit discards a
       # virtualenv whose base interpreter is not the one now installed, and
       # the runner image's patch release changes over time.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
@@ -91,7 +91,7 @@ jobs:
           .github/scripts/release-version.test.sh
           .github/scripts/release-on-main.test.sh
 
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
