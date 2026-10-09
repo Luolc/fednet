@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"regexp"
 	"slices"
@@ -220,9 +221,9 @@ func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {
 // could not be recorded; tests shorten it.
 var deleteTimeout = 30 * time.Second
 
-// openThread posts the thread, then records its owner. If recording fails
-// it deletes the message it posted, so no thread is left in Slack without
-// an owner, and fails.
+// openThread posts the thread, then records its owner, with the channel's
+// name when Slack gives it. If recording fails it deletes the message it
+// posted, so no thread is left in Slack without an owner, and fails.
 func (s *Server) openThread(ctx context.Context, client string, r Request) (Reply, error) {
 	if r.Channel == "" || r.Text == "" {
 		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
@@ -241,7 +242,13 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 		return Reply{}, err
 	}
 	key := slack.ThreadKey(r.Channel, ts)
-	if err := s.Store.Claim(ctx, key, client); err != nil {
+	var name string
+	if info, err := s.Slack.ChannelInfo(ctx, r.Channel); err != nil {
+		slog.Warn("hubapi: reading the name of a new thread's channel, recording none", "thread", key, "err", err)
+	} else {
+		name = info.Name
+	}
+	if err := s.Store.Claim(ctx, key, client, name); err != nil {
 		// The caller may have given up already; the message goes anyway,
 		// within deleteTimeout.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteTimeout)
@@ -273,11 +280,11 @@ func (s *Server) channelContext(ctx context.Context, r Request) (Reply, error) {
 	if s.Slack == nil {
 		return Reply{}, errNoSlack
 	}
-	p, err := s.Slack.Purpose(ctx, r.Channel)
+	info, err := s.Slack.ChannelInfo(ctx, r.Channel)
 	if errors.Is(err, slack.ErrNotFound) {
 		return Reply{}, link.Refuse(link.ErrNotFound, "no channel %s", r.Channel)
 	}
-	return Reply{Text: p}, err
+	return Reply{Text: info.Purpose}, err
 }
 
 func (s *Server) setChannelContext(ctx context.Context, r Request) error {

@@ -27,7 +27,8 @@ import (
 // DefaultWindow is how far back a backfill reads at most.
 const DefaultWindow = 24 * time.Hour
 
-// NoMachineText is what the hub says in a new thread no machine takes.
+// NoMachineText is what the hub says in a new direct message thread no
+// machine takes.
 const NoMachineText = "没有机器接这个 channel"
 
 // HubName is the name the hub's own posts carry, as the client id of a
@@ -133,11 +134,16 @@ type Receiver struct {
 // reply in a thread that has an owner; and a message in a channel that
 // mentions the bot, whose thread then gets the channel's default machine
 // as its owner and, when the thread had messages before, their history.
+// The channel's name, as Slack has it when the thread is handed over, is
+// recorded with the owner and goes with that message and every reply
+// after it.
 // A message in a channel that mentions nobody and whose thread has no
 // owner is not the agents' business and is not even recorded. A mention
-// in a channel no machine takes is recorded, with a post from the hub
-// saying so put in the hub's inbox for the outbound side to deliver. An
-// error means nothing was recorded, and the event must not be acked.
+// in a channel no machine takes is recorded and logged, and nothing is
+// said in the thread; a new thread in a direct message conversation no
+// machine takes is recorded, with a post from the hub saying so put in
+// the hub's inbox for the outbound side to deliver. An error means
+// nothing was recorded, and the event must not be acked.
 func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	if !r.wanted(ev) {
 		return nil
@@ -187,14 +193,18 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	// What a mention carries is read outside the transaction; whether the
 	// message is the one that hands the thread over is decided inside it,
 	// on the ownership as of then.
-	var purpose string
+	var info slack.ChannelInfo
 	var history *payload.History
 	if !ev.IM && !owned {
-		purpose, history = r.purpose(ctx, ev.Channel), r.history(ev, thread, before)
+		info, history = r.channelInfo(ctx, ev.Channel), r.history(ev, thread, before)
 	}
 	_, err = r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
 		rt := route.New(tx, r.Route)
-		owned, err := hasOwner(ctx, tx, thread)
+		name, err := tx.ChannelName(ctx, thread)
+		owned := err == nil
+		if errors.Is(err, store.ErrNotFound) {
+			err = nil
+		}
 		if err != nil {
 			return err
 		}
@@ -202,9 +212,9 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		case ev.IM:
 			m.Trigger = payload.DM
 		case owned:
-			m.Trigger = payload.Reply
+			m.Trigger, m.ChannelName = payload.Reply, name
 		default:
-			m.Trigger, m.Context, m.History = payload.Mention, purpose, history
+			m.Trigger, m.Context, m.ChannelName, m.History = payload.Mention, info.Purpose, info.Name, history
 		}
 		b, err := json.Marshal(m)
 		if err != nil {
@@ -212,13 +222,16 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		}
 		switch {
 		case m.Trigger == payload.Mention:
-			_, err = rt.RouteNew(ctx, ev.Channel, thread, b)
+			_, err = rt.RouteNew(ctx, ev.Channel, info.Name, thread, b)
 		case ev.IM && ev.ThreadTS == "":
 			_, err = rt.RouteNewDM(ctx, thread, b)
 		default:
 			_, err = rt.RouteReply(ctx, thread, b)
 		}
 		switch {
+		case errors.Is(err, route.ErrNoMachine) && !ev.IM:
+			slog.Info("inbound: mention in a channel no machine takes, not answered", "thread", thread)
+			return nil
 		case errors.Is(err, route.ErrNoMachine):
 			slog.Warn("inbound: new thread no machine takes", "thread", thread)
 			return r.tell(ctx, tx, thread, NoMachineText)
@@ -279,16 +292,16 @@ func files(fs []slack.File) []payload.File {
 	return out
 }
 
-// purpose returns channel's purpose, the context a new thread carries, or
-// "" when Slack does not give it; the message goes without, and the agent
-// can still ask for it.
-func (r *Receiver) purpose(ctx context.Context, channel string) string {
-	p, err := r.Slack.Purpose(ctx, channel)
+// channelInfo returns channel's name and purpose, which a new thread
+// carries, or neither when Slack does not give them; the message goes
+// without, and the agent can still ask for the purpose.
+func (r *Receiver) channelInfo(ctx context.Context, channel string) slack.ChannelInfo {
+	info, err := r.Slack.ChannelInfo(ctx, channel)
 	if err != nil {
-		slog.Warn("inbound: reading the channel's purpose, sending without", "channel", channel, "err", err)
-		return ""
+		slog.Warn("inbound: reading the channel's name and purpose, sending without", "channel", channel, "err", err)
+		return slack.ChannelInfo{}
 	}
-	return p
+	return info
 }
 
 // hasOwner reports whether thread has an owner in h.

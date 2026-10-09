@@ -113,6 +113,12 @@ type Message struct {
 	// empty for a reply, a direct message, or when the hub could not
 	// read it.
 	Context string `json:"context,omitempty"`
+	// ChannelName is the name of the channel, without the #, as it was
+	// when the thread got its owner: on the inbound message that hands
+	// the thread over and on every reply after it. Empty for a direct
+	// message, and when the hub could not read the name or owned the
+	// thread from before it recorded names.
+	ChannelName string `json:"channel_name,omitempty"`
 	// Trigger says why an inbound message was sent: Mention, Reply or DM.
 	Trigger string `json:"trigger,omitempty"`
 	// UserName is User's name on the hub's user list.

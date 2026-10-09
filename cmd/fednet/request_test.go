@@ -53,7 +53,7 @@ func TestHubRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { hs.Close() })
-	if _, _, err := hs.ClaimAndEnqueue(ctx, thread, "old-workstation", []byte("first")); err != nil {
+	if _, _, err := hs.ClaimAndEnqueue(ctx, thread, "old-workstation", "", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 

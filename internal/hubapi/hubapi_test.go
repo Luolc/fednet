@@ -92,7 +92,7 @@ func TestAdopt(t *testing.T) {
 	s, _ := testServer(t)
 	ctx := t.Context()
 	const key = "C1/1700000000.000100"
-	if _, _, err := s.Store.ClaimAndEnqueue(ctx, key, "old-workstation", []byte("first")); err != nil {
+	if _, _, err := s.Store.ClaimAndEnqueue(ctx, key, "old-workstation", "", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := answer(t, s, "workstation", Request{Cmd: Adopt, Thread: key}); err != nil {
@@ -148,7 +148,7 @@ func TestWithoutSlack(t *testing.T) {
 	s, _ := testServer(t)
 	s.Slack = nil
 	const key = "C1/1700000000.000100"
-	if _, _, err := s.Store.ClaimAndEnqueue(t.Context(), key, "old-workstation", []byte("first")); err != nil {
+	if _, _, err := s.Store.ClaimAndEnqueue(t.Context(), key, "old-workstation", "", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := answer(t, s, "workstation", Request{Cmd: ReadThread, Thread: key}); !errors.Is(err, errNoSlack) {
@@ -172,6 +172,7 @@ func (c *countPosts) Post(ctx context.Context, channel, text string) (string, er
 
 func TestOpenThread(t *testing.T) {
 	s, f := testServer(t)
+	f.RenameChannel("C1", "repo-fednet")
 	f.AddChannel("C2", "")
 	posts := &countPosts{API: f}
 	s.Slack = posts
@@ -191,6 +192,9 @@ func TestOpenThread(t *testing.T) {
 	}
 	if owner, err := s.Store.Owner(ctx, got.Thread); err != nil || owner != "workstation" {
 		t.Fatalf("owner of the new thread = %q, %v; want workstation", owner, err)
+	}
+	if name, err := s.Store.ChannelName(ctx, got.Thread); err != nil || name != "repo-fednet" {
+		t.Fatalf("channel name of the new thread = %q, %v; want repo-fednet", name, err)
 	}
 
 	tests := []struct {
@@ -213,6 +217,32 @@ func TestOpenThread(t *testing.T) {
 	// besides the first one.
 	if posts.n != 2 {
 		t.Fatalf("Slack got %d posts, want 2", posts.n)
+	}
+}
+
+// noChannelInfo is a Slack whose ChannelInfo fails.
+type noChannelInfo struct{ slack.API }
+
+func (noChannelInfo) ChannelInfo(context.Context, string) (slack.ChannelInfo, error) {
+	return slack.ChannelInfo{}, errors.New("flaky")
+}
+
+// A thread whose channel's name cannot be read is opened all the same,
+// with no name recorded.
+func TestOpenThreadWithoutChannelName(t *testing.T) {
+	s, f := testServer(t)
+	f.RenameChannel("C1", "repo-fednet")
+	s.Slack = noChannelInfo{f}
+	s.OpenThread = map[string][]string{"C1": {"workstation"}}
+	got, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner, err := s.Store.Owner(t.Context(), got.Thread); err != nil || owner != "workstation" {
+		t.Fatalf("owner of the new thread = %q, %v; want workstation", owner, err)
+	}
+	if name, err := s.Store.ChannelName(t.Context(), got.Thread); err != nil || name != "" {
+		t.Fatalf("channel name of the new thread = %q, %v; want none", name, err)
 	}
 }
 
@@ -297,7 +327,7 @@ func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
 func TestThreads(t *testing.T) {
 	s, _ := testServer(t)
 	for thread, client := range map[string]string{"C1/2": "workstation", "C1/1": "workstation", "C1/3": "datamachine"} {
-		if err := s.Store.Claim(t.Context(), thread, client); err != nil {
+		if err := s.Store.Claim(t.Context(), thread, client, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
