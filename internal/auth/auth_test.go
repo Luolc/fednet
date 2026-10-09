@@ -63,7 +63,8 @@ func TestCredentialFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Read(path); err == nil || strings.Contains(err.Error(), c1.Secret) {
-		t.Fatalf("Read of a group-readable file: err = %v, want an error without the secret", err)
+		t.Fatalf("Read of a group-readable file: err nil %v, contains the secret %v; want an error without the secret",
+			err == nil, err != nil && strings.Contains(err.Error(), c1.Secret))
 	}
 }
 
@@ -161,8 +162,9 @@ func TestIdentify(t *testing.T) {
 			t.Errorf("%s: downlink %d, uplink %d; want %d, %d", tt.name, down, up, tt.want, wantUp)
 		}
 		// A refusal says nothing about why; the reason is in the log.
+		// The body is not printed: a regression could put the credential in it.
 		if wantUp == http.StatusUnauthorized && body != "unauthorized\n" {
-			t.Errorf("%s: 401 body = %q, want just \"unauthorized\"", tt.name, body)
+			t.Errorf("%s: 401 body is %d bytes and not just \"unauthorized\"", tt.name, len(body))
 		}
 	}
 
@@ -206,11 +208,15 @@ func TestIdentifyErrors(t *testing.T) {
 	a := &Authenticator{Store: st}
 	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
 	req.Header = header("ws", Credential{ClientID: "ws", Secret: "not-the-secret"}, "")
+	// The error is not printed either: it is what might carry a credential.
 	_, err = a.Identify(req)
-	if err == nil || strings.Contains(err.Error(), "not-the-secret") || strings.Contains(err.Error(), good.Secret) {
-		t.Fatalf("Identify with a wrong credential: err = %v, want an error without either credential", err)
+	if err == nil {
+		t.Fatal("Identify with a wrong credential: err = nil")
+	}
+	if strings.Contains(err.Error(), "not-the-secret") || strings.Contains(err.Error(), good.Secret) {
+		t.Fatal("Identify error contains a credential")
 	}
 	if !strings.Contains(err.Error(), `"ws"`) {
-		t.Fatalf("Identify error %q does not name the client", err)
+		t.Fatal("Identify error does not name the client")
 	}
 }

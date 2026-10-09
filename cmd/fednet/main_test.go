@@ -112,26 +112,36 @@ func TestHubAndClient(t *testing.T) {
 	clientDB := filepath.Join(dir, "client.db")
 	credPath := filepath.Join(dir, "credential")
 	var stdout, stderr syncBuffer
+	// Whatever a failure prints goes through redact, so that a regression
+	// which leaks the credential does not leak it into the test log too.
+	var secret string
+	redact := func(s string) string {
+		if secret != "" {
+			s = strings.ReplaceAll(s, secret, "[REDACTED]")
+		}
+		return s
+	}
 	t.Cleanup(func() {
 		if t.Failed() {
-			t.Logf("stdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+			t.Logf("stdout:\n%s\nstderr:\n%s", redact(stdout.String()), redact(stderr.String()))
 		}
 	})
 
 	// The client makes its credential; the hub registers its hash.
 	if code := run(ctx, []string{"client", "init", "-id", "workstation", "-credential", credPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("client init: exit %d, stderr %q", code, stderr.String())
-	}
-	fields := strings.Fields(stdout.String())
-	if len(fields) != 2 || fields[0] != "workstation" || len(fields[1]) != 64 {
-		t.Fatalf("client init printed %q, want the client id and a hex SHA-256", stdout.String())
+		t.Fatalf("client init: exit %d, stderr %d bytes", code, len(stderr.String()))
 	}
 	cred, err := auth.Read(credPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	secret = cred.Secret
+	fields := strings.Fields(stdout.String())
+	if len(fields) != 2 || fields[0] != "workstation" || len(fields[1]) != 64 {
+		t.Fatalf("client init printed %q, want the client id and a hex SHA-256", redact(stdout.String()))
+	}
 	if code := run(ctx, []string{"hub", "register", "-db", hubDB, fields[0], fields[1]}, &stdout, &stderr); code != 0 {
-		t.Fatalf("hub register: exit %d, stderr %q", code, stderr.String())
+		t.Fatalf("hub register: exit %d, stderr %q", code, redact(stderr.String()))
 	}
 
 	// A message queued on the hub before the client ever connects.
@@ -188,7 +198,7 @@ func TestHubAndClient(t *testing.T) {
 
 	// Retiring the client, and a client the hub never heard of.
 	if code := run(ctx, []string{"hub", "revoke", "-db", hubDB, "workstation"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("hub revoke: exit %d, stderr %q", code, stderr.String())
+		t.Fatalf("hub revoke: exit %d, stderr %q", code, redact(stderr.String()))
 	}
 	if reg, err := hs.Registration(ctx, "workstation"); err != nil || !reg.Revoked {
 		t.Fatalf("Registration(workstation) after revoke = %+v, %v; want revoked", reg, err)
@@ -204,7 +214,7 @@ func TestHubAndClient(t *testing.T) {
 		}
 	}
 	if !strings.Contains(stdout.String(), "workstation") || !strings.Contains(stderr.String(), "nobody") {
-		t.Fatalf("stdout %q / stderr %q do not name the clients", stdout.String(), stderr.String())
+		t.Fatalf("stdout %q / stderr %q do not name the clients", redact(stdout.String()), redact(stderr.String()))
 	}
 	if fi, err := os.Stat(credPath); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("credential file mode = %v, %v; want 0600", fi.Mode(), err)
