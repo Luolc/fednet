@@ -11,14 +11,17 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -32,7 +35,7 @@ func serve(t *testing.T, c *link.Client) string {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- (&Server{Post: c.Post}).Serve(ctx, ln) }()
+	go func() { done <- (&Server{Post: c.Post, Request: c.Request}).Serve(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
@@ -93,7 +96,7 @@ func TestBadRequest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			res, err := Do(t.Context(), path, tt.req)
-			if err != nil || !res.BadRequest || res.Error == "" || res.MsgID != "" {
+			if err != nil || res.Kind != BadRequest || res.Error == "" || res.MsgID != "" {
 				t.Fatalf("Do = %+v, %v; want a bad request", res, err)
 			}
 		})
@@ -326,5 +329,73 @@ func TestListenConcurrent(t *testing.T) {
 	conn.Close()
 	if err := <-accepted; err != nil {
 		t.Fatalf("the winner did not get the connection: %v", err)
+	}
+}
+
+// Requests for the hub are answered with the hub's reply, and a failure
+// says why.
+func TestAsk(t *testing.T) {
+	ctx := t.Context()
+	hs, err := store.OpenHub(ctx, filepath.Join(t.TempDir(), "hub.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { hs.Close() })
+	f := &slack.Fake{}
+	f.AddChannel("C1", "repo: fednet")
+	ts, err := f.Start("C1", "U1", "please fix the build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := &link.Hub{Store: hs, Answer: (&hubapi.Server{Store: hs, Slack: f}).Answer}
+	srv := httptest.NewServer(hub.Handler())
+	t.Cleanup(func() {
+		hub.Close()
+		srv.Close()
+	})
+	path := serve(t, &link.Client{ID: "workstation", Hub: srv.URL})
+
+	res, err := Do(ctx, path, Request{Cmd: hubapi.ReadThread, Thread: slack.ThreadKey("C1", ts)})
+	want := []slack.Message{{TS: ts, User: "U1", Text: "please fix the build"}}
+	if err != nil || res.Error != "" || !slices.Equal(res.Messages, want) {
+		t.Fatalf("Do(read-thread) = %+v, %v; want %+v", res, err, want)
+	}
+	res, err = Do(ctx, path, Request{Cmd: hubapi.GetChannelContext, Channel: "C1"})
+	if err != nil || res.Error != "" || res.Text != "repo: fednet" {
+		t.Fatalf("Do(channel-context-get) = %+v, %v; want the purpose", res, err)
+	}
+
+	tests := []struct {
+		name string
+		req  Request
+		kind string
+	}{
+		{"a malformed thread key", Request{Cmd: hubapi.ReadThread, Thread: "C1"}, BadRequest},
+		{"a thread that does not exist", Request{Cmd: hubapi.ReadThread, Thread: "C1/1600000000.000001"}, NotFound},
+	}
+	for _, tt := range tests {
+		res, err := Do(ctx, path, tt.req)
+		if err != nil || res.Error == "" || res.Kind != tt.kind {
+			t.Errorf("%s: Do = %+v, %v; want kind %q", tt.name, res, err, tt.kind)
+		}
+	}
+}
+
+// With the hub down a request for it fails at once; it is not queued.
+func TestAskWhileHubDown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := "http://" + ln.Addr().String()
+	ln.Close()
+	st := openClientStore(t)
+	path := serve(t, &link.Client{Store: st, ID: "workstation", Hub: hub})
+	res, err := Do(t.Context(), path, Request{Cmd: hubapi.Adopt, Thread: "C1/1700000000.000100"})
+	if err != nil || res.Error == "" || res.Kind != Unreachable {
+		t.Fatalf("Do(adopt) = %+v, %v; want kind %q", res, err, Unreachable)
+	}
+	if ms, err := st.Outbox.Pending(t.Context()); err != nil || len(ms) != 0 {
+		t.Fatalf("outbox = %+v, %v; want empty", ms, err)
 	}
 }

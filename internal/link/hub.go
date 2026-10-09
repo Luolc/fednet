@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -26,6 +27,10 @@ type Hub struct {
 	// Identify returns the id of the client behind r. Nil means the id is
 	// read from ClientHeader as is.
 	Identify func(r *http.Request) (string, error)
+	// Answer answers a request from client. An error made by Refuse goes
+	// back to the client; any other error is logged and the client only
+	// learns that the request failed. Nil means every request fails.
+	Answer func(ctx context.Context, client string, req []byte) ([]byte, error)
 
 	mu       sync.Mutex
 	seen     map[string]time.Time
@@ -72,11 +77,12 @@ func (h *Hub) authorize(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return client, true
 }
 
-// Handler serves DownlinkPath and UplinkPath.
+// Handler serves DownlinkPath, UplinkPath and RequestPath.
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+DownlinkPath, h.serveDownlink)
 	mux.HandleFunc("POST "+UplinkPath, h.serveUplink)
+	mux.HandleFunc("POST "+RequestPath, h.serveRequest)
 	return mux
 }
 
@@ -254,4 +260,49 @@ func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// refusals maps each refusal to the status it is sent with.
+var refusals = []struct {
+	err    error
+	status int
+}{
+	{ErrBadRequest, http.StatusBadRequest},
+	{ErrDenied, http.StatusForbidden},
+	{ErrNotFound, http.StatusNotFound},
+}
+
+// serveRequest answers one request with 200 and the answer, or with the
+// status of a refusal and its text.
+func (h *Hub) serveRequest(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.authorize(w, r)
+	if !ok {
+		return
+	}
+	req, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxFrameBytes))
+	if err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
+	if h.Answer == nil {
+		http.Error(w, "the hub answers no requests", http.StatusInternalServerError)
+		return
+	}
+	answer, err := h.Answer(r.Context(), client, req)
+	var rf refusal
+	if errors.As(err, &rf) {
+		for _, f := range refusals {
+			if rf.kind == f.err {
+				http.Error(w, rf.msg, f.status)
+				return
+			}
+		}
+	}
+	if err != nil {
+		slog.Warn("link: request", "client", client, "err", err)
+		http.Error(w, "the hub failed to answer", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(answer)
 }
