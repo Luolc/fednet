@@ -45,8 +45,9 @@ const (
 	// RequestApproval asks the people on the approver list to approve an
 	// action: Text says what it does, Action is its parameters, Agent is
 	// the agent that will act, and Requester, if set, is the Slack user id
-	// of the person the agent asks on behalf of. It returns the approval
-	// id; the outcome comes down the link later.
+	// of the person the agent says it asks on behalf of, a note on the
+	// card. It returns the approval id; the outcome comes down the link
+	// later.
 	RequestApproval = "request-approval"
 )
 
@@ -273,16 +274,17 @@ func (s *Server) requestApproval(ctx context.Context, client string, r Request) 
 	switch {
 	case r.Agent == "" || r.Text == "" || len(r.Action) == 0:
 		return "", link.Refuse(link.ErrBadRequest, "needs an agent, a text and an action")
-	case len(r.Action) > approval.MaxAction:
-		return "", link.Refuse(link.ErrBadRequest, "action has %d bytes, at most %d", len(r.Action), approval.MaxAction)
 	case !json.Valid(r.Action):
 		return "", link.Refuse(link.ErrBadRequest, "action is not JSON")
 	case s.Approvals == nil:
 		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
 	}
 	id, err := s.Approvals.Request(ctx, client, r.Agent, r.Requester, r.Text, r.Action)
-	if errors.Is(err, approval.ErrOff) {
+	switch {
+	case errors.Is(err, approval.ErrOff):
 		return "", link.Refuse(link.ErrDenied, "%v", err)
+	case errors.Is(err, approval.ErrTooBig):
+		return "", link.Refuse(link.ErrBadRequest, "%v", err)
 	}
 	return id, err
 }

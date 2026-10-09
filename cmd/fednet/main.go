@@ -98,7 +98,8 @@ commands:
         its parameters as JSON, NAME is the agent that will act; prints the
         approval id once the hub has posted the card; the outcome comes as
         a message of type approval through the hook, signed when approved;
-        the user given as -requester may not decide it
+        an action the card cannot show whole is refused; -requester is a
+        note on the card, not checked
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   approval verify -pubkey PATH -approval PATH -action PATH -machine CLIENT-ID -agent NAME -used PATH
@@ -911,7 +912,7 @@ func clientRequestApproval(ctx context.Context, args []string, stdout io.Writer)
 	socket, asJSON := socketFlags(fs)
 	agent := fs.String("agent", "", "the agent that will act (required)")
 	actionPath := fs.String("action", "", "file holding the action's parameters as JSON (required)")
-	requester := fs.String("requester", "", "Slack id of the person the agent asks on behalf of; they may not decide it")
+	requester := fs.String("requester", "", "Slack id of the person the agent asks on behalf of, shown on the card as the agent's own word")
 	if err := parseFlags(fs, args, 1); err != nil {
 		return err
 	}

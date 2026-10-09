@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
@@ -240,30 +241,32 @@ func (w *Web) Whisper(ctx context.Context, channel, user, text string) error {
 	})
 }
 
-// maxParams is how much of the action's parameters a card shows; Slack
-// takes at most 3000 characters in one text object.
-const maxParams = 2500
-
-// blocks lays the card out: a header, the summary, the parameters in a
-// code block, who asks and when it expires, then the buttons while it
+// blocks lays the card out: a header, the summary, the parameters in code
+// blocks (one block each chunk of ParamBlocks, which the caller has
+// checked fit), who asks and when it expires, then the buttons while it
 // waits or how it ended once decided. Times are Slack date tokens, which
 // each reader sees in their own time zone.
 func blocks(c Card) []slackgo.Block {
-	params := c.Params
-	if len(params) > maxParams {
-		params = params[:maxParams] + "\n…(truncated)"
-	}
 	bs := []slackgo.Block{
 		slackgo.NewHeaderBlock(slackgo.NewTextBlockObject(slackgo.PlainTextType, "审批请求", false, false)),
-		slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, "*做什么*\n"+c.Summary, false, false), nil, nil),
-		slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, "*参数*\n```"+params+"```", false, false), nil, nil),
-		slackgo.NewSectionBlock(nil, []*slackgo.TextBlockObject{
-			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*机器*\n"+c.Machine, false, false),
-			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*agent*\n"+c.Agent, false, false),
-			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*过期*\n"+date(c.Expires), false, false),
-			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*编号*\n"+c.ID, false, false),
-		}, nil),
+		slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, "*做什么*\n"+escape(c.Summary), false, false), nil, nil),
 	}
+	chunks, _ := ParamBlocks(c.Params)
+	for i, chunk := range chunks {
+		text := "```" + chunk + "```"
+		if i == 0 {
+			text = "*参数*\n" + text
+		}
+		bs = append(bs, slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, text, false, false), nil, nil))
+	}
+	who := "*机器* (hub 认证)\n" + c.Machine + "\n*agent* (自报)\n" + c.Agent
+	if c.Requester != "" {
+		who += "\n*代谁* (agent 自报，不参与校验)\n<@" + c.Requester + ">"
+	}
+	bs = append(bs, slackgo.NewSectionBlock(nil, []*slackgo.TextBlockObject{
+		slackgo.NewTextBlockObject(slackgo.MarkdownType, who, false, false),
+		slackgo.NewTextBlockObject(slackgo.MarkdownType, "*过期*\n"+date(c.Expires)+"\n*编号*\n"+c.ID, false, false),
+	}, nil))
 	if c.Outcome == "" {
 		return append(bs, slackgo.NewActionBlock("approval:"+c.ID,
 			slackgo.NewButtonBlockElement(ApproveAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "批准", false, false)).WithStyle(slackgo.StylePrimary),
@@ -271,6 +274,11 @@ func blocks(c Card) []slackgo.Block {
 		))
 	}
 	return append(bs, slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, outcomeText(c), false, false), nil, nil))
+}
+
+// escape makes s show as is in Slack's markup.
+func escape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 // outcomeText says how a decided card ended, in one line.

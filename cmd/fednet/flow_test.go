@@ -208,11 +208,13 @@ func TestApprovalFlow(t *testing.T) {
 	}
 	ts := tss[0]
 
-	// Not on the list, a bot, the requester: nothing is decided.
+	if cards[0].Requester != "U2" {
+		t.Fatalf("card = %+v, want the requester note U2", cards[0])
+	}
+	// Not on the list, a bot: nothing is decided.
 	for _, c := range []slack.Click{
 		{ID: id, Approve: true, User: "U9", Channel: "C9", TS: ts},
 		{ID: id, Approve: true, User: "U1", Bot: true, Channel: "C9", TS: ts},
-		{ID: id, Approve: true, User: "U2", Channel: "C9", TS: ts},
 	} {
 		if err := rig.sr.r.Click(ctx, c); err != nil {
 			t.Fatal(err)
@@ -223,9 +225,6 @@ func TestApprovalFlow(t *testing.T) {
 	}
 	if ms := rig.outcomes(t); len(ms) != 0 {
 		t.Fatalf("outcomes after clicks that do not count = %+v, want none", ms)
-	}
-	if w := rig.f.Whispers("U2"); len(w) != 1 || !strings.Contains(w[0], "请求方") {
-		t.Fatalf("U2 was told %q, want that the requester may not decide", w)
 	}
 
 	// The approver clicks twice: one outcome, signed, reaches the hook.
@@ -261,9 +260,22 @@ func TestApprovalFlow(t *testing.T) {
 		t.Fatalf("approval verify with a changed action: exit %d, want %d", code, exitMismatch)
 	}
 
+	// An action the card cannot show whole is refused as a bad request.
+	big := filepath.Join(rig.dir, "big.json")
+	if err := os.WriteFile(big, []byte(`"`+strings.Repeat("x", 46*2900)+`"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := rig.request(t, ctx, big); code != exitBadRequest || out != "" {
+		t.Fatalf("request-approval with an action too big for a card: exit %d, printed %q; want %d and nothing", code, out, exitBadRequest)
+	}
+	if _, cards := rig.f.Cards("C9"); len(cards) != 1 {
+		t.Fatalf("%d cards after the refused request, want still 1", len(cards))
+	}
+
 	// A second request, rejected: the outcome comes back without a
-	// signature, and a click to approve after that changes nothing.
-	code, id2 := rig.request(t, ctx, actionPath)
+	// signature, and a click to approve after that changes nothing. The
+	// approver named as requester decides like any approver.
+	code, id2 := rig.request(t, ctx, actionPath, "-requester", "U2")
 	if code != 0 || id2 == "" || id2 == id {
 		t.Fatalf("second request-approval: exit %d, printed %q", code, id2)
 	}

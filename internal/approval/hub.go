@@ -17,9 +17,6 @@ import (
 	"github.com/Luolc/fednet/internal/store"
 )
 
-// MaxAction is the largest action, in bytes, a request may carry.
-const MaxAction = 64 << 10
-
 // DefaultInterval is how often Run looks for approvals that have expired
 // and for cards that do not show their outcome yet.
 const DefaultInterval = time.Minute
@@ -28,6 +25,11 @@ const DefaultInterval = time.Minute
 // it has no key, no Slack, no card channel or no approvers. Nothing is
 // recorded or posted then, so no approval can be given.
 var ErrOff = errors.New("approval: approvals are not set up on the hub")
+
+// ErrTooBig is returned by Flow.Request for an action the card cannot
+// show whole: what the approver sees must be what is signed, so such an
+// action is refused rather than shown cut.
+var ErrTooBig = errors.New("approval: the action does not fit in one card")
 
 // Flow runs approvals on the hub: Request records what an agent asks and
 // posts the card; Click applies a press on a card's button; Run expires
@@ -58,12 +60,17 @@ type Flow struct {
 
 // Request records an approval client's agent asks for, with summary saying
 // what the action does and action its parameters, and posts the card. It
-// returns the approval id. requester, if not empty, is the Slack user id
-// of the person the agent asks on behalf of; they may not decide it. The
-// hash the signature will cover is of action byte for byte.
+// returns the approval id. client is who asks, as the hub authenticated
+// it; agent and requester (the Slack user id of the person the agent says
+// it asks on behalf of, or empty) are what the agent reported: the card
+// shows them as such, and no check reads them. The hash the signature
+// will cover is of action byte for byte.
 func (f *Flow) Request(ctx context.Context, client, agent, requester, summary string, action []byte) (string, error) {
 	if f.Key == nil || f.Slack == nil || f.Channel == "" || len(f.Approvers) == 0 {
 		return "", ErrOff
+	}
+	if _, ok := slack.ParamBlocks(string(action)); !ok {
+		return "", ErrTooBig
 	}
 	now := f.now()
 	a := store.Approval{
@@ -95,9 +102,8 @@ func (f *Flow) Request(ctx context.Context, client, agent, requester, summary st
 // could not be recorded; tests shorten it.
 var deleteTimeout = 30 * time.Second
 
-// Click applies c. A click counts only if the clicker is an approver, not
-// a bot and not the requester, and the approval is still pending and not
-// expired; a click that does not count changes nothing, and the clicker
+// Click applies c. A click counts only if the clicker is an approver and
+// not a bot, and the approval is still pending and not expired; a click that does not count changes nothing, and the clicker
 // is told why in an ephemeral message. A click that counts decides the
 // approval, queues the outcome for the client, then updates the card. An
 // error means nothing was decided and the click should not be acked.
@@ -130,9 +136,6 @@ func (f *Flow) click(ctx context.Context, c slack.Click) (string, error) {
 	}
 	if err != nil {
 		return "", err
-	}
-	if a.Requester == c.User {
-		return "请求方不能处理自己发起的审批", nil
 	}
 	if a.Status != store.Pending {
 		return "这张卡已经处理过了：" + outcomeName(a.Status), nil
@@ -223,7 +226,7 @@ func (f *Flow) finishCard(ctx context.Context, a store.Approval) {
 
 // card is a's card as it should look now.
 func card(a store.Approval) slack.Card {
-	c := slack.Card{ID: a.ID, Summary: a.Summary, Params: string(a.Action), Machine: a.Client, Agent: a.Agent, Expires: a.ExpiresAt}
+	c := slack.Card{ID: a.ID, Summary: a.Summary, Params: string(a.Action), Machine: a.Client, Agent: a.Agent, Requester: a.Requester, Expires: a.ExpiresAt}
 	if a.Status != store.Pending {
 		c.Outcome, c.Approver, c.DecidedAt = a.Status, a.DecidedBy, a.DecidedAt
 	}

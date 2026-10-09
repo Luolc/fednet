@@ -18,8 +18,9 @@ type Approval struct {
 	// Client and Agent are who requested: the agent on the client.
 	Client string
 	Agent  string
-	// Requester is the Slack user id of the person on whose behalf the
-	// agent asked, if the request named one; they may not decide it.
+	// Requester is the Slack user id of the person the agent said it asks
+	// on behalf of, if the request named one: a note for the card, read by
+	// no check.
 	Requester string
 	// Summary says what the action does; Action is its parameters, the
 	// JSON the agent handed in, byte for byte.

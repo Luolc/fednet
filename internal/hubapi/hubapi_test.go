@@ -373,7 +373,7 @@ func TestRequestApproval(t *testing.T) {
 		{"no text", Request{Cmd: RequestApproval, Agent: "a", Action: action}, link.ErrBadRequest},
 		{"no action", Request{Cmd: RequestApproval, Agent: "a", Text: "x"}, link.ErrBadRequest},
 		{"action not JSON", Request{Cmd: RequestApproval, Agent: "a", Text: "x", Action: []byte("{")}, link.ErrBadRequest},
-		{"action too big", Request{Cmd: RequestApproval, Agent: "a", Text: "x", Action: append([]byte(`"`), append(bytes.Repeat([]byte("x"), approval.MaxAction), '"')...)}, link.ErrBadRequest},
+		{"action too big for a card", Request{Cmd: RequestApproval, Agent: "a", Text: "x", Action: append([]byte(`"`), append(bytes.Repeat([]byte("x"), 46*2900), '"')...)}, link.ErrBadRequest},
 	}
 	for _, tt := range tests {
 		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, tt.want) {

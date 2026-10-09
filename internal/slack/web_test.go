@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	slackgo "github.com/slack-go/slack"
 )
@@ -351,9 +352,10 @@ func blocksJSON(t *testing.T, bs []slackgo.Block) string {
 }
 
 // A pending card has the two buttons, each carrying the approval id; a
-// decided card has none and says how it ended; long parameters are cut.
+// decided card has none and says how it ended; long parameters go whole,
+// over several blocks, with Slack's markup characters escaped.
 func TestCardBlocks(t *testing.T) {
-	c := Card{ID: "apr-1", Summary: "delete b", Params: `{"b":1}`, Machine: "workstation", Agent: "ops-exec", Expires: time.Unix(1_760_000_000, 0)}
+	c := Card{ID: "apr-1", Summary: "delete b", Params: `{"b":1}`, Machine: "workstation", Agent: "ops-exec", Requester: "U7", Expires: time.Unix(1_760_000_000, 0)}
 	bs := blocks(c)
 	actions, ok := bs[len(bs)-1].(*slackgo.ActionBlock)
 	if !ok || len(actions.Elements.ElementSet) != 2 {
@@ -366,7 +368,7 @@ func TestCardBlocks(t *testing.T) {
 		}
 	}
 	text := blocksJSON(t, bs)
-	for _, want := range []string{"delete b", `{\"b\":1}`, "workstation", "ops-exec", "<!date^1760000000^"} {
+	for _, want := range []string{"delete b", `{\"b\":1}`, "workstation", "ops-exec", "<@U7>", "自报", "<!date^1760000000^"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("pending card %s lacks %q", text, want)
 		}
@@ -390,10 +392,41 @@ func TestCardBlocks(t *testing.T) {
 		t.Errorf("expired card %s does not say expired", text)
 	}
 
-	c.Params = strings.Repeat("x", maxParams+1)
-	text = blocksJSON(t, blocks(c))
-	if strings.Contains(text, c.Params) || !strings.Contains(text, "truncated") {
-		t.Error("long parameters are not cut")
+	c.Params = `{"a": "<x & y>", "b": "` + strings.Repeat("é", paramChunk) + `"}`
+	bs = blocks(c)
+	var params []string
+	for _, b := range bs {
+		if sec, ok := b.(*slackgo.SectionBlock); ok && sec.Text != nil && strings.Contains(sec.Text.Text, "```") {
+			params = append(params, strings.Trim(strings.TrimPrefix(sec.Text.Text, "*参数*\n"), "`"))
+		}
+	}
+	if len(params) != 2 || strings.Join(params, "") != escape(c.Params) || !strings.HasPrefix(params[0], `{"a": "&lt;x &amp; y&gt;"`) {
+		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the escaped parameters", len(params), strings.Join(params, ""))
+	}
+	for _, p := range params {
+		if utf8.RuneCountInString(p) > paramChunk || !utf8.ValidString(p) {
+			t.Fatalf("a parameter block has %d characters or is cut inside a character", utf8.RuneCountInString(p))
+		}
+	}
+}
+
+// ParamBlocks fits at most maxParamChunks blocks of paramChunk characters
+// each; one character more does not fit; an entity is never split.
+func TestParamBlocks(t *testing.T) {
+	exact := strings.Repeat("x", maxParamChunks*paramChunk)
+	if chunks, ok := ParamBlocks(exact); !ok || len(chunks) != maxParamChunks {
+		t.Fatalf("ParamBlocks(exact) = %d blocks, %v; want %d, true", len(chunks), ok, maxParamChunks)
+	}
+	if _, ok := ParamBlocks(exact + "x"); ok {
+		t.Fatal("ParamBlocks(exact + 1) fits")
+	}
+	// An & at the end of a block moves whole to the next.
+	chunks, _ := ParamBlocks(strings.Repeat("x", paramChunk-2) + "&y")
+	if len(chunks) != 2 || chunks[1] != "&amp;y" {
+		t.Fatalf("ParamBlocks around an entity = %q, want the entity whole in the second block", chunks)
+	}
+	if chunks, ok := ParamBlocks(""); !ok || len(chunks) != 1 || chunks[0] != "" {
+		t.Fatalf("ParamBlocks(\"\") = %q, %v; want one empty block", chunks, ok)
 	}
 }
 

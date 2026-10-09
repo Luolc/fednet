@@ -158,12 +158,16 @@ func TestFlowApprove(t *testing.T) {
 	}
 }
 
-// Clicks by someone not on the approver list, by a bot, and by the
-// requester do not count: the approval stays pending, nothing is sent,
-// and the clicker is told why. An approver's click still counts after.
+// Clicks by someone not on the approver list and by a bot do not count:
+// the approval stays pending, nothing is sent, and the clicker is told
+// why. The requester the agent named is a note on the card, read by no
+// check: an approver named there still decides.
 func TestFlowRefusesClicks(t *testing.T) {
 	tf := newFlow(t)
-	id, ts := tf.request(t, "U2")
+	id, ts := tf.request(t, "U1")
+	if c := tf.card(t, ts); c.Requester != "U1" || c.Machine != "workstation" {
+		t.Fatalf("card = %+v, want the requester note U1 and the authenticated machine", c)
+	}
 	for _, c := range []struct {
 		user string
 		bot  bool
@@ -171,7 +175,6 @@ func TestFlowRefusesClicks(t *testing.T) {
 	}{
 		{"U3", false, "不在审批人名单"},
 		{"B1", true, "bot"},
-		{"U2", false, "请求方"},
 	} {
 		if err := tf.Click(t.Context(), slack.Click{ID: id, Approve: true, User: c.user, Bot: c.bot, Channel: "C9", TS: ts}); err != nil {
 			t.Fatal(err)
@@ -196,8 +199,48 @@ func TestFlowRefusesClicks(t *testing.T) {
 	}
 
 	tf.click(t, id, ts, "U1", true)
-	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 || ms[0].Outcome != payload.Approved {
-		t.Fatalf("outcomes after U1's click = %+v, want one approved", ms)
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 || ms[0].Outcome != payload.Approved || ms[0].Approver != "U1" {
+		t.Fatalf("outcomes after U1's click = %+v, want one approved by U1", ms)
+	}
+}
+
+// The card shows the whole action: one that just fits is shown whole and
+// signed over whole; one character more is refused before any card is
+// posted.
+func TestFlowActionMustFitTheCard(t *testing.T) {
+	tf := newFlow(t)
+	// 46 blocks of 2900 characters, as a JSON string.
+	fits := `"` + strings.Repeat("x", 46*2900-2) + `"`
+	id, err := tf.Request(t.Context(), "workstation", "ops-exec", "", "big one", []byte(fits))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tss, cards := tf.f.Cards("C9")
+	if len(cards) != 1 || cards[0].Params != fits {
+		t.Fatalf("card shows %d characters of the action, want all %d", len(cards[0].Params), len(fits))
+	}
+	tf.click(t, id, tss[0], "U1", true)
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 1 || ms[0].Outcome != payload.Approved {
+		t.Fatalf("outcomes = %+v, want one approved", ms)
+	}
+	var a Approval
+	if err := json.Unmarshal(ms[0].Approval, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.ParamsSHA256 != sha256.Sum256([]byte(fits)) {
+		t.Fatal("the signature is not over the whole action")
+	}
+
+	_, err = tf.Request(t.Context(), "workstation", "ops-exec", "", "too big", []byte(fits+" "))
+	if !errors.Is(err, ErrTooBig) {
+		t.Fatalf("Request with one character too many = %v, want ErrTooBig", err)
+	}
+	if _, cards := tf.f.Cards("C9"); len(cards) != 1 {
+		t.Fatalf("cards = %d, want still the one that fit", len(cards))
+	}
+	if ps, err := tf.Store.PendingApprovals(t.Context()); err != nil || len(ps) != 0 {
+		t.Fatalf("pending = %+v, %v; want none left", ps, err)
 	}
 }
 
