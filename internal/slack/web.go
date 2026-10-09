@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
@@ -87,10 +88,73 @@ func (w *Web) Replies(ctx context.Context, channel, ts string) ([]Message, error
 			return nil, err
 		}
 		for _, m := range page {
-			ms = append(ms, Message{TS: m.Timestamp, User: m.User, Text: m.Text})
+			ms = append(ms, message(m))
 		}
 		if next == "" {
 			return ms, nil
+		}
+		p.Cursor = next
+	}
+}
+
+// message converts a message as Slack returns it. A thread's first message
+// carries its own ts as thread_ts, which here means "not a reply".
+func message(m slackgo.Message) Message {
+	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType}
+	if m.ThreadTimestamp != m.Timestamp {
+		out.ThreadTS = m.ThreadTimestamp
+	}
+	for _, f := range m.Files {
+		out.Files = append(out.Files, File{Name: f.Name, URL: f.Permalink})
+	}
+	return out
+}
+
+// History pages through conversations.history, which Slack returns newest
+// first, and puts the result oldest first.
+func (w *Web) History(ctx context.Context, channel, oldest string) ([]Message, error) {
+	p := &slackgo.GetConversationHistoryParameters{ChannelID: channel, Oldest: oldest}
+	var ms []Message
+	for {
+		var res *slackgo.GetConversationHistoryResponse
+		err := w.call(ctx, "conversations.history", func() (err error) {
+			res, err = w.c.GetConversationHistoryContext(ctx, p)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range res.Messages {
+			ms = append(ms, message(m))
+		}
+		if !res.HasMore || res.ResponseMetaData.NextCursor == "" {
+			slices.Reverse(ms)
+			return ms, nil
+		}
+		p.Cursor = res.ResponseMetaData.NextCursor
+	}
+}
+
+// Conversations pages through users.conversations for the bot's own
+// channels, private channels and direct messages.
+func (w *Web) Conversations(ctx context.Context) ([]Conversation, error) {
+	p := &slackgo.GetConversationsForUserParameters{Types: []string{"public_channel", "private_channel", "im"}}
+	var cs []Conversation
+	for {
+		var page []slackgo.Channel
+		var next string
+		err := w.call(ctx, "users.conversations", func() (err error) {
+			page, next, err = w.c.GetConversationsForUserContext(ctx, p)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range page {
+			cs = append(cs, Conversation{ID: c.ID, IM: c.IsIM})
+		}
+		if next == "" {
+			return cs, nil
 		}
 		p.Cursor = next
 	}
@@ -103,6 +167,15 @@ func (w *Web) Post(ctx context.Context, channel, text string) (string, error) {
 		return err
 	})
 	return ts, err
+}
+
+func (w *Web) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
+	var reply string
+	err := w.call(ctx, "chat.postMessage", func() (err error) {
+		_, reply, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionText(text, false), slackgo.MsgOptionTS(ts))
+		return err
+	})
+	return reply, err
 }
 
 func (w *Web) Purpose(ctx context.Context, channel string) (string, error) {

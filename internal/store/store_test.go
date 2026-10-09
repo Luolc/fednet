@@ -713,3 +713,97 @@ func TestClaimAndThreads(t *testing.T) {
 		t.Fatalf("Threads(b) = %v, %v; want [C2/1]", got, err)
 	}
 }
+
+func TestReceiveSlack(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	var handled []string
+	receive := func(m SlackMessage) bool {
+		t.Helper()
+		fresh, err := h.ReceiveSlack(ctx, m, func(tx *Hub) error {
+			handled = append(handled, m.Channel+"/"+m.TS)
+			_, err := tx.Outbox.Enqueue(ctx, "a", []byte(m.TS))
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fresh
+	}
+	for i, tt := range []struct {
+		m    SlackMessage
+		want bool
+	}{
+		{SlackMessage{"C1", "1.1", "Ev1"}, true},
+		// The same event again, and the same message by another event.
+		{SlackMessage{"C1", "1.1", "Ev1"}, false},
+		{SlackMessage{"C1", "1.1", "Ev2"}, false},
+		// The same message read from history, with no event id.
+		{SlackMessage{"C1", "1.1", ""}, false},
+		// Messages from history have no event id to collide on.
+		{SlackMessage{"C1", "1.0", ""}, true},
+		{SlackMessage{"C2", "1.0", ""}, true},
+		// An event seen before, now carrying another message.
+		{SlackMessage{"C2", "1.2", "Ev1"}, false},
+		{SlackMessage{"C2", "1.2", "Ev3"}, true},
+	} {
+		if got := receive(tt.m); got != tt.want {
+			t.Fatalf("#%d ReceiveSlack(%+v) = %v, want %v", i, tt.m, got, tt.want)
+		}
+	}
+	if want := []string{"C1/1.1", "C1/1.0", "C2/1.0", "C2/1.2"}; !slices.Equal(handled, want) {
+		t.Fatalf("handled %v, want %v", handled, want)
+	}
+	got, err := h.Outbox.After(ctx, "a", 0)
+	if err != nil || len(got) != 4 {
+		t.Fatalf("queued %d, %v; want the 4 fresh messages", len(got), err)
+	}
+	// LastSeen is the latest ts taken in, not the last.
+	if v, err := h.SlackState(ctx, LastSeen); err != nil || v != "1.2" {
+		t.Fatalf("LastSeen = %q, %v; want 1.2", v, err)
+	}
+	// A failing handler leaves no record, so the message can come again.
+	boom := errors.New("boom")
+	if fresh, err := h.ReceiveSlack(ctx, SlackMessage{"C3", "9.9", "Ev9"}, func(*Hub) error { return boom }); fresh || !errors.Is(err, boom) {
+		t.Fatalf("ReceiveSlack with a failing handler = %v, %v; want false, boom", fresh, err)
+	}
+	if v, _ := h.SlackState(ctx, LastSeen); v != "1.2" {
+		t.Fatalf("LastSeen after a failed receive = %q, want 1.2", v)
+	}
+	if fresh := receive(SlackMessage{"C3", "9.9", "Ev9"}); !fresh {
+		t.Fatal("the message of a failed receive was not fresh when it came again")
+	}
+}
+
+func TestSlackState(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	if v, err := h.SlackState(ctx, BackfillFrom); err != nil || v != "" {
+		t.Fatalf("SlackState of an unset key = %q, %v; want empty", v, err)
+	}
+	for _, v := range []string{"1.1", "2.2", ""} {
+		if err := h.SetSlackState(ctx, BackfillFrom, v); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := h.SlackState(ctx, BackfillFrom); err != nil || got != v {
+			t.Fatalf("SlackState after setting %q = %q, %v", v, got, err)
+		}
+	}
+}
+
+func TestThreadsIn(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	for thread, client := range map[string]string{"C1/1.2": "a", "C1/1.1": "b", "C10/1.1": "a", "D1/1.1": "a"} {
+		if err := h.Claim(ctx, thread, client); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := h.ThreadsIn(ctx, "C1")
+	if err != nil || !slices.Equal(got, []string{"C1/1.1", "C1/1.2"}) {
+		t.Fatalf("ThreadsIn(C1) = %v, %v; want [C1/1.1 C1/1.2]", got, err)
+	}
+	if got, err := h.ThreadsIn(ctx, "C2"); err != nil || len(got) != 0 {
+		t.Fatalf("ThreadsIn(C2) = %v, %v; want nothing", got, err)
+	}
+}

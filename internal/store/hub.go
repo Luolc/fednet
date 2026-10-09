@@ -40,18 +40,49 @@ CREATE TABLE client (
 	revoked     INTEGER NOT NULL DEFAULT 0,
 	version     TEXT NOT NULL DEFAULT ''
 );
+`, `
+-- The messages people posted in Slack that the hub has taken in, live or
+-- by backfill, keyed by channel and ts; a live one also records the id of
+-- the event that brought it. Either key repeating means the message was
+-- taken in before.
+CREATE TABLE slack_message (
+	channel  TEXT NOT NULL,
+	ts       TEXT NOT NULL,
+	event_id TEXT UNIQUE,
+	PRIMARY KEY (channel, ts)
+);
+-- Where the hub stands with Slack's history, by key: see the constants in
+-- inbound.go.
+CREATE TABLE slack_state (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.
 var ErrNotFound = errors.New("store: not found")
 
-// Hub is the hub's database.
+// Hub is the hub's database. A Hub that ReceiveSlack hands to its callback
+// is bound to one transaction: its Outbox and the thread ownership it
+// reads and writes are part of that transaction. Its Inbox is not; nothing
+// inbound writes the inbox.
 type Hub struct {
-	db *sql.DB
+	// db runs the queries: the database, or the transaction the Hub is
+	// bound to.
+	db dbtx
+	// conn is the database itself, which opens transactions and closes.
+	conn *sql.DB
 	// Outbox holds the downlink messages for each client until it acks them.
 	Outbox HubOutbox
 	// Inbox holds the uplink messages received from clients.
 	Inbox HubInbox
+}
+
+// dbtx is a *sql.DB or a *sql.Tx.
+type dbtx interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // OpenHub opens, or creates, the hub database at path.
@@ -60,37 +91,52 @@ func OpenHub(ctx context.Context, path string) (*Hub, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Hub{db: db, Outbox: HubOutbox{db}, Inbox: HubInbox{Inbox{db}}}, nil
+	return &Hub{db: db, conn: db, Outbox: HubOutbox{db}, Inbox: HubInbox{Inbox{db}}}, nil
 }
 
 // Close closes the database.
-func (h *Hub) Close() error { return h.db.Close() }
+func (h *Hub) Close() error { return h.conn.Close() }
+
+// transact runs f in a transaction and commits it if f succeeds. On a Hub
+// already bound to a transaction, f runs in that one and the caller
+// commits.
+func (h *Hub) transact(ctx context.Context, f func(tx *Hub) error) error {
+	if _, ok := h.db.(*sql.Tx); ok {
+		return f(h)
+	}
+	tx, err := h.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := f(&Hub{db: tx, conn: h.conn, Outbox: HubOutbox{tx}, Inbox: h.Inbox}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 // ClaimAndEnqueue queues payload for the first message of thread, in one
 // transaction: client becomes the owner of thread unless it already has one,
 // and payload is queued for whichever client the owner then is. It returns
 // that owner. Of several concurrent calls on a new thread, the first wins and
 // all of them queue for its client.
-func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client string, payload []byte) (string, Downlink, error) {
-	tx, err := h.db.BeginTx(ctx, nil)
+func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client string, payload []byte) (owner string, d Downlink, err error) {
+	err = h.transact(ctx, func(tx *Hub) error {
+		if _, err := tx.db.ExecContext(ctx,
+			"INSERT INTO owner (thread, client_id) VALUES (?, ?) ON CONFLICT (thread) DO NOTHING",
+			thread, client); err != nil {
+			return err
+		}
+		if err := tx.db.QueryRowContext(ctx, "SELECT client_id FROM owner WHERE thread = ?", thread).Scan(&owner); err != nil {
+			return err
+		}
+		d, err = enqueue(ctx, tx.db, owner, payload)
+		return err
+	})
 	if err != nil {
 		return "", Downlink{}, err
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO owner (thread, client_id) VALUES (?, ?) ON CONFLICT (thread) DO NOTHING",
-		thread, client); err != nil {
-		return "", Downlink{}, err
-	}
-	var owner string
-	if err := tx.QueryRowContext(ctx, "SELECT client_id FROM owner WHERE thread = ?", thread).Scan(&owner); err != nil {
-		return "", Downlink{}, err
-	}
-	d, err := enqueue(ctx, tx, owner, payload)
-	if err != nil {
-		return "", Downlink{}, err
-	}
-	return owner, d, tx.Commit()
+	return owner, d, nil
 }
 
 // Claim makes client the owner of thread, a thread that has just been
@@ -233,19 +279,14 @@ type Downlink struct {
 }
 
 // HubOutbox is the hub's outbox, one queue per client.
-type HubOutbox struct{ db *sql.DB }
+type HubOutbox struct{ db dbtx }
 
 // Enqueue queues payload for client under a new msg_id.
 func (o HubOutbox) Enqueue(ctx context.Context, client string, payload []byte) (Downlink, error) {
 	return enqueue(ctx, o.db, client, payload)
 }
 
-// execer is a *sql.DB or a *sql.Tx.
-type execer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
-func enqueue(ctx context.Context, db execer, client string, payload []byte) (Downlink, error) {
+func enqueue(ctx context.Context, db dbtx, client string, payload []byte) (Downlink, error) {
 	d := Downlink{Message: Message{MsgID: newMsgID(), Payload: payload}}
 	res, err := db.ExecContext(ctx,
 		"INSERT INTO outbox (client_id, msg_id, payload, enqueued_at) VALUES (?, ?, ?, ?)",

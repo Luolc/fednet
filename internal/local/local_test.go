@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -357,7 +358,7 @@ func TestAsk(t *testing.T) {
 
 	res, err := Do(ctx, path, Request{Cmd: hubapi.ReadThread, Thread: slack.ThreadKey("C1", ts)})
 	want := []slack.Message{{TS: ts, User: "U1", Text: "please fix the build"}}
-	if err != nil || res.Error != "" || !slices.Equal(res.Messages, want) {
+	if err != nil || res.Error != "" || !reflect.DeepEqual(res.Messages, want) {
 		t.Fatalf("Do(read-thread) = %+v, %v; want %+v", res, err, want)
 	}
 	res, err = Do(ctx, path, Request{Cmd: hubapi.GetChannelContext, Channel: "C1"})

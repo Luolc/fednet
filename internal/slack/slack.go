@@ -5,8 +5,11 @@
 package slack
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,12 +18,36 @@ import (
 // ErrNotFound is returned for a channel or thread Slack does not know.
 var ErrNotFound = errors.New("slack: not found")
 
-// Message is one message in a thread.
+// Message is one message in a channel or a thread.
 type Message struct {
 	// TS is the message's Slack timestamp, which identifies it in its channel.
 	TS   string `json:"ts"`
 	User string `json:"user"`
 	Text string `json:"text"`
+	// ThreadTS is the ts of the first message of the thread the message is
+	// a reply in; empty for a message that is not a reply.
+	ThreadTS string `json:"thread_ts,omitempty"`
+	// BotID is set on a message a bot posted, this one included.
+	BotID string `json:"bot_id,omitempty"`
+	// SubType is Slack's subtype of the message; empty for a plain message
+	// a person typed.
+	SubType string `json:"subtype,omitempty"`
+	// Files are the files uploaded with the message.
+	Files []File `json:"files,omitempty"`
+}
+
+// File is a file uploaded with a message.
+type File struct {
+	Name string `json:"name"`
+	// URL is the file's permalink, which opens it in Slack.
+	URL string `json:"url"`
+}
+
+// Conversation is a channel or a direct message conversation.
+type Conversation struct {
+	ID string
+	// IM is set for a direct message conversation.
+	IM bool
 }
 
 // API is what the hub needs from Slack.
@@ -28,9 +55,18 @@ type API interface {
 	// Replies returns the messages of the thread that starts at ts in
 	// channel, the first message included, oldest first.
 	Replies(ctx context.Context, channel, ts string) ([]Message, error)
+	// History returns the messages posted in channel after oldest, a ts,
+	// that are not replies in a thread, oldest first.
+	History(ctx context.Context, channel, oldest string) ([]Message, error)
+	// Conversations returns the channels and direct message conversations
+	// the bot is a member of.
+	Conversations(ctx context.Context) ([]Conversation, error)
 	// Post posts text in channel as a new message, which starts a thread,
 	// and returns its ts.
 	Post(ctx context.Context, channel, text string) (string, error)
+	// PostReply posts text as a reply in the thread that starts at ts in
+	// channel, and returns the reply's ts.
+	PostReply(ctx context.Context, channel, ts, text string) (string, error)
 	// Purpose returns channel's purpose, the description shown with it.
 	Purpose(ctx context.Context, channel string) (string, error)
 	// SetPurpose replaces channel's purpose.
@@ -50,6 +86,39 @@ func ParseThreadKey(key string) (channel, ts string, ok bool) {
 	return channel, ts, ok && channel != "" && ts != "" && !strings.Contains(ts, "/")
 }
 
+// CompareTS orders two Slack timestamps, which are "SECONDS.FRACTION"
+// strings; it returns -1, 0 or 1 as a is before, at or after b. A ts that
+// does not parse sorts first.
+func CompareTS(a, b string) int {
+	as, af := splitTS(a)
+	bs, bf := splitTS(b)
+	if as != bs {
+		return cmp.Compare(as, bs)
+	}
+	return cmp.Compare(af, bf)
+}
+
+// splitTS parses ts into its seconds and its fraction scaled to
+// microseconds; both are -1 for a ts that does not parse.
+func splitTS(ts string) (sec, usec int64) {
+	s, f, _ := strings.Cut(ts, ".")
+	sec, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return -1, -1
+	}
+	if f == "" {
+		return sec, 0
+	}
+	if len(f) < 6 {
+		f += strings.Repeat("0", 6-len(f))
+	}
+	usec, err = strconv.ParseInt(f[:6], 10, 64)
+	if err != nil {
+		return -1, -1
+	}
+	return sec, usec
+}
+
 // Fake is an API kept in memory, for tests. Its zero value has no
 // channels; AddChannel adds one.
 type Fake struct {
@@ -61,30 +130,52 @@ type Fake struct {
 
 type fakeChannel struct {
 	purpose string
+	im      bool
 	threads map[string][]Message
 }
 
 // AddChannel adds an empty channel with purpose.
-func (f *Fake) AddChannel(channel, purpose string) {
+func (f *Fake) AddChannel(channel, purpose string) { f.add(channel, purpose, false) }
+
+// AddIM adds an empty direct message conversation.
+func (f *Fake) AddIM(channel string) { f.add(channel, "", true) }
+
+func (f *Fake) add(channel, purpose string, im bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.channels == nil {
 		f.channels = make(map[string]*fakeChannel)
 	}
-	f.channels[channel] = &fakeChannel{purpose: purpose, threads: make(map[string][]Message)}
+	f.channels[channel] = &fakeChannel{purpose: purpose, im: im, threads: make(map[string][]Message)}
 }
 
 // Reply adds a message from user to the thread at ts in channel and returns
 // the new message's ts.
 func (f *Fake) Reply(channel, ts, user, text string) (string, error) {
+	return f.Add(channel, Message{ThreadTS: ts, User: user, Text: text})
+}
+
+// Add adds m to channel: as a reply in the thread at m.ThreadTS when that
+// is set, as a new message that starts a thread otherwise. A m.TS that is
+// empty gets a ts later than any before. It returns m's ts.
+func (f *Fake) Add(channel string, m Message) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c, ok := f.channels[channel]
-	if !ok || c.threads[ts] == nil {
+	if !ok {
 		return "", ErrNotFound
 	}
-	m := Message{TS: f.next(), User: user, Text: text}
-	c.threads[ts] = append(c.threads[ts], m)
+	if m.TS == "" {
+		m.TS = f.next()
+	}
+	if m.ThreadTS == "" {
+		c.threads[m.TS] = []Message{m}
+		return m.TS, nil
+	}
+	if c.threads[m.ThreadTS] == nil {
+		return "", ErrNotFound
+	}
+	c.threads[m.ThreadTS] = append(c.threads[m.ThreadTS], m)
 	return m.TS, nil
 }
 
@@ -104,23 +195,48 @@ func (f *Fake) Replies(_ context.Context, channel, ts string) ([]Message, error)
 	return append([]Message(nil), c.threads[ts]...), nil
 }
 
+func (f *Fake) History(_ context.Context, channel, oldest string) ([]Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.channels[channel]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	var ms []Message
+	for _, ts := range slices.SortedFunc(maps.Keys(c.threads), CompareTS) {
+		if CompareTS(ts, oldest) > 0 {
+			ms = append(ms, c.threads[ts][0])
+		}
+	}
+	return ms, nil
+}
+
+// Conversations returns every channel and direct message conversation
+// added, ordered by id.
+func (f *Fake) Conversations(context.Context) ([]Conversation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cs []Conversation
+	for _, id := range slices.Sorted(maps.Keys(f.channels)) {
+		cs = append(cs, Conversation{ID: id, IM: f.channels[id].im})
+	}
+	return cs, nil
+}
+
 // Post posts as the user "fednet".
 func (f *Fake) Post(_ context.Context, channel, text string) (string, error) {
 	return f.Start(channel, "fednet", text)
 }
 
+// PostReply replies as the user "fednet".
+func (f *Fake) PostReply(_ context.Context, channel, ts, text string) (string, error) {
+	return f.Reply(channel, ts, "fednet", text)
+}
+
 // Start posts text from user in channel as a new message, which starts a
 // thread, and returns its ts.
 func (f *Fake) Start(channel, user, text string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	c, ok := f.channels[channel]
-	if !ok {
-		return "", ErrNotFound
-	}
-	ts := f.next()
-	c.threads[ts] = []Message{{TS: ts, User: user, Text: text}}
-	return ts, nil
+	return f.Add(channel, Message{User: user, Text: text})
 }
 
 func (f *Fake) Purpose(_ context.Context, channel string) (string, error) {
