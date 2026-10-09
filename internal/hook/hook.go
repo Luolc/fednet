@@ -5,6 +5,14 @@
 // retried with growing delays, and after the last allowed attempt the
 // message is moved to the dead letters. Messages run one at a time, oldest
 // first, so no message runs twice at once and the inbox stays in order.
+//
+// The contract with the hook: it runs in its own process group, which is
+// killed when it exits, so it must not leave processes behind; anything
+// long-lived goes to a daemon. Its outcome is recorded before the next
+// message runs; while the client lives, no message runs again once it has
+// exited 0. If the client dies between the hook's exit and the record, the
+// next start runs the hook again for that message, so the hook must be
+// idempotent by msg_id.
 package hook
 
 import (
@@ -23,12 +31,18 @@ import (
 	"github.com/Luolc/fednet/internal/store"
 )
 
-// Event is what the event file holds: one inbox message, encoded as JSON.
-// Payload is base64 in the file, as encoding/json encodes bytes.
+// Event is what the event file holds: one inbox message, as JSON. Payload
+// is the message's payload as it came from the hub, a JSON object (see
+// package payload), embedded as is.
 type Event struct {
-	MsgID   string `json:"msg_id"`
-	Payload []byte `json:"payload"`
+	MsgID   string          `json:"msg_id"`
+	Payload json.RawMessage `json:"payload"`
 }
+
+// errNotRun means the hook was not started: the event file could not be
+// written. That is the client's trouble, not the hook's, so it is not an
+// attempt.
+var errNotRun = errors.New("hook not run")
 
 // Retry paces the attempts at one message: after attempt n fails (n from
 // 1), the next runs Min doubled n-1 times later, capped at Max; when
@@ -83,6 +97,16 @@ type Runner struct {
 	// nudge has a buffer of one, so a Nudge is kept until Run looks.
 	nudge     chan struct{}
 	nudgeOnce sync.Once
+	// unsaved is an outcome the store refused; Run keeps trying to record
+	// it, and runs nothing else until it has, so the hook never runs again
+	// for a message whose outcome is known.
+	unsaved *outcome
+}
+
+// outcome is what one run of the hook ended in: err nil means it exited 0.
+type outcome struct {
+	q   store.Queued
+	err error
 }
 
 func (r *Runner) timeout() time.Duration {
@@ -129,12 +153,14 @@ func (r *Runner) Nudge() {
 // Run runs the hook for every undelivered message as it becomes due, until
 // ctx is done. It must be called once. A run of the hook that ctx
 // interrupts is not counted as an attempt; the message is tried again by
-// the next Run.
+// the next Run. An outcome the store refuses to record is kept and retried
+// before anything else runs; one that is still unrecorded when ctx is done
+// is lost, and the next Run runs the hook again for that message.
 func (r *Runner) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		wait, err := r.pass(ctx)
 		if err != nil {
-			slog.Warn("hook: inbox", "err", err)
+			slog.Warn("hook: store", "err", err)
 			wait = r.retry().Min
 		}
 		if wait == 0 {
@@ -157,10 +183,18 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// pass runs the hook for the due messages. It returns 0 when it ran
-// something (the caller looks again at once), how long until the next
-// message is due, or -1 when nothing is queued.
+// pass records an unsaved outcome if there is one, then runs the hook for
+// the due messages. It returns 0 when it ran something (the caller looks
+// again at once), how long until the next message is due, or -1 when
+// nothing is queued. A store error stops the pass; the outcome in hand, if
+// any, is kept for the next one.
 func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
+	if r.unsaved != nil {
+		if err := r.record(ctx, *r.unsaved); err != nil {
+			return 0, err
+		}
+		r.unsaved = nil
+	}
 	qs, err := r.Store.Inbox.Queued(ctx)
 	if err != nil {
 		return 0, err
@@ -178,8 +212,19 @@ func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
 			}
 			continue
 		}
-		r.attempt(ctx, q)
+		o := outcome{q: q, err: r.exec(ctx, q.Message)}
+		if o.err != nil && ctx.Err() != nil {
+			// Interrupted by the shutdown, not failed: not an attempt.
+			return 0, nil
+		}
+		if errors.Is(o.err, errNotRun) {
+			return 0, o.err
+		}
 		ran = true
+		if err := r.record(ctx, o); err != nil {
+			r.unsaved = &o
+			return 0, err
+		}
 	}
 	if ran {
 		return 0, nil
@@ -187,57 +232,62 @@ func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
 	return wait, nil
 }
 
-// attempt runs the hook once for q and records the outcome.
-func (r *Runner) attempt(ctx context.Context, q store.Queued) {
-	attempts := q.Attempts + 1
-	err := r.exec(ctx, q.Message)
-	if err == nil {
-		// The hook has delivered the message; recording that must not be
-		// lost to a shutdown, or the next Run would deliver it again.
-		dctx := context.WithoutCancel(ctx)
-		if err := r.Store.Inbox.MarkDelivered(dctx, q.MsgID); err != nil {
-			slog.Error("hook: mark delivered", "msg_id", q.MsgID, "err", err)
+// record writes o to the store: delivered, or a retry, or a dead letter.
+// It writes even once ctx is done: an outcome lost to the shutdown would
+// make the next Run run the hook again.
+func (r *Runner) record(ctx context.Context, o outcome) error {
+	ctx = context.WithoutCancel(ctx)
+	q := o.q
+	if o.err == nil {
+		if err := r.Store.Inbox.MarkDelivered(ctx, q.MsgID); err != nil {
+			return fmt.Errorf("mark %s delivered: %w", q.MsgID, err)
 		}
-		if _, err := r.Store.Inbox.Prune(dctx, time.Now().Add(-r.retention())); err != nil {
+		if _, err := r.Store.Inbox.Prune(ctx, time.Now().Add(-r.retention())); err != nil {
 			slog.Warn("hook: prune", "err", err)
 		}
-		return
+		return nil
 	}
-	if ctx.Err() != nil {
-		return
-	}
+	attempts := q.Attempts + 1
 	retry := r.retry()
 	if attempts >= retry.Attempts {
-		slog.Error("hook: dead letter", "msg_id", q.MsgID, "attempts", attempts, "err", err)
-		if err := r.Store.Inbox.Bury(ctx, q.MsgID, err.Error()); err != nil {
-			slog.Error("hook: bury", "msg_id", q.MsgID, "err", err)
+		if err := r.Store.Inbox.Bury(ctx, q.MsgID, o.err.Error()); err != nil {
+			return fmt.Errorf("bury %s: %w", q.MsgID, err)
 		}
-		return
+		slog.Error("hook: dead letter", "msg_id", q.MsgID, "attempts", attempts, "err", o.err)
+		return nil
 	}
 	delay := retry.delay(attempts)
-	slog.Warn("hook: failed", "msg_id", q.MsgID, "attempt", attempts, "retry_in", delay, "err", err)
 	if err := r.Store.Inbox.Retry(ctx, q.MsgID, time.Now().Add(delay)); err != nil {
-		slog.Error("hook: record attempt", "msg_id", q.MsgID, "err", err)
+		return fmt.Errorf("record attempt at %s: %w", q.MsgID, err)
 	}
+	slog.Warn("hook: failed", "msg_id", q.MsgID, "attempt", attempts, "retry_in", delay, "err", o.err)
+	return nil
 }
 
 // stderrTail is how much of the hook's stderr goes into the error.
 const stderrTail = 4 << 10
 
 // exec writes m to an event file, runs the hook on it and returns nil if
-// the hook exited 0. The error says why it did not, with the end of the
-// hook's stderr.
+// the hook exited 0 and left nothing behind. The error says why it did
+// not, with the end of the hook's stderr. Whatever the outcome, the hook's
+// process group is killed once the hook itself has exited.
 func (r *Runner) exec(ctx context.Context, m store.Message) error {
 	f, err := os.CreateTemp(r.dir(), "fednet-event-*.json")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errNotRun, err)
 	}
-	defer os.Remove(f.Name())
-	if err := json.NewEncoder(f).Encode(Event{MsgID: m.MsgID, Payload: m.Payload}); err != nil {
-		f.Close()
-		return err
+	defer func() {
+		if err := os.Remove(f.Name()); err != nil {
+			slog.Warn("hook: remove event file", "err", err)
+		}
+	}()
+	// A payload that is not JSON cannot be put in the event; that is the
+	// hub's fault, and the error, counted as an attempt, says so.
+	err = json.NewEncoder(f).Encode(Event{MsgID: m.MsgID, Payload: m.Payload})
+	if cerr := f.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("%w: %v", errNotRun, cerr)
 	}
-	if err := f.Close(); err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -250,29 +300,43 @@ func (r *Runner) exec(ctx context.Context, m store.Message) error {
 	cmd.Dir = r.dir()
 	var stderr tail
 	cmd.Stderr = &stderr
-	// The hook gets its own process group, so that the timeout kills what
+	// The hook gets its own process group, so that killing it takes what
 	// it started too, and the client's own signals do not reach it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
 	// Wait blocks until stderr is closed, which a process the hook left
 	// behind may hold; this bounds that wait.
 	cmd.WaitDelay = time.Second
 
 	err = cmd.Run()
-	if cmd.ProcessState != nil && cmd.ProcessState.Success() {
-		return nil
+	if cmd.Process != nil {
+		// Whatever the hook left running in its group dies with it; the
+		// group is a pid of a process the hook reaped or never waited
+		// for, so it cannot have been reused by now.
+		if kerr := killGroup(cmd.Process.Pid); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
+			slog.Warn("hook: kill process group", "pid", cmd.Process.Pid, "err", kerr)
+		}
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		err = fmt.Errorf("timed out after %v", r.timeout())
+	case errors.Is(err, exec.ErrWaitDelay):
+		err = errors.New("exited 0 but left a process holding its stderr")
 	}
 	if s := strings.TrimSpace(string(stderr.b)); s != "" {
 		err = fmt.Errorf("%v; stderr: %s", err, s)
+	}
+	return err
+}
+
+// killGroup sends SIGKILL to the process group whose id is pid. It returns
+// os.ErrProcessDone when there is no such group.
+func killGroup(pid int) error {
+	err := syscall.Kill(-pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
 	}
 	return err
 }

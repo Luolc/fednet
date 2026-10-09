@@ -3,6 +3,7 @@ package hook
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -179,9 +180,9 @@ func (s *syncBuffer) String() string {
 func TestRunsOncePerMessage(t *testing.T) {
 	f := newFixture(t, `cat "$1" >> "$DIR/seen"`)
 	f.run()
-	f.put("m1", "first")
-	f.put("m2", "second")
-	f.put("m1", "redelivered")
+	f.put("m1", `{"t":"first"}`)
+	f.put("m2", `{"t":"second"}`)
+	f.put("m1", `{"t":"redelivered"}`)
 	waitFor(t, "both messages delivered", func() bool { return f.delivered("m1") && f.delivered("m2") })
 
 	var got []Event
@@ -192,9 +193,8 @@ func TestRunsOncePerMessage(t *testing.T) {
 		}
 		got = append(got, e)
 	}
-	want := []Event{{"m1", []byte("first")}, {"m2", []byte("second")}}
-	if len(got) != len(want) || got[0].MsgID != "m1" || string(got[0].Payload) != "first" || got[1].MsgID != "m2" || string(got[1].Payload) != "second" {
-		t.Fatalf("hook saw %v, want %v", got, want)
+	if len(got) != 2 || got[0].MsgID != "m1" || string(got[0].Payload) != `{"t":"first"}` || got[1].MsgID != "m2" || string(got[1].Payload) != `{"t":"second"}` {
+		t.Fatalf("hook saw %v, want m1 {\"t\":\"first\"} then m2 {\"t\":\"second\"}", got)
 	}
 	// The event files are gone once the hook has run.
 	if left, _ := os.ReadDir(f.r.Dir); len(left) != 0 {
@@ -213,7 +213,7 @@ func TestRetriesUntilSuccess(t *testing.T) {
 	f.r.Retry.Attempts = 1000
 	f.run()
 	before := time.Now()
-	f.put("m1", "x")
+	f.put("m1", `{"t":"x"}`)
 	waitFor(t, "two failed attempts", func() bool {
 		qs := f.queued()
 		return len(qs) == 1 && qs[0].Attempts == 2
@@ -230,7 +230,7 @@ func TestRetriesUntilSuccess(t *testing.T) {
 		t.Fatalf("hook ran %d times, want at least 3", runs)
 	}
 	// A later message goes through the loop again; m1 is not run again.
-	f.put("m2", "y")
+	f.put("m2", `{"t":"y"}`)
 	waitFor(t, "m2 delivered", func() bool { return f.delivered("m2") })
 	if got := len(f.lines("runs")); got != runs+1 {
 		t.Fatalf("hook ran %d times after m2, want %d", got, runs+1)
@@ -245,10 +245,10 @@ func TestRetriesUntilSuccess(t *testing.T) {
 func TestDeadLetterAtLimit(t *testing.T) {
 	f := newFixture(t, `echo "$1" >> "$DIR/runs"; echo "no agent here" >&2; exit 1`)
 	f.run()
-	f.put("m1", "x")
+	f.put("m1", `{"t":"x"}`)
 	waitFor(t, "m1 among the dead letters", func() bool { return len(f.deadLetters()) == 1 })
 	d := f.deadLetters()[0]
-	if d.MsgID != "m1" || string(d.Payload) != "x" || d.Attempts != testRetry.Attempts {
+	if d.MsgID != "m1" || string(d.Payload) != `{"t":"x"}` || d.Attempts != testRetry.Attempts {
 		t.Fatalf("dead letter = %+v, want m1 (x) after %d attempts", d, testRetry.Attempts)
 	}
 	if !strings.Contains(d.Reason, "exit status 1") || !strings.Contains(d.Reason, "no agent here") {
@@ -266,8 +266,8 @@ func TestDeadLetterAtLimit(t *testing.T) {
 
 	// Redelivered: dropped by dedup, so the hook does not run for it. m2
 	// going through proves the loop looked again.
-	f.put("m1", "again")
-	f.put("m2", "y")
+	f.put("m1", `{"t":"again"}`)
+	f.put("m2", `{"t":"y"}`)
 	waitFor(t, "m2 among the dead letters", func() bool { return len(f.deadLetters()) == 2 })
 	if runs := len(f.lines("runs")); runs != 2*testRetry.Attempts {
 		t.Fatalf("hook ran %d times, want %d", runs, 2*testRetry.Attempts)
@@ -299,7 +299,7 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 	f := newFixture(t, `sleep 60 & echo $! > "$DIR/child"; echo $$ > "$DIR/self"; wait`)
 	f.r.Retry.Attempts = 2
 	f.run()
-	f.put("m1", "x")
+	f.put("m1", `{"t":"x"}`)
 	var self, child int
 	waitFor(t, "the hook to start", func() bool {
 		var ok1, ok2 bool
@@ -358,7 +358,7 @@ func TestEnvIsOnlyWhatIsGiven(t *testing.T) {
 			f := newFixture(t, `/usr/bin/env > "$1.env"; cp "$1.env" "$(dirname "$1")/../env"`)
 			f.r.Env = tt.env
 			f.run()
-			f.put("m1", "x")
+			f.put("m1", `{"t":"x"}`)
 			waitFor(t, "m1 delivered", func() bool { return f.delivered("m1") })
 			got := f.lines("env")
 			if len(got) == 1 && got[0] == "" {
@@ -389,7 +389,7 @@ func TestResumesAfterRestart(t *testing.T) {
 	}
 	f.r.Retry = Retry{Min: time.Hour, Max: time.Hour, Attempts: 3}
 	stop := f.run()
-	f.put("m1", "x")
+	f.put("m1", `{"t":"x"}`)
 	waitFor(t, "one failed attempt", func() bool {
 		qs := f.queued()
 		return len(qs) == 1 && qs[0].Attempts == 1
@@ -417,7 +417,7 @@ func TestShutdownDoesNotCountAsAttempt(t *testing.T) {
 	f := newFixture(t, `echo $$ > "$DIR/self"; sleep 60`)
 	f.r.Timeout = time.Minute
 	stop := f.run()
-	f.put("m1", "x")
+	f.put("m1", `{"t":"x"}`)
 	var self int
 	waitFor(t, "the hook to start", func() bool {
 		var ok bool
@@ -440,5 +440,144 @@ func TestRetryDelay(t *testing.T) {
 		if got := r.delay(attempts); got != want {
 			t.Errorf("delay(%d) = %v, want %v", attempts, got, want)
 		}
+	}
+}
+
+// running reports whether pid is a live process: it exists and is not a
+// zombie waiting for its parent.
+func running(t *testing.T, pid int) bool {
+	t.Helper()
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	// The state follows the parenthesised command name.
+	i := bytes.LastIndexByte(b, ')')
+	return i > 0 && len(b) > i+2 && b[i+2] != 'Z'
+}
+
+// When the hook exits on its own, what it left running in its process
+// group is killed too; a leftover that holds stderr makes the run fail.
+func TestLeftoverProcessesAreKilled(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		body      string
+		delivered bool
+	}{
+		{"detached", `sleep 60 >/dev/null 2>&1 &`, true},
+		{"holding stderr", `sleep 60 &`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// The hook starts its child, then waits for the test to let
+			// it exit, so the child is observed running first.
+			f := newFixture(t, tt.body+` echo $! > "$DIR/child"; while [ ! -e "$DIR/go" ]; do sleep 0.01; done; exit 0`)
+			f.r.Retry = Retry{Min: time.Hour, Max: time.Hour, Attempts: 5}
+			// Longer than the WaitDelay, so that a held stderr is what
+			// ends the run, not the timeout.
+			f.r.Timeout = 5 * time.Second
+			f.run()
+			f.put("m1", `{"t":"x"}`)
+			var child int
+			waitFor(t, "the hook to start its child", func() bool {
+				var ok bool
+				child, ok = f.pid("child")
+				return ok
+			})
+			// The control arm: the child is running while the hook is.
+			if !running(t, child) {
+				t.Fatalf("child %d is not running", child)
+			}
+			if err := os.WriteFile(filepath.Join(f.dir, "go"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "the outcome to be recorded", func() bool {
+				if tt.delivered {
+					return f.delivered("m1")
+				}
+				qs := f.queued()
+				return len(qs) == 1 && qs[0].Attempts == 1
+			})
+			waitFor(t, "the child to be gone", func() bool { return !running(t, child) })
+			time.Sleep(10 * time.Millisecond)
+			if running(t, child) {
+				t.Fatalf("child %d is running after the hook exited", child)
+			}
+			if !tt.delivered && !strings.Contains(f.logs.String(), "holding its stderr") {
+				t.Fatalf("log does not say the hook left a process holding stderr:\n%s", f.logs.String())
+			}
+		})
+	}
+}
+
+// An outcome the store refuses is kept and recorded later; the hook does
+// not run again for the message meanwhile, whichever write failed.
+func TestOutcomeKeptWhenStoreFails(t *testing.T) {
+	for _, tt := range []struct {
+		name, script, trigger string
+		limit                 int
+		recorded              func(f *fixture) bool
+	}{
+		{"delivered", "exit 0",
+			"CREATE TRIGGER fail BEFORE UPDATE OF delivered ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END", 5,
+			func(f *fixture) bool { return f.delivered("m1") }},
+		{"retry", "exit 1",
+			"CREATE TRIGGER fail BEFORE UPDATE OF attempts ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END", 5,
+			func(f *fixture) bool { qs := f.queued(); return len(qs) == 1 && qs[0].Attempts == 1 }},
+		{"dead letter", "exit 1",
+			"CREATE TRIGGER fail BEFORE INSERT ON dead_letter BEGIN SELECT RAISE(ABORT, 'disk full'); END", 1,
+			func(f *fixture) bool { return len(f.deadLetters()) == 1 }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, `echo run >> "$DIR/runs"; `+tt.script)
+			f.r.Retry = Retry{Min: time.Hour, Max: time.Hour, Attempts: tt.limit}
+			db, err := sql.Open("sqlite", filepath.Join(f.dir, "client.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { db.Close() })
+			if _, err := db.ExecContext(t.Context(), tt.trigger); err != nil {
+				t.Fatal(err)
+			}
+			f.put("m1", `{"t":"x"}`)
+			for i := range 3 {
+				wait, err := f.r.pass(t.Context())
+				if err == nil || !strings.Contains(err.Error(), "disk full") || !strings.Contains(err.Error(), "m1") {
+					t.Fatalf("pass %d with the store failing: err = %v, want the store's error naming m1", i, err)
+				}
+				if wait != 0 || len(f.lines("runs")) != 1 {
+					t.Fatalf("pass %d: wait %v, hook ran %d times; want 0, 1", i, wait, len(f.lines("runs")))
+				}
+			}
+			// The store recovers: the kept outcome is recorded, the hook
+			// is not run again for it.
+			if _, err := db.ExecContext(t.Context(), "DROP TRIGGER fail"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.r.pass(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !tt.recorded(f) {
+				t.Fatal("the outcome was not recorded once the store recovered")
+			}
+			if n := len(f.lines("runs")); n != 1 {
+				t.Fatalf("hook ran %d times, want 1", n)
+			}
+		})
+	}
+}
+
+// A payload that is not JSON cannot be handed to the hook; that counts as
+// a failed attempt, with the reason, rather than being retried forever.
+func TestBadPayloadIsAFailure(t *testing.T) {
+	f := newFixture(t, `echo run >> "$DIR/runs"; exit 0`)
+	f.r.Retry = Retry{Min: time.Millisecond, Max: time.Millisecond, Attempts: 2}
+	f.run()
+	f.put("m1", "not json")
+	waitFor(t, "the dead letter", func() bool { return len(f.deadLetters()) == 1 })
+	if reason := f.deadLetters()[0].Reason; !strings.Contains(reason, "json") {
+		t.Fatalf("reason %q does not say the payload is not JSON", reason)
+	}
+	if f.lines("runs") != nil {
+		t.Fatal("the hook ran for a payload that could not be written")
 	}
 }

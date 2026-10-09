@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/hook"
+	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -27,7 +29,10 @@ func TestRun(t *testing.T) {
 	}{
 		{"version", []string{"version"}, 0, "dev\n", ""},
 		{"hub without flags", []string{"hub"}, 2, "", "-listen and -db are required"},
-		{"client without flags", []string{"client"}, 2, "", "-hub, -db and -credential are required"},
+		{"client without flags", []string{"client"}, 2, "", "-hub, -db, -credential and -socket are required"},
+		{"post without a thread", []string{"client", "post", "-socket", "x", "hello"}, 2, "", "-socket, -thread and a non-empty TEXT are required"},
+		{"post without a text", []string{"client", "post", "-socket", "x", "-thread", "t"}, 2, "", "want 1 arguments"},
+		{"post to a missing socket", []string{"client", "post", "-socket", "/nonexistent/fednet.sock", "-thread", "t", "hello"}, 4, "", "no such file"},
 		{"client init without flags", []string{"client", "init"}, 2, "", "-id and -credential are required"},
 		{"register with a bad hash", []string{"hub", "register", "-db", "x", "ws", "nothex"}, 2, "", "HASH must be"},
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
@@ -113,6 +118,7 @@ func TestHubAndClient(t *testing.T) {
 	hubDB := filepath.Join(dir, "hub.db")
 	clientDB := filepath.Join(dir, "client.db")
 	credPath := filepath.Join(dir, "credential")
+	socket := filepath.Join(dir, "fednet.sock")
 	var stdout, stderr syncBuffer
 	// Whatever a failure prints goes through redact, so that a regression
 	// which leaks the credential does not leak it into the test log too.
@@ -157,7 +163,8 @@ func TestHubAndClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	queued, err := hs.Outbox.Enqueue(ctx, "workstation", []byte("hello"))
+	const hello = `{"type":"test","text":"hello"}`
+	queued, err := hs.Outbox.Enqueue(ctx, "workstation", []byte(hello))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,15 +195,15 @@ func TestHubAndClient(t *testing.T) {
 	}
 	t.Setenv("FEDNET_TEST_DIR", dir)
 	t.Setenv("FEDNET_TEST_LEAK", "not for the hook")
-	stopClient := start(t, []string{"client", "-hub", "http://" + addr, "-db", clientDB, "-credential", credPath,
+	stopClient := start(t, []string{"client", "-hub", "http://" + addr, "-db", clientDB, "-credential", credPath, "-socket", socket,
 		"-hook-env", "FEDNET_TEST_DIR", "/bin/sh", script}, &stdout, &stderr)
 	var event hook.Event
 	waitFor(t, "the hook to run", func() bool {
 		b, err := os.ReadFile(filepath.Join(dir, "event"))
 		return err == nil && json.Unmarshal(b, &event) == nil
 	})
-	if event.MsgID != queued.MsgID || string(event.Payload) != "hello" {
-		t.Fatalf("hook got %+v, want %s (hello)", event, queued.MsgID)
+	if event.MsgID != queued.MsgID || string(event.Payload) != hello {
+		t.Fatalf("hook got %+v, want %s with payload %s", event, queued.MsgID, hello)
 	}
 	waitFor(t, "the message marked delivered", func() bool {
 		ms, err := cs.Inbox.Undelivered(ctx)
@@ -223,6 +230,50 @@ func TestHubAndClient(t *testing.T) {
 	t.Cleanup(func() { hs.Close() })
 	if reg, err := hs.Registration(ctx, "workstation"); err != nil || reg.Version != version {
 		t.Fatalf("Registration(workstation) = %+v, %v; want version %q", reg, err, version)
+	}
+
+	// An agent posts through the client's socket, once as text and once as
+	// JSON; the hub stores both posts with their thread.
+	waitFor(t, "the client's socket", func() bool {
+		_, err := os.Stat(socket)
+		return err == nil
+	})
+	const thread = "C1/1700000000.000100"
+	var out syncBuffer
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "build is green"}, &out, &stderr); code != 0 {
+		t.Fatalf("client post: exit %d, stderr %q", code, redact(stderr.String()))
+	}
+	textID := strings.TrimSpace(out.String())
+	out = syncBuffer{}
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "-json", "--", "- done"}, &out, &stderr); code != 0 {
+		t.Fatalf("client post -json: exit %d, stderr %q", code, redact(stderr.String()))
+	}
+	var res struct {
+		MsgID string `json:"msg_id"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &res); err != nil || res.MsgID == "" || textID == "" {
+		t.Fatalf("client post printed %q, then %q; want a msg_id, then JSON with one", textID, out.String())
+	}
+	want := map[string]payload.Message{
+		textID:    {Type: payload.Post, Thread: thread, Text: "build is green"},
+		res.MsgID: {Type: payload.Post, Thread: thread, Text: "- done"},
+	}
+	waitFor(t, "the posts in the hub inbox", func() bool {
+		ms, err := hs.Inbox.Undelivered(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(ms) == len(want)
+	})
+	ms, err := hs.Inbox.Undelivered(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range ms {
+		var got payload.Message
+		if err := json.Unmarshal(m.Payload, &got); err != nil || got != want[m.MsgID] {
+			t.Errorf("hub inbox has %s: %+v, %v; want %+v", m.MsgID, got, err, want[m.MsgID])
+		}
 	}
 
 	if code := stopClient(); code != 0 {
@@ -254,5 +305,25 @@ func TestHubAndClient(t *testing.T) {
 	}
 	if fi, err := os.Stat(credPath); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("credential file mode = %v, %v; want 0600", fi.Mode(), err)
+	}
+}
+
+// A socket this user may not write to is refused with exit code 3.
+func TestPostDenied(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may connect to any socket")
+	}
+	socket := filepath.Join(t.TempDir(), "fednet.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if err := os.Chmod(socket, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), []string{"client", "post", "-socket", socket, "-thread", "t", "hello"}, &stdout, &stderr); code != 3 {
+		t.Fatalf("exit code = %d, want 3; stderr %q", code, stderr.String())
 	}
 }
