@@ -13,7 +13,74 @@ const (
 	// BackfillFrom is where a backfill that has not finished starts; empty
 	// once it has.
 	BackfillFrom = "backfill_from"
+	// BackfillEpoch counts the Slack connections, across processes: a
+	// backfill may move LastSeen on and clear BackfillFrom only while the
+	// epoch is still the one it started under.
+	BackfillEpoch = "backfill_epoch"
 )
+
+// FixBackfillStart is for a connection to Slack that has just come up: in
+// one transaction it starts a new epoch and sets BackfillFrom to where the
+// next backfill starts, the latest message seen or, earlier, where a
+// backfill is still pending. It returns the new epoch.
+func (h *Hub) FixBackfillStart(ctx context.Context) (epoch int64, err error) {
+	err = h.transact(ctx, func(tx *Hub) error {
+		if _, err := tx.db.ExecContext(ctx,
+			`INSERT INTO slack_state (key, value) VALUES (?, '1')
+			 ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`, BackfillEpoch); err != nil {
+			return err
+		}
+		if err := tx.db.QueryRowContext(ctx, "SELECT CAST(value AS INTEGER) FROM slack_state WHERE key = ?", BackfillEpoch).Scan(&epoch); err != nil {
+			return err
+		}
+		from, err := tx.SlackState(ctx, LastSeen)
+		if err != nil {
+			return err
+		}
+		pending, err := tx.SlackState(ctx, BackfillFrom)
+		if err != nil {
+			return err
+		}
+		if pending != "" && (from == "" || olderTS(pending, from)) {
+			from = pending
+		}
+		return tx.SetSlackState(ctx, BackfillFrom, from)
+	})
+	return epoch, err
+}
+
+// FinishBackfill is for a backfill that has read everything up to ts: in
+// one transaction it moves LastSeen on to ts and clears BackfillFrom,
+// unless a connection has come up since the backfill started, under
+// another epoch, whose own backfill the start now belongs to. It reports
+// whether it did.
+func (h *Hub) FinishBackfill(ctx context.Context, epoch int64, ts string) (bool, error) {
+	done := false
+	err := h.transact(ctx, func(tx *Hub) error {
+		var current int64
+		if err := tx.db.QueryRowContext(ctx, "SELECT CAST(value AS INTEGER) FROM slack_state WHERE key = ?", BackfillEpoch).Scan(&current); err != nil {
+			return err
+		}
+		if current != epoch {
+			return nil
+		}
+		if err := tx.AdvanceLastSeen(ctx, ts); err != nil {
+			return err
+		}
+		if err := tx.SetSlackState(ctx, BackfillFrom, ""); err != nil {
+			return err
+		}
+		done = true
+		return nil
+	})
+	return done, err
+}
+
+// olderTS reports whether Slack timestamp a is older than b: of the same
+// length they order as strings, and a shorter one is older.
+func olderTS(a, b string) bool {
+	return len(a) < len(b) || (len(a) == len(b) && a < b)
+}
 
 // SlackMessage identifies a message a person posted in Slack.
 type SlackMessage struct {

@@ -57,10 +57,9 @@ type Poster struct {
 
 	nudge     chan struct{}
 	nudgeOnce sync.Once
-	// sent counts the parts of a split post already in Slack, by msg_id,
-	// so a retry does not post them again. It lives in memory: a hub that
-	// restarts in the middle of a post posts its first parts again.
-	sent map[string]int
+	// stop is closed by Stop.
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 func (p *Poster) maxChars() int {
@@ -92,7 +91,7 @@ func (p *Poster) Nudge() {
 
 // Run posts the inbox until ctx is done. It must be called once.
 func (p *Poster) Run(ctx context.Context) {
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !p.stopping() {
 		if err := p.Pass(ctx); err != nil && ctx.Err() == nil {
 			slog.Warn("outbound: post", "err", err)
 		}
@@ -101,8 +100,36 @@ func (p *Poster) Run(ctx context.Context) {
 		case <-p.nudgeCh():
 		case <-t.C:
 		case <-ctx.Done():
+		case <-p.stopCh():
 		}
 		t.Stop()
+	}
+}
+
+func (p *Poster) stopCh() chan struct{} {
+	p.stopOnce.Do(func() { p.stop = make(chan struct{}) })
+	return p.stop
+}
+
+// Stop makes Run return once the post in hand, if any, is out as far as
+// Slack takes it and that is recorded, taking no further one; unlike ctx
+// it interrupts nothing. It is for handing the inbox to another process,
+// which goes on from what is recorded. It may be called more than once.
+func (p *Poster) Stop() {
+	p.stopOnce.Do(func() { p.stop = make(chan struct{}) })
+	select {
+	case <-p.stop:
+	default:
+		close(p.stop)
+	}
+}
+
+func (p *Poster) stopping() bool {
+	select {
+	case <-p.stopCh():
+		return true
+	default:
+		return false
 	}
 }
 
@@ -117,6 +144,9 @@ func (p *Poster) Pass(ctx context.Context) error {
 		return err
 	}
 	for _, u := range us {
+		if p.stopping() {
+			return nil
+		}
 		if text, ok := alertText(u); ok {
 			if err := p.relay(ctx, u.Client, text); err != nil {
 				// Left in the inbox for the next pass; an alert has no
@@ -124,7 +154,7 @@ func (p *Poster) Pass(ctx context.Context) error {
 				slog.Warn("outbound: alert from a client", "msg_id", u.MsgID, "client", u.Client, "err", err)
 				continue
 			}
-			if err := p.Store.Inbox.MarkDelivered(ctx, u.MsgID); err != nil {
+			if err := p.record(ctx, func() error { return p.Store.Inbox.MarkDelivered(ctx, u.MsgID) }); err != nil {
 				return err
 			}
 			continue
@@ -140,12 +170,32 @@ func (p *Poster) Pass(ctx context.Context) error {
 		} else if err != nil {
 			return fmt.Errorf("msg_id %s: %w", u.MsgID, err)
 		}
-		if err := p.Store.Inbox.MarkDelivered(ctx, u.MsgID); err != nil {
+		if err := p.record(ctx, func() error { return p.Store.Inbox.MarkDelivered(ctx, u.MsgID) }); err != nil {
 			return err
 		}
-		delete(p.sent, u.MsgID)
 	}
 	return nil
+}
+
+// record runs write, a store write about something already in Slack,
+// again every Interval until it succeeds or ctx is done: what is in Slack
+// must be recorded before anything else is posted, or Run returns, so
+// that no process posts it again. It returns ctx's error when it gives up.
+func (p *Poster) record(ctx context.Context, write func() error) error {
+	for {
+		err := write()
+		if err == nil {
+			return nil
+		}
+		slog.Warn("outbound: record, retrying", "err", err)
+		t := time.NewTimer(p.interval())
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+	}
 }
 
 // alertText returns the text of u if it is an alert a client raised.
@@ -169,8 +219,8 @@ func (p *Poster) relay(ctx context.Context, client, text string) error {
 	return w.Send(ctx, text)
 }
 
-// post posts u's parts that are not in Slack yet. An error wrapping
-// errPermanent means u can never go out.
+// post posts u's parts that are not in Slack yet, recording each as it
+// goes. An error wrapping errPermanent means u can never go out.
 func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 	var m payload.Message
 	if err := json.Unmarshal(u.Payload, &m); err != nil {
@@ -186,11 +236,8 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 	if strings.TrimSpace(m.Text) == "" {
 		return fmt.Errorf("%w: empty text", errPermanent)
 	}
-	if p.sent == nil {
-		p.sent = make(map[string]int)
-	}
 	parts := Split(m.Text, p.maxChars())
-	for i := p.sent[u.MsgID]; i < len(parts); i++ {
+	for i := u.PartsSent; i < len(parts); i++ {
 		_, err := p.Slack.PostReply(ctx, channel, ts, u.Client, parts[i])
 		if errors.Is(err, slack.ErrNotFound) {
 			return fmt.Errorf("%w: %v", errPermanent, err)
@@ -198,7 +245,9 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 		if err != nil {
 			return err
 		}
-		p.sent[u.MsgID] = i + 1
+		if err := p.record(ctx, func() error { return p.Store.Inbox.SetPartsSent(ctx, u.MsgID, i+1) }); err != nil {
+			return err
+		}
 	}
 	return nil
 }

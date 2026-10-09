@@ -33,11 +33,21 @@ var testBackoff = Backoff{Min: time.Millisecond, Max: 10 * time.Millisecond}
 // Hub's handler.
 func testHub(t *testing.T, wrap func(http.Handler) http.Handler) (*Hub, *httptest.Server) {
 	t.Helper()
+	return testHubWith(t, nil, wrap)
+}
+
+// testHubWith is testHub with configure, if set, run on the Hub before it
+// serves.
+func testHubWith(t *testing.T, configure func(*Hub), wrap func(http.Handler) http.Handler) (*Hub, *httptest.Server) {
+	t.Helper()
 	st, err := store.OpenHub(t.Context(), filepath.Join(t.TempDir(), "hub.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := &Hub{Store: st, Lease: testLease}
+	if configure != nil {
+		configure(h)
+	}
 	var handler http.Handler = h.Handler()
 	if wrap != nil {
 		handler = wrap(handler)
@@ -81,10 +91,17 @@ func (c *cutter) cut() {
 // the returned func stops it and waits for it to return.
 func testClient(t *testing.T, st *store.Client, id, hub string, cut *cutter) (*Client, func()) {
 	t.Helper()
+	return testClientWith(t, st, id, hub, cut, nil)
+}
+
+// testClientWith is testClient with the header the client sends.
+func testClientWith(t *testing.T, st *store.Client, id, hub string, cut *cutter, header http.Header) (*Client, func()) {
+	t.Helper()
 	c := &Client{
 		Store:      st,
 		ID:         id,
 		Hub:        hub,
+		Header:     header,
 		Heartbeat:  testHeartbeat,
 		Backoff:    testBackoff,
 		Timeout:    testTimeout,
@@ -668,5 +685,60 @@ func TestRequestUnreachable(t *testing.T) {
 		if d := time.Since(start); d > 5*testTimeout {
 			t.Errorf("%s: Request took %v, want it bounded by the timeout %v", name, d, testTimeout)
 		}
+	}
+}
+
+// A client whose version the hub does not serve gets no downlink: its
+// messages wait in the outbox, its uplink still works, and a client of a
+// served version gets its messages. The waiting messages reach the client
+// once it runs a served version.
+func TestOutdatedClientGetsNoDownlink(t *testing.T) {
+	ctx := t.Context()
+	h, srv := testHubWith(t, func(h *Hub) {
+		h.AcceptVersion = func(v string) error {
+			if v != "v2" {
+				return errors.New("version " + v + " is older than v2")
+			}
+			return nil
+		}
+	}, nil)
+	old := openClientStore(t)
+	oldClient, stopOld := testClientWith(t, old, "a", srv.URL, &cutter{}, http.Header{VersionHeader: {"v1"}})
+	served := openClientStore(t)
+	testClientWith(t, served, "b", srv.URL, &cutter{}, http.Header{VersionHeader: {"v2"}})
+	forA, err := h.Send(ctx, "a", []byte("for a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forB, err := h.Send(ctx, "b", []byte("for b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted, err := oldClient.Post(ctx, []byte("from a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "b's message", func() bool { return len(inboxIDs(t, served.Inbox)) == 1 })
+	waitFor(t, "a's post in the hub inbox", func() bool { return len(inboxIDs(t, h.Store.Inbox.Inbox)) == 1 })
+	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{posted}) {
+		t.Fatalf("hub inbox = %v, want [%s]", got, posted)
+	}
+	if got := inboxIDs(t, served.Inbox); !slices.Equal(got, []string{forB.MsgID}) {
+		t.Fatalf("b's inbox = %v, want [%s]", got, forB.MsgID)
+	}
+	// Enough reconnect attempts have happened for a to have got its
+	// message, had the hub served it.
+	if got := inboxIDs(t, old.Inbox); len(got) != 0 {
+		t.Fatalf("a's inbox = %v, want empty", got)
+	}
+	if outboxEmpty(t, h, "a") {
+		t.Fatal("a's message is gone from the hub outbox")
+	}
+	// a upgraded: the same client id at a served version.
+	stopOld()
+	testClientWith(t, old, "a", srv.URL, &cutter{}, http.Header{VersionHeader: {"v2"}})
+	waitFor(t, "a's message after the upgrade", func() bool { return len(inboxIDs(t, old.Inbox)) == 1 })
+	if got := inboxIDs(t, old.Inbox); !slices.Equal(got, []string{forA.MsgID}) {
+		t.Fatalf("a's inbox = %v, want [%s]", got, forA.MsgID)
 	}
 }

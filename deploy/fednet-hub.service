@@ -11,7 +11,18 @@
 #     flags, to run the hub without Slack; leave out the webhook to run it
 #     without alerts; leave out the approval key to run it without
 #     approvals (requests for approval are then refused).
-# The database lives in /var/lib/fednet-hub (StateDirectory).
+# The database lives in /var/lib/fednet-hub (StateDirectory); the admin
+# socket in /run/fednet-hub (RuntimeDirectory).
+#
+# To upgrade without a gap, put the new binary at /usr/local/bin/fednet and
+# run `systemctl reload fednet-hub`: the hub starts a new process of the
+# new binary, which takes over the port and the socket, then the old one
+# finishes what it has in hand and exits. A new process that fails to start
+# makes the reload fail and leaves the old one serving. The service is
+# Type=notify so that systemd follows the main process across the handoff;
+# NotifyAccess=all because the new process reports before it is the main
+# one. A change to this unit, or a database migration the old binary cannot
+# handle, needs `systemctl restart` instead.
 
 [Unit]
 Description=fednet hub
@@ -19,7 +30,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=all
 User=fednet
 Group=fednet
 # replace: where the deployment keeps the four credential files.
@@ -29,6 +41,8 @@ LoadCredential=alert-webhook:/etc/fednet-hub/credentials/alert-webhook
 LoadCredential=approval-key:/etc/fednet-hub/credentials/approval-key
 StateDirectory=fednet-hub
 StateDirectoryMode=0700
+RuntimeDirectory=fednet-hub
+RuntimeDirectoryMode=0700
 # replace: -listen with the address the clients reach the hub at, on the
 # private network between the machines (the hub speaks plain HTTP, so not
 # a public address). If that address belongs to a VPN interface, also order
@@ -37,10 +51,12 @@ ExecStart=/usr/local/bin/fednet hub \
     -listen 127.0.0.1:8080 \
     -db /var/lib/fednet-hub/hub.db \
     -config /etc/fednet-hub/hub.json \
+    -admin-socket %t/fednet-hub/admin.sock \
     -slack-app-token-file %d/slack-app-token \
     -slack-bot-token-file %d/slack-bot-token \
     -alert-webhook-file %d/alert-webhook \
     -approval-key-file %d/approval-key
+ExecReload=/usr/local/bin/fednet hub handoff -socket %t/fednet-hub/admin.sock
 Restart=on-failure
 RestartSec=5s
 # Exit 2 is a usage error; restarting does not fix it.

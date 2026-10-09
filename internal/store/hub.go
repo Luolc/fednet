@@ -80,6 +80,10 @@ CREATE TABLE approval (
 	card_final   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX approval_status ON approval (status);
+`, `
+-- How many parts of a split post are in Slack already, so that neither a
+-- retry nor another process posts them again.
+ALTER TABLE inbox ADD COLUMN parts_sent INTEGER NOT NULL DEFAULT 0;
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.

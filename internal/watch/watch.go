@@ -1,7 +1,8 @@
 // Package watch raises the hub's alerts: when the hub has been cut off from
-// Slack too long, and when a machine is offline while messages for it have
-// waited too long. An alert goes to the alerts webhook once for each
-// occurrence; only after the trouble has cleared does it alert again.
+// Slack too long, when a machine is offline while messages for it have
+// waited too long, and when a machine runs a version the hub does not
+// serve. An alert goes to the alerts webhook once for each occurrence; only
+// after the trouble has cleared does it alert again.
 package watch
 
 import (
@@ -42,6 +43,9 @@ type Watch struct {
 	Link SlackLink
 	// Online reports whether a client is online.
 	Online func(client string) bool
+	// AcceptVersion, if set, says whether the hub serves a client of a
+	// version, with the reason when it does not; it is the link's.
+	AcceptVersion func(version string) error
 	// Alert gets the alerts; it must be set.
 	Alert *alert.Webhook
 	// SlackDown is how long the hub may be cut off from Slack before an
@@ -58,6 +62,9 @@ type Watch struct {
 	// offline holds the clients whose current absence is alerted, each with
 	// the threads already told.
 	offline map[string]map[string]bool
+	// outdated holds, for each client alerted for its version, that
+	// version.
+	outdated map[string]string
 }
 
 func or(d, def time.Duration) time.Duration {
@@ -114,9 +121,13 @@ func (w *Watch) checkClients(ctx context.Context) error {
 	}
 	if w.offline == nil {
 		w.offline = make(map[string]map[string]bool)
+		w.outdated = make(map[string]string)
 	}
 	var errs []error
 	for _, c := range clients {
+		if w.AcceptVersion != nil {
+			errs = append(errs, w.checkVersion(ctx, c))
+		}
 		waiting := false
 		if !w.Online(c) {
 			if waiting, err = w.Store.Outbox.QueuedFor(ctx, c, limit); err != nil {
@@ -138,6 +149,29 @@ func (w *Watch) checkClients(ctx context.Context) error {
 		errs = append(errs, w.tellThreads(ctx, c, limit))
 	}
 	return errors.Join(errs...)
+}
+
+// checkVersion alerts once that client, as last seen, runs a version the
+// hub does not serve; again if it comes back with another such version.
+func (w *Watch) checkVersion(ctx context.Context, client string) error {
+	reg, err := w.Store.Registration(ctx, client)
+	if err != nil {
+		return err
+	}
+	if reg.Version == "" || w.AcceptVersion(reg.Version) == nil {
+		delete(w.outdated, client)
+		return nil
+	}
+	if w.outdated[client] == reg.Version {
+		return nil
+	}
+	err = w.Alert.Send(ctx, fmt.Sprintf("%s runs %s, which this hub does not serve: %v; messages for it wait until it is upgraded",
+		client, reg.Version, w.AcceptVersion(reg.Version)))
+	if err != nil {
+		return err
+	}
+	w.outdated[client] = reg.Version
+	return nil
 }
 
 // tellThreads says in each thread with a message queued for client, once,

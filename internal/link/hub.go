@@ -32,6 +32,11 @@ type Hub struct {
 	// handshake, so a client revoked or re-registered while connected is
 	// dropped. Zero means DefaultRecheck.
 	Recheck time.Duration
+	// AcceptVersion, if set, is asked at each downlink handshake with the
+	// version in VersionHeader. An error refuses the downlink with 426 and
+	// the error's text: the client's messages wait in its outbox until it
+	// runs a version the hub serves. Uplink and requests are not refused.
+	AcceptVersion func(version string) error
 	// Answer answers a request from client. An error made by Refuse goes
 	// back to the client; any other error is logged and the client only
 	// learns that the request failed. Nil means every request fails.
@@ -187,6 +192,13 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 	client, ok := h.authorize(w, r)
 	if !ok {
 		return
+	}
+	if h.AcceptVersion != nil {
+		if err := h.AcceptVersion(r.Header.Get(VersionHeader)); err != nil {
+			slog.Warn("link: downlink refused, messages wait", "client", client, "err", err)
+			http.Error(w, err.Error(), http.StatusUpgradeRequired)
+			return
+		}
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OnPingReceived: func(context.Context, []byte) bool {

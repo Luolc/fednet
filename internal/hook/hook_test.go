@@ -470,6 +470,110 @@ func TestShutdownDoesNotCountAsAttempt(t *testing.T) {
 	}
 }
 
+// Stop lets the run of the hook in hand end and records it, and takes no
+// further message: the next Run, in another process, runs only that one.
+func TestStopWaitsForTheHook(t *testing.T) {
+	f := newFixture(t, `echo $$ > "$DIR/self"; sleep 0.3`)
+	f.r.Timeout = time.Minute
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(ctx)
+	}()
+	f.put("m1", `{"t":"x"}`)
+	f.put("m2", `{"t":"y"}`)
+	var self int
+	waitFor(t, "the hook to start", func() bool {
+		var ok bool
+		self, ok = f.pid("self")
+		return ok
+	})
+	f.r.Stop()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+	if left(self) {
+		t.Fatalf("hook %d is left (state %q) after Run returned", self, state(t, self))
+	}
+	if !f.delivered("m1") {
+		t.Fatal("m1 is not marked delivered: the run in hand was not recorded")
+	}
+	qs := f.queued()
+	if len(qs) != 1 || qs[0].MsgID != "m2" || qs[0].Attempts != 0 {
+		t.Fatalf("queued after Stop = %+v, want m2 untouched", qs)
+	}
+}
+
+// Stop does not let Run return with an outcome the store refused: the
+// hook has run, so the outcome is kept and recorded once the store takes
+// it; a Runner that takes the inbox over then does not run the hook again.
+func TestStopRecordsTheOutcome(t *testing.T) {
+	f := newFixture(t, `echo run >> "$DIR/runs"; exit 0`)
+	f.r.Retry = Retry{Min: 20 * time.Millisecond, Max: 20 * time.Millisecond, Attempts: 5}
+	db, err := sql.Open("sqlite", filepath.Join(f.dir, "client.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.ExecContext(t.Context(), "CREATE TRIGGER fail BEFORE UPDATE OF delivered ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(t.Context())
+	}()
+	f.put("m1", `{"t":"x"}`)
+	waitFor(t, "the hook to run", func() bool { return len(f.lines("runs")) == 1 })
+	f.r.Stop()
+	select {
+	case <-done:
+		t.Fatal("Run returned with the outcome unrecorded")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := db.ExecContext(t.Context(), "DROP TRIGGER fail"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return once the store took the outcome")
+	}
+	if !f.delivered("m1") {
+		t.Fatal("m1 is not marked delivered")
+	}
+	// The next Runner, as in the process that takes over.
+	next := &Runner{Store: f.st, Command: f.r.Command, Env: f.r.Env, Dir: f.r.Dir, Timeout: f.r.Timeout, Retry: f.r.Retry}
+	if wait, err := next.pass(t.Context()); err != nil || wait != -1 {
+		t.Fatalf("the next Runner's pass = %v, %v; want nothing queued", wait, err)
+	}
+	if runs := f.lines("runs"); len(runs) != 1 {
+		t.Fatalf("hook ran %d times, want once", len(runs))
+	}
+}
+
+// A Stop that lands after Run has looked at the inbox and found it empty,
+// just before it waits, still makes Run return.
+func TestStopJustBeforeWaitReturns(t *testing.T) {
+	f := newFixture(t, `exit 0`)
+	var once sync.Once
+	f.r.beforeWait = func() { once.Do(f.r.Stop) }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(t.Context())
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after a Stop just before it waited")
+	}
+}
+
 func TestRetryDelay(t *testing.T) {
 	r := Retry{Min: time.Second, Max: 10 * time.Second, Attempts: 5}
 	for attempts, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 4: 8 * time.Second, 5: 10 * time.Second, 40: 10 * time.Second} {

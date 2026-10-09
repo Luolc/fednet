@@ -105,6 +105,13 @@ type Runner struct {
 	// it, and runs nothing else until it has, so the hook never runs again
 	// for a message whose outcome is known.
 	unsaved *outcome
+	// stop is closed by Stop.
+	stop     chan struct{}
+	stopOnce sync.Once
+	// beforeWait, if set, runs after Run has decided to wait for
+	// something to do and before it picks what to wait for; a test puts
+	// a Stop there.
+	beforeWait func()
 }
 
 // outcome is what one run of the hook ended in: err nil means it exited 0.
@@ -154,20 +161,48 @@ func (r *Runner) Nudge() {
 	}
 }
 
+func (r *Runner) stopCh() chan struct{} {
+	r.stopOnce.Do(func() { r.stop = make(chan struct{}) })
+	return r.stop
+}
+
+// Stop makes Run return once the run of the hook in hand, if any, has
+// ended and its outcome is recorded, taking no further message; unlike
+// ctx it interrupts nothing, and an outcome the store refuses is still
+// retried until recorded. It is for handing the inbox to another process.
+// It may be called more than once.
+func (r *Runner) Stop() {
+	r.stopOnce.Do(func() { r.stop = make(chan struct{}) })
+	select {
+	case <-r.stop:
+	default:
+		close(r.stop)
+	}
+}
+
+func (r *Runner) stopping() bool {
+	select {
+	case <-r.stopCh():
+		return true
+	default:
+		return false
+	}
+}
+
 // Run runs the hook for every undelivered message as it becomes due, until
-// ctx is done. It must be called once. A run of the hook that ctx
+// ctx is done or Stop is called. It must be called once. A run of the hook that ctx
 // interrupts is not counted as an attempt; the message is tried again by
 // the next Run. An outcome the store refuses to record is kept and retried
 // before anything else runs; one that is still unrecorded when ctx is done
 // is lost, and the next Run runs the hook again for that message.
 func (r *Runner) Run(ctx context.Context) {
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && (!r.stopping() || r.unsaved != nil) {
 		wait, err := r.pass(ctx)
 		if err != nil {
 			slog.Warn("hook: store", "err", err)
 			wait = r.retry().Min
 		}
-		if wait == 0 {
+		if wait == 0 || (r.stopping() && r.unsaved == nil) {
 			continue
 		}
 		var due <-chan time.Time
@@ -176,10 +211,21 @@ func (r *Runner) Run(ctx context.Context) {
 			timer = time.NewTimer(wait)
 			due = timer.C
 		}
+		// With an outcome to record the loop waits only for the retry;
+		// Stop, already called, must not wake it. Otherwise it listens for
+		// Stop: one that came since pass looked would be missed.
+		if r.beforeWait != nil {
+			r.beforeWait()
+		}
+		var stop <-chan struct{}
+		if r.unsaved == nil {
+			stop = r.stopCh()
+		}
 		select {
 		case <-r.nudgeCh():
 		case <-due:
 		case <-ctx.Done():
+		case <-stop:
 		}
 		if timer != nil {
 			timer.Stop()
@@ -207,7 +253,7 @@ func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
 	wait := time.Duration(-1)
 	ran := false
 	for _, q := range qs {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || r.stopping() {
 			return 0, nil
 		}
 		if d := q.NextAttempt.Sub(now); d > 0 {

@@ -230,6 +230,26 @@ func TestHandleDedupsEvents(t *testing.T) {
 	}
 }
 
+// Two hubs on the same database, as during a handoff, both get the same
+// event: it is queued once. Each has its own connection and its own
+// memory; only the database is shared.
+func TestHandleDedupsAcrossInstances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.db")
+	r1, _ := newReceiver(t)
+	r1.Store = openHub(t, path)
+	r2, _ := newReceiver(t)
+	r2.Store = openHub(t, path)
+	handle(t, r1, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r2, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r2, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	handle(t, r1, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	for i, r := range []*Receiver{r1, r2} {
+		if got := texts(t, r.Store, "workstation"); !slices.Equal(got, []string{"first", "reply"}) {
+			t.Fatalf("texts seen by hub %d = %q, want [first reply]", i+1, got)
+		}
+	}
+}
+
 // A message is recorded, and queued, before Handle returns, so that the
 // event is acked only after that; when the record fails, Handle fails, and
 // nothing is queued.
@@ -592,6 +612,47 @@ func TestBackfillOfOldConnectionKeepsNewStart(t *testing.T) {
 				t.Fatalf("BackfillFrom after the new backfill = %q, want empty", from)
 			}
 		})
+	}
+}
+
+// The same across processes: the old hub's backfill finishes after the new
+// hub's connection has fixed its start. The old backfill cannot clear or
+// move it, since the store, not the old hub's memory, decides; the new
+// hub's backfill takes in what came during the gap.
+func TestBackfillOfOldProcessKeepsNewStart(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "hub.db")
+	old, f := newReceiver(t)
+	old.Store = openHub(t, path)
+	handle(t, old, post(t, f, "C1", slack.Message{User: "U1", Text: "first"}))
+	connected(t, old)
+	gate := &gatedHistory{API: f, entered: make(chan struct{}), release: make(chan struct{})}
+	old.Slack = gate
+	done := make(chan error, 1)
+	go func() { done <- old.Backfill(ctx) }()
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the old backfill did not get to C1's history")
+	}
+	// The new process comes up and fixes its start; a message is posted
+	// that the old backfill has already read past.
+	fresh := &Receiver{Store: openHub(t, path), Slack: f, Route: old.Route, Users: old.Users, Now: old.Now}
+	connected(t, fresh)
+	post(t, f, "C1", slack.Message{User: "U1", Text: "gap"})
+	close(gate.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if from, _ := fresh.Store.SlackState(ctx, store.BackfillFrom); from == "" {
+		t.Fatal("the old process's backfill cleared the new process's start")
+	}
+	runBackfill(t, fresh)
+	if got, want := all(t, fresh.Store), []string{"first", "gap"}; !slices.Equal(got, want) {
+		t.Fatalf("queued = %q, want %q", got, want)
+	}
+	if from, _ := fresh.Store.SlackState(ctx, store.BackfillFrom); from != "" {
+		t.Fatalf("BackfillFrom after the new backfill = %q, want empty", from)
 	}
 }
 

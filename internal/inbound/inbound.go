@@ -90,11 +90,15 @@ type Receiver struct {
 	mu        sync.Mutex
 	connected bool
 	since     time.Time
-	// generation counts the connections: a backfill clears the start it
-	// read only if no connection has come up since, so that a backfill of
-	// the connection before cannot clear what Connected fixed for this
-	// one.
-	generation int
+	// up is closed by the first Connected.
+	up     chan struct{}
+	upOnce sync.Once
+	// epoch is the store's BackfillEpoch as of this Receiver's last
+	// Connected: a backfill clears the start it read only if the store's
+	// epoch is still this one, so that a backfill of the connection
+	// before, in this process or in the one being replaced, cannot clear
+	// what Connected fixed for this one.
+	epoch int64
 }
 
 // Handle takes in ev: if it is a message to hand on, Handle records it and
@@ -248,20 +252,25 @@ func (r *Receiver) Connected(ctx context.Context) error {
 	if !r.connected {
 		r.connected, r.since = true, r.now()
 	}
-	r.generation++
-	st := r.Store
-	from, err := st.SlackState(ctx, store.LastSeen)
+	epoch, err := r.Store.FixBackfillStart(ctx)
 	if err != nil {
 		return err
 	}
-	pending, err := st.SlackState(ctx, store.BackfillFrom)
-	if err != nil {
-		return err
+	r.epoch = epoch
+	r.upOnce.Do(func() { r.up = make(chan struct{}) })
+	select {
+	case <-r.up:
+	default:
+		close(r.up)
 	}
-	if pending != "" && (from == "" || slack.CompareTS(pending, from) < 0) {
-		from = pending
-	}
-	return st.SetSlackState(ctx, store.BackfillFrom, from)
+	return nil
+}
+
+// Up returns a channel that is closed once the connection to Slack has
+// come up for the first time.
+func (r *Receiver) Up() <-chan struct{} {
+	r.upOnce.Do(func() { r.up = make(chan struct{}) })
+	return r.up
 }
 
 // Backfill reads from Slack what the hub may have missed and takes it in
@@ -273,11 +282,11 @@ func (r *Receiver) Connected(ctx context.Context) error {
 // only if no connection has come up meanwhile, so that a backfill that
 // failed partway starts from the same place next time, and so does a hub
 // that restarted, and so does the connection after one whose backfill was
-// still running.
+// still running, in this process or in another on the same database.
 func (r *Receiver) Backfill(ctx context.Context) error {
 	st := r.Store
 	r.mu.Lock()
-	generation := r.generation
+	epoch := r.epoch
 	from, err := st.SlackState(ctx, store.BackfillFrom)
 	r.mu.Unlock()
 	if err != nil || from == "" {
@@ -297,16 +306,12 @@ func (r *Receiver) Backfill(ctx context.Context) error {
 		}
 	}
 	// Everything up to now has been read, unless a newer connection has
-	// fixed a start of its own, which is its backfill's to clear.
+	// fixed a start of its own, which is its backfill's to clear; the
+	// store decides, so that holds across processes too.
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.generation != generation {
-		return nil
-	}
-	if err := st.AdvanceLastSeen(ctx, slackTS(now)); err != nil {
-		return err
-	}
-	return st.SetSlackState(ctx, store.BackfillFrom, "")
+	_, err = st.FinishBackfill(ctx, epoch, slackTS(now))
+	return err
 }
 
 // backfill takes in what c has after from.
