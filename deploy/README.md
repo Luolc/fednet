@@ -51,6 +51,8 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 
 审批要同时有 Slack 和私钥，还要在配置里的 `approvals` 写上审批卡发到哪个 channel (`channel`) 和谁能批 (`approvers`，Slack 用户 id，每个都得在 `users` 名单上)。缺任何一样，agent 的 `request-approval` 直接被拒绝，不发卡、不签名；没给私钥时启动日志里有一句 `approvals are off`。
 
+channel 里的消息只有 @ 了 bot 才交给 agent，@ 的那条带上线程里之前的消息作为上下文；配置里的 `history` 定上下文的上限：`max_messages` 最多几条，`max_chars` 这几条的正文合计最多几个字符，`max_message_chars` 单条正文超过几个字符就截断 (@ 的那条本身也按它截)。不写就用示例里的默认值 (10、4000、2000)。hub 启动时用 bot token 调一次 `auth.test` 认自己的用户 id，调不到就不启动。
+
 ## 启动之后
 
 在 hub 机器上登记一台 client (ID 和 HASH 是那台机器上 `fednet client init` 打印的)：

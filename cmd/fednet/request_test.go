@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/inbound"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
@@ -291,11 +292,35 @@ func TestHubConfigAlerts(t *testing.T) {
 	}
 }
 
+func TestHubConfigHistory(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cfg, err := readHubConfig(write("set.json", `{"history": {"max_messages": 3, "max_chars": 500, "max_message_chars": 100}}`))
+	if err != nil || cfg.history() != (inbound.Limits{MaxMessages: 3, MaxChars: 500, MaxMessageChars: 100}) {
+		t.Fatalf("readHubConfig = %+v, %v; want 3, 500 and 100", cfg.History, err)
+	}
+	if cfg, err := readHubConfig(write("unset.json", `{}`)); err != nil || cfg.history() != (inbound.Limits{}) {
+		t.Fatalf("readHubConfig without history = %+v, %v; want zero, the defaults", cfg.History, err)
+	}
+	if _, err := readHubConfig(write("bad.json", `{"history": {"max_chars": -1}}`)); err == nil || !strings.Contains(err.Error(), "history limits must not be negative") {
+		t.Fatalf("readHubConfig with a negative limit = %v, want it refused", err)
+	}
+}
+
 // The example config in deploy/ is one the hub takes.
 func TestExampleHubConfig(t *testing.T) {
 	cfg, err := readHubConfig(filepath.Join("..", "..", "deploy", "hub.example.json"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.history() != (inbound.Limits{MaxMessages: inbound.DefaultMaxMessages, MaxChars: inbound.DefaultMaxChars, MaxMessageChars: inbound.DefaultMaxMessageChars}) {
+		t.Fatalf("the example's history limits are %+v, want the defaults", cfg.History)
 	}
 	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 {
 		t.Fatalf("example config = %+v, want every part set", cfg)

@@ -31,6 +31,58 @@ const (
 	Expired  = "expired"
 )
 
+// Triggers of an inbound message, for Message.Trigger: why the hub sent
+// it down.
+const (
+	// Mention is a message that mentions the bot in a thread that had no
+	// owner: the thread is handed to the client with this message.
+	Mention = "mention"
+	// Reply is a reply in a thread the client owns.
+	Reply = "reply"
+	// DM is a message in a direct message conversation.
+	DM = "dm"
+)
+
+// File is the metadata of a file uploaded with a message. URL is the
+// file's permalink, which needs a Slack login; the content is not fetched.
+type File struct {
+	Name     string `json:"name"`
+	Mimetype string `json:"mimetype"`
+	Size     int    `json:"size"`
+	URL      string `json:"url"`
+}
+
+// History is what a thread held before the message that handed it to the
+// client: the latest few messages, within the hub's limits, and how many
+// there are in all.
+type History struct {
+	// Total is how many messages the thread had before the trigger;
+	// Included how many Messages holds, the latest ones; Omitted the
+	// rest, all earlier than those.
+	Total    int `json:"total"`
+	Included int `json:"included"`
+	Omitted  int `json:"omitted"`
+	// Messages are oldest first.
+	Messages []HistoryMessage `json:"messages"`
+	// ReadMore is the command that reads the whole thread.
+	ReadMore string `json:"read_more"`
+}
+
+// HistoryMessage is one message of a History.
+type HistoryMessage struct {
+	TS string `json:"ts"`
+	// User is the Slack user id of the person who posted it; empty for a
+	// message an agent posted.
+	User string `json:"user"`
+	// Name is the person's name on the hub's user list, or, for a message
+	// an agent posted, "fednet (<machine>)".
+	Name string `json:"name"`
+	Text string `json:"text"`
+	// Truncated is set when Text was cut to the hub's limit.
+	Truncated bool   `json:"truncated"`
+	Files     []File `json:"files"`
+}
+
 // Message is a decoded payload. Type is always set; which other fields are
 // set depends on it.
 type Message struct {
@@ -48,9 +100,20 @@ type Message struct {
 	// TS is the Slack ts of an inbound message.
 	TS string `json:"ts,omitempty"`
 	// Context is the description of the channel, its Slack purpose, sent
-	// with the inbound message that starts a thread in it; empty for a
-	// reply, a direct message, or when the hub could not read it.
+	// with the inbound message that hands a thread in it to the client;
+	// empty for a reply, a direct message, or when the hub could not
+	// read it.
 	Context string `json:"context,omitempty"`
+	// Trigger says why an inbound message was sent: Mention, Reply or DM.
+	Trigger string `json:"trigger,omitempty"`
+	// UserName is User's name on the hub's user list.
+	UserName string `json:"user_name,omitempty"`
+	// Files are the files uploaded with an inbound message, which Text
+	// also lists.
+	Files []File `json:"files,omitempty"`
+	// History is, on a Mention in a thread that had messages before it,
+	// those messages.
+	History *History `json:"history,omitempty"`
 	// ApprovalID, Agent and Outcome are set on an approval outcome: which
 	// approval, the agent that requested it, and Approved, Rejected or
 	// Expired. Text is then the summary the request gave.

@@ -7,5 +7,6 @@
   "users": {"U0000000001": "maintainer"},
   "alerts": {"slack_down": "5m", "offline_queued": "10m"},
   "approvals": {"channel": "C0000000003", "approvers": ["U0000000001"]},
+  "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
   "upgrade": {"admins": ["U0000000001"], "auto": true}
 }
