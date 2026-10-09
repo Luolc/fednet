@@ -268,19 +268,28 @@ func TestHubWithSlack(t *testing.T) {
 	if fi, err := os.Stat(shotPath); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("the screenshot's mode is %v, %v; want 0600", fi.Mode(), err)
 	}
-	// The inbox keeps the payload as the hub sent it: no path.
+	// The hook gives up on it. The dead letter keeps the payload as the
+	// inbox stored it, as the hub sent it: no path.
 	cs, err := store.OpenClient(ctx, clientDB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	waitFor(t, "the message queued in the inbox", func() bool {
-		qs, err := cs.Inbox.Queued(ctx)
-		return err == nil && len(qs) == 1 && !strings.Contains(string(qs[0].Payload), `"path"`) && strings.Contains(string(qs[0].Payload), `"fetch":true`)
+	var dead store.DeadLetter
+	waitFor(t, "the message among the dead letters", func() bool {
+		ds, err := cs.Inbox.DeadLetters(ctx)
+		if err != nil || len(ds) != 1 {
+			return false
+		}
+		dead = ds[0]
+		return true
 	})
+	if p := string(dead.Payload); dead.MsgID != event.MsgID || strings.Contains(p, `"path"`) || !strings.Contains(p, `"fetch":true`) {
+		t.Fatalf("dead letter %s holds %s, want %s with fetch and no path", dead.MsgID, p, event.MsgID)
+	}
 
-	// The hook gives up on it; the client tells the hub, whose first try
-	// at the webhook is refused and logged.
+	// The client tells the hub, whose first try at the webhook is refused
+	// and logged.
 	waitFor(t, "the refused alert in the log", func() bool {
 		return strings.Contains(stderr.String(), "outbound: alert from a client")
 	})
