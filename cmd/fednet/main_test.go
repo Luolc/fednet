@@ -44,7 +44,6 @@ func TestRun(t *testing.T) {
 		{"hub with a missing config", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-config", "/nonexistent/hub.json"}, 1, "", "no such file"},
 		{"hub with one Slack token", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-slack-bot-token-file", "/dev/null"}, 2, "", "give both -slack-app-token-file and -slack-bot-token-file"},
 		{"hub with an empty token file", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-slack-app-token-file", "/dev/null", "-slack-bot-token-file", "/dev/null"}, 1, "", "/dev/null is empty"},
-		{"hub with a missing webhook file", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-alert-webhook-file", "/nonexistent/webhook"}, 1, "", "no such file"},
 		{"reassign without a target", []string{"hub", "reassign", "-db", "x", "workstation"}, 2, "", "want 2 arguments"},
 		{"register with a bad hash", []string{"hub", "register", "-db", "x", "ws", "nothex"}, 2, "", "HASH must be"},
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
@@ -182,7 +181,9 @@ func TestHubAndClient(t *testing.T) {
 	}
 	hs.Close()
 
-	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB}, &stdout, &stderr)
+	// Without Slack the webhook file is not read, so one that is missing
+	// does not stop the hub.
+	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-alert-webhook-file", "/nonexistent/webhook"}, &stdout, &stderr)
 	var addr string
 	waitFor(t, "the hub to listen", func() bool {
 		m := listening.FindStringSubmatch(stdout.String())

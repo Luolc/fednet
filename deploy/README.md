@@ -19,7 +19,7 @@
 
 三个凭证文件各放一个凭证，首尾的空白 (包括末尾换行) 读的时候去掉。fednet 只从这几个文件读凭证，不读环境变量，也不把凭证写进日志和错误信息；文件由部署方提供，单元模板用 `LoadCredential=` 把它们交给服务。
 
-两个 Slack 文件要么都给，要么都不给。都不给时 hub 只跑 client 用的 HTTP 服务，启动日志里有一句 `Slack not configured`，适合本地试跑。给了 Slack、没给 webhook 时，报警只进日志。
+两个 Slack 文件要么都给，要么都不给。都不给时 hub 只跑 client 用的 HTTP 服务，启动日志里有一句 `Slack not configured`，适合本地试跑。没给 Slack 时 webhook 文件不读，给了也不用；给了 Slack、没给 webhook 时，报警只进日志。
 
 ## 启动之后
 

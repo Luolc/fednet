@@ -324,7 +324,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	configPath := fs.String("config", "", "hub config file; without one, no client may open threads")
 	appTokenPath := fs.String("slack-app-token-file", "", "file holding the Slack app-level token, for Socket Mode")
 	botTokenPath := fs.String("slack-bot-token-file", "", "file holding the Slack bot token, for the Web API")
-	webhookPath := fs.String("alert-webhook-file", "", "file holding the URL of the Slack incoming webhook for alerts")
+	webhookPath := fs.String("alert-webhook-file", "", "file holding the URL of the Slack incoming webhook for alerts; read only with the Slack token files")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
@@ -340,6 +340,10 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 		if cfg, err = readHubConfig(*configPath); err != nil {
 			return err
 		}
+	}
+	if *appTokenPath == "" {
+		// Without Slack nothing sends alerts, so the webhook is not read.
+		*webhookPath = ""
 	}
 	var appToken, botToken, webhookURL string
 	for _, f := range []struct {

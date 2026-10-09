@@ -271,3 +271,15 @@ func TestHubStopsWhenSlackRejectsToken(t *testing.T) {
 		t.Fatal("stderr contains a token")
 	}
 }
+
+// With Slack, a webhook file that cannot be read stops the hub before it
+// starts.
+func TestHubWithSlackNeedsItsWebhookFile(t *testing.T) {
+	dir := t.TempDir()
+	slackFlags, _ := fakeSlack(t, dir, &slack.Fake{}, nil)
+	var stdout, stderr syncBuffer
+	args := append([]string{"hub", "-listen", "127.0.0.1:0", "-db", filepath.Join(dir, "hub.db"), "-alert-webhook-file", "/nonexistent/webhook"}, slackFlags...)
+	if code := run(t.Context(), args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "no such file") {
+		t.Fatalf("exit %d, stderr %q; want 1 and the missing file", code, stderr.String())
+	}
+}
