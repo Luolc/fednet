@@ -30,7 +30,36 @@ const (
 	// Content-Type and Content-Length are the file's, FileNameHeader its
 	// name. A file the hub does not serve is refused like a request.
 	FilePath = "/file"
+	// UploadPath takes a POST whose body is an Upload as JSON followed by
+	// the content of each of its files, in order, each Size bytes, and
+	// replies 204 once the hub has posted them in the thread. Like a
+	// request it is not queued: it is done or fails.
+	UploadPath = "/upload"
 )
+
+// Upload is the header of an upload: the thread the files go to, a text
+// to post with them, and the files, whose content follows the header.
+type Upload struct {
+	Thread string       `json:"thread"`
+	Text   string       `json:"text,omitempty"`
+	Files  []FileHeader `json:"files"`
+}
+
+// FileHeader is one file of an Upload: its name and how many bytes of
+// content follow.
+type FileHeader struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+// Total is how many bytes of content follow the header.
+func (u Upload) Total() int64 {
+	var n int64
+	for _, f := range u.Files {
+		n += f.Size
+	}
+	return n
+}
 
 // Headers on every request to the hub.
 const (

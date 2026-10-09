@@ -51,7 +51,7 @@ func fakeSlack(t *testing.T, dir string, api slack.API, fail error) ([]string, <
 	}
 	runs := make(chan slackRun, 1)
 	var botToken string
-	newSlack = func(token string) slack.API {
+	newSlack = func(token string, _ bool) slack.API {
 		botToken = token
 		return api
 	}
@@ -64,7 +64,11 @@ func fakeSlack(t *testing.T, dir string, api slack.API, fail error) ([]string, <
 		return ctx.Err()
 	}
 	t.Cleanup(func() {
-		newSlack = func(token string) slack.API { return slack.New(token) }
+		newSlack = func(token string, commentUpload bool) slack.API {
+			w := slack.New(token)
+			w.CommentUpload = commentUpload
+			return w
+		}
 		runInbound = inbound.Run
 	})
 	return []string{"-slack-app-token-file", app, "-slack-bot-token-file", bot}, runs

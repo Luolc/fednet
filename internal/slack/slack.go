@@ -135,6 +135,18 @@ type API interface {
 	// stream the caller closes. The content is not checked against
 	// f.Size: the caller counts.
 	Download(ctx context.Context, f File) (io.ReadCloser, error)
+	// Upload posts files, with text, in the thread that starts at ts in
+	// channel, as one message from machine, as PostReply does; each
+	// file's content is read from its Body, Size bytes.
+	Upload(ctx context.Context, channel, ts, machine, text string, files []Upload) error
+}
+
+// Upload is one file to upload: its name, its size in bytes and its
+// content.
+type Upload struct {
+	Name string
+	Size int64
+	Body io.Reader
 }
 
 // Command is a slash command someone sent, as Socket Mode delivers it.
@@ -694,6 +706,47 @@ func (f *Fake) FileInfo(_ context.Context, id string) (File, error) {
 	}
 	ff.DownloadURL = "fake://" + id
 	return ff.File, nil
+}
+
+// Upload adds a message from the bot to the thread, naming machine as
+// PostReply does, with the files; each gets an id FileInfo and Download
+// then find, and its content read whole from Body.
+func (f *Fake) Upload(_ context.Context, channel, ts, machine, text string, files []Upload) error {
+	var fs []File
+	var contents [][]byte
+	for _, u := range files {
+		b, err := io.ReadAll(u.Body)
+		if err != nil {
+			return err
+		}
+		if int64(len(b)) != u.Size {
+			return fmt.Errorf("slack: %s: got %d bytes, said %d", u.Name, len(b), u.Size)
+		}
+		fs = append(fs, File{Name: u.Name, URL: "https://files.example.invalid/" + u.Name})
+		contents = append(contents, b)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.channels[channel]
+	if !ok || c.threads[ts] == nil {
+		return ErrNotFound
+	}
+	if f.files == nil {
+		f.files = make(map[string]fakeFile)
+	}
+	for i := range fs {
+		f.clock++
+		fs[i].ID = "F" + strconv.Itoa(f.clock)
+		fs[i].Size = len(contents[i])
+		f.files[fs[i].ID] = fakeFile{fs[i], contents[i]}
+	}
+	m := Message{TS: f.next(), User: FakeBot, Text: text, Machine: machine, Files: fs, SubType: "file_share"}
+	c.threads[ts] = append(c.threads[ts], m)
+	if f.machines == nil {
+		f.machines = make(map[string]string)
+	}
+	f.machines[m.TS] = machine
+	return nil
 }
 
 func (f *Fake) Download(_ context.Context, file File) (io.ReadCloser, error) {

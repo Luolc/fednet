@@ -40,9 +40,9 @@ type Client struct {
 	// Timeout bounds one dial, one uplink request and the wait for one
 	// pong. Zero means DefaultTimeout.
 	Timeout time.Duration
-	// FetchTimeout bounds one file download, headers to last byte. Zero
-	// means DefaultFetchTimeout.
-	FetchTimeout time.Duration
+	// FileTimeout bounds one file download or upload, headers to last
+	// byte. Zero means DefaultFileTimeout.
+	FileTimeout time.Duration
 	// HTTPClient is used for both links. Nil means http.DefaultClient.
 	HTTPClient *http.Client
 	// Received, if set, is called after a downlink message is stored in
@@ -66,9 +66,9 @@ type Client struct {
 
 // Defaults for the zero fields of Client.
 const (
-	DefaultHeartbeat    = 10 * time.Second
-	DefaultTimeout      = 30 * time.Second
-	DefaultFetchTimeout = 5 * time.Minute
+	DefaultHeartbeat   = 10 * time.Second
+	DefaultTimeout     = 30 * time.Second
+	DefaultFileTimeout = 5 * time.Minute
 )
 
 // DefaultBackoff is the Backoff used when Client.Backoff is zero.
@@ -95,11 +95,11 @@ func (c *Client) timeout() time.Duration {
 	return c.Timeout
 }
 
-func (c *Client) fetchTimeout() time.Duration {
-	if c.FetchTimeout == 0 {
-		return DefaultFetchTimeout
+func (c *Client) fileTimeout() time.Duration {
+	if c.FileTimeout == 0 {
+		return DefaultFileTimeout
 	}
-	return c.FetchTimeout
+	return c.FileTimeout
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -331,12 +331,12 @@ func (c *Client) Request(ctx context.Context, req []byte) ([]byte, error) {
 
 // Fetch asks the hub for the file with id and returns what the hub says
 // of it and its content, which the caller reads whole, within
-// FetchTimeout, and closes. Like Request it queues nothing, and fails the
+// FileTimeout, and closes. Like Request it queues nothing, and fails the
 // same ways: ErrUnreachable without an answer, a refusal as the hub
 // refused. A download the hub broke off ends with io.ErrUnexpectedEOF
 // before Size bytes.
 func (c *Client) Fetch(ctx context.Context, id string) (File, io.ReadCloser, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout())
+	ctx, cancel := context.WithTimeout(ctx, c.fileTimeout())
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Hub+FilePath+"?id="+url.QueryEscape(id), nil)
 	if err != nil {
 		cancel()
@@ -376,6 +376,39 @@ type fetched struct {
 func (f *fetched) Close() error {
 	f.cancel()
 	return f.ReadCloser.Close()
+}
+
+// Upload posts u's files, whose content it reads from body, u.Total()
+// bytes, in the thread u names, and returns once the hub has posted them
+// in Slack, within FileTimeout. Like Request it queues nothing and fails
+// the same ways.
+func (c *Client) Upload(ctx context.Context, u Upload, body io.Reader) error {
+	header, err := json.Marshal(u)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.fileTimeout())
+	defer cancel()
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Hub+UploadPath, io.MultiReader(bytes.NewReader(header), io.LimitReader(body, u.Total())))
+	if err != nil {
+		return err
+	}
+	hreq.Header = c.header()
+	hreq.Header.Set("Content-Type", "application/octet-stream")
+	hreq.ContentLength = int64(len(header)) + u.Total()
+	res, err := c.httpClient().Do(hreq)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	defer res.Body.Close()
+	msg, err := io.ReadAll(io.LimitReader(res.Body, maxFrameBytes))
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	if res.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	return refused(res, strings.TrimSpace(string(msg)))
 }
 
 // refused turns a response that is not 200 into the error Request and

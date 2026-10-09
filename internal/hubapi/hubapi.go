@@ -15,6 +15,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/Luolc/fednet/internal/approval"
@@ -107,11 +108,93 @@ type Server struct {
 	// MaxFetchBytes is the largest file Fetch serves. Zero means
 	// DefaultMaxFetchBytes.
 	MaxFetchBytes int64
+	// MaxUploadBytes is the largest file Upload takes, and MaxUploadFiles
+	// how many one upload may have. Zero means the default.
+	MaxUploadBytes int64
+	MaxUploadFiles int
 }
 
-// DefaultMaxFetchBytes is the largest file served when Server.MaxFetchBytes
-// is zero: 200 MiB.
-const DefaultMaxFetchBytes = 200 << 20
+// Defaults for the zero limits of Server: the largest file served is 200
+// MiB, the largest uploaded 50 MiB, ten to an upload.
+const (
+	DefaultMaxFetchBytes  = 200 << 20
+	DefaultMaxUploadBytes = 50 << 20
+	DefaultMaxUploadFiles = 10
+)
+
+// Upload posts the files of u in its thread, for link.Hub.Upload, as a
+// message from client with u.Text; the content comes from body, each
+// file's Size bytes in order, and goes to Slack as it is read. An upload
+// with no files, with more than MaxUploadFiles, with a file over
+// MaxUploadBytes or empty, or with a file without a name, is refused
+// before any content is read; so is one for a thread key that is not
+// one. A file whose content falls short of its Size fails the upload.
+func (s *Server) Upload(ctx context.Context, client string, u link.Upload, body io.Reader) error {
+	channel, ts, err := thread(Request{Thread: u.Thread})
+	if err != nil {
+		return err
+	}
+	maxBytes, maxFiles := s.MaxUploadBytes, s.MaxUploadFiles
+	if maxBytes == 0 {
+		maxBytes = DefaultMaxUploadBytes
+	}
+	if maxFiles == 0 {
+		maxFiles = DefaultMaxUploadFiles
+	}
+	switch {
+	case len(u.Files) == 0:
+		return link.Refuse(link.ErrBadRequest, "an upload needs at least one file")
+	case len(u.Files) > maxFiles:
+		return link.Refuse(link.ErrBadRequest, "an upload takes at most %d files, got %d", maxFiles, len(u.Files))
+	}
+	var files []slack.Upload
+	for _, f := range u.Files {
+		switch {
+		case f.Name == "" || strings.ContainsAny(f.Name, "/\\"):
+			return link.Refuse(link.ErrBadRequest, "%q is not a file name", f.Name)
+		case f.Size <= 0:
+			return link.Refuse(link.ErrBadRequest, "file %s is empty", f.Name)
+		case f.Size > maxBytes:
+			return link.Refuse(link.ErrBadRequest, "file %s is %d bytes, over the hub's limit of %d", f.Name, f.Size, maxBytes)
+		}
+		files = append(files, slack.Upload{Name: f.Name, Size: f.Size, Body: &exactly{r: body, n: f.Size, name: f.Name}})
+	}
+	if s.Slack == nil {
+		return errNoSlack
+	}
+	err = s.Slack.Upload(ctx, channel, ts, client, u.Text, files)
+	if errors.Is(err, slack.ErrNotFound) {
+		return link.Refuse(link.ErrNotFound, "no thread %s", u.Thread)
+	}
+	return err
+}
+
+// exactly reads n bytes of r and then reports EOF; an EOF of r before
+// that is an error naming the file, so that a short file is not posted
+// as a whole one.
+type exactly struct {
+	r    io.Reader
+	n    int64
+	name string
+}
+
+func (e *exactly) Read(p []byte) (int, error) {
+	if e.n <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > e.n {
+		p = p[:e.n]
+	}
+	n, err := e.r.Read(p)
+	e.n -= int64(n)
+	if err == io.EOF && e.n > 0 {
+		return n, fmt.Errorf("file %s ended %d bytes short", e.name, e.n)
+	}
+	if err == io.EOF {
+		err = nil
+	}
+	return n, err
+}
 
 // fileID matches a Slack file id: letters and digits, nothing a path
 // could be made of.

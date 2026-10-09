@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -709,5 +710,108 @@ func TestWebFiles(t *testing.T) {
 	w.base = redirecting.URL + "/"
 	if _, err := w.Download(ctx, File{ID: "F4", DownloadURL: redirecting.URL + "/files-pri/F4"}); err == nil || !strings.Contains(err.Error(), "sign-in page") {
 		t.Fatalf("Download redirected to the sign-in page = %v, want an error saying so", err)
+	}
+}
+
+// An upload: an upload URL for each file, the content posted there with
+// the token, then one completion that puts the files in the thread with
+// the machine and the text in blocks, or in the comment with
+// CommentUpload.
+func TestWebUpload(t *testing.T) {
+	ctx := context.Background()
+	var srv *httptest.Server
+	var uploaded = map[string]string{}
+	var n int
+	host := func() string { return srv.URL }
+	w, ts, srv := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "files.getUploadURLExternal":
+			n++
+			return 200, `{"ok":true,"upload_url":"` + host() + `/upload/` + r.form.Get("filename") + `","file_id":"F` + strconv.Itoa(n) + `"}`
+		case "files.completeUploadExternal":
+			return 200, `{"ok":true,"files":[{"id":"F1","title":"shot.png"}]}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	// The upload URL takes the content as the body; it is served here,
+	// outside the Web API handler above. A refusal is sent before the body
+	// is read.
+	var refuse bool
+	mux := http.NewServeMux()
+	mux.Handle("/upload/", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if refuse {
+			rw.WriteHeader(500)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		ts.mu.Lock()
+		uploaded[path.Base(r.URL.Path)] = r.Header.Get("Authorization") + " " + string(b)
+		ts.mu.Unlock()
+		rw.Write([]byte("OK"))
+	}))
+	mux.Handle("/", srv.Config.Handler)
+	srv.Config.Handler = mux
+	files := []Upload{{Name: "shot.png", Size: 6, Body: strings.NewReader("PNG...")}, {Name: "build.log", Size: 5, Body: strings.NewReader("error")}}
+	if err := w.Upload(ctx, "C1", "1.1", "workstation", "see these", files); err != nil {
+		t.Fatal(err)
+	}
+	if uploaded["shot.png"] != "Bearer "+testToken+" PNG..." || uploaded["build.log"] != "Bearer "+testToken+" error" {
+		t.Fatalf("uploaded = %q, want both files' content with the token", uploaded)
+	}
+	reqs, _ := ts.got()
+	var complete request
+	for _, r := range reqs {
+		if r.method == "files.completeUploadExternal" {
+			complete = r
+		}
+	}
+	if complete.form.Get("channel_id") != "C1" || complete.form.Get("thread_ts") != "1.1" || complete.form.Get("files") != `[{"id":"F1","title":"shot.png"},{"id":"F2","title":"build.log"}]` {
+		t.Fatalf("completeUploadExternal got %v", complete.form)
+	}
+	if blocks := complete.form.Get("blocks"); !strings.Contains(blocks, `"type":"context"`) || !strings.Contains(blocks, `"text":"workstation"`) || !strings.Contains(blocks, `"text":"see these"`) || complete.form.Get("initial_comment") != "" {
+		t.Fatalf("completeUploadExternal blocks = %s, initial_comment = %q; want the machine and the text in blocks", blocks, complete.form.Get("initial_comment"))
+	}
+	// With CommentUpload the machine goes in the comment and no blocks
+	// are sent; an upload without text has just the context block.
+	w.CommentUpload = true
+	if err := w.Upload(ctx, "C1", "1.1", "workstation", "see these", []Upload{{Name: "a.txt", Size: 1, Body: strings.NewReader("a")}}); err != nil {
+		t.Fatal(err)
+	}
+	reqs, _ = ts.got()
+	complete = reqs[len(reqs)-1]
+	if complete.form.Get("initial_comment") != "workstation: see these" || complete.form.Get("blocks") != "" {
+		t.Fatalf("with CommentUpload: initial_comment = %q, blocks = %q", complete.form.Get("initial_comment"), complete.form.Get("blocks"))
+	}
+	w.CommentUpload = false
+	if err := w.Upload(ctx, "C1", "1.1", "workstation", "", []Upload{{Name: "a.txt", Size: 1, Body: strings.NewReader("a")}}); err != nil {
+		t.Fatal(err)
+	}
+	reqs, _ = ts.got()
+	complete = reqs[len(reqs)-1]
+	if blocks := complete.form.Get("blocks"); strings.Contains(blocks, `"markdown"`) || !strings.Contains(blocks, `"text":"workstation"`) {
+		t.Fatalf("without text: blocks = %s, want just the machine", blocks)
+	}
+	// An upload the URL refuses before reading the body fails without
+	// leaving anything running behind: the content is sent by the request
+	// itself, there is no writer to wait for.
+	before := runtime.NumGoroutine()
+	refuse = true
+	err := w.Upload(ctx, "C1", "1.1", "workstation", "x", []Upload{{Name: "c.txt", Size: 1 << 20, Body: bytes.NewReader(make([]byte, 1<<20))}})
+	if err == nil || !strings.Contains(err.Error(), "replied 500") {
+		t.Fatalf("Upload refused by the URL = %v, want an error naming the status", err)
+	}
+	refuse = false
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > before {
+		t.Fatalf("%d goroutines after a refused upload, %d before", n, before)
+	}
+	// An upload URL on another host does not get the token.
+	host = func() string { return "https://files.example.invalid" }
+	err = w.Upload(ctx, "C1", "1.1", "workstation", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
+	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 3 {
+		t.Fatalf("Upload to another host = %v, %d uploads; want it refused before any upload, without quoting the token", err, len(uploaded))
 	}
 }
