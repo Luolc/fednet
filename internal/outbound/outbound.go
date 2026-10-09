@@ -9,6 +9,11 @@
 // out first, so a thread's messages stay in order. A post that can never
 // go out (its payload is not a post, its thread is not in Slack) is
 // alerted, logged and marked delivered, so it does not hold up the rest.
+//
+// The inbox also holds the alerts clients raise, which only the hub can
+// send, since only the hub has the webhook: each goes to the webhook as
+// from the client that raised it, and one that fails stays in the inbox
+// for the next pass without holding up the posts.
 package outbound
 
 import (
@@ -41,7 +46,7 @@ type Poster struct {
 	Store *store.Hub
 	Slack slack.API
 	// Alert, if not nil, gets an alert for each post that can never go
-	// out.
+	// out, and the alerts clients raise.
 	Alert *alert.Webhook
 	// MaxChars is the longest message, in characters, a post goes out
 	// as. Zero means DefaultMaxChars.
@@ -112,6 +117,18 @@ func (p *Poster) Pass(ctx context.Context) error {
 		return err
 	}
 	for _, u := range us {
+		if text, ok := alertText(u); ok {
+			if err := p.relay(ctx, u.Client, text); err != nil {
+				// Left in the inbox for the next pass; an alert has no
+				// place in a thread's order, so posts behind it go on.
+				slog.Warn("outbound: alert from a client", "msg_id", u.MsgID, "client", u.Client, "err", err)
+				continue
+			}
+			if err := p.Store.Inbox.MarkDelivered(ctx, u.MsgID); err != nil {
+				return err
+			}
+			continue
+		}
 		err := p.post(ctx, u)
 		if errors.Is(err, errPermanent) {
 			slog.Error("outbound: dropped", "msg_id", u.MsgID, "client", u.Client, "err", err)
@@ -129,6 +146,27 @@ func (p *Poster) Pass(ctx context.Context) error {
 		delete(p.sent, u.MsgID)
 	}
 	return nil
+}
+
+// alertText returns the text of u if it is an alert a client raised.
+func alertText(u store.Uplink) (string, bool) {
+	var m payload.Message
+	if json.Unmarshal(u.Payload, &m) != nil || m.Type != payload.Alert {
+		return "", false
+	}
+	return m.Text, true
+}
+
+// relay sends an alert client raised to the webhook, as from client. With
+// no webhook, it is only logged.
+func (p *Poster) relay(ctx context.Context, client, text string) error {
+	if p.Alert == nil {
+		slog.Error("outbound: alert from a client, no webhook to send it to", "client", client, "text", text)
+		return nil
+	}
+	w := *p.Alert
+	w.From = client
+	return w.Send(ctx, text)
 }
 
 // post posts u's parts that are not in Slack yet. An error wrapping

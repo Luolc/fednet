@@ -11,6 +11,9 @@ const (
 	// Inbound is a message a person posted in a Slack thread, sent down to
 	// the thread's owner.
 	Inbound = "message"
+	// Alert is an alert a client raises, such as a dead letter, for the
+	// hub to send to the alerts webhook, which only the hub knows.
+	Alert = "alert"
 )
 
 // Message is a decoded payload. Type is always set; which other fields are
@@ -20,7 +23,7 @@ type Message struct {
 	// Thread is the key of the thread a post goes to, or the inbound
 	// message is in.
 	Thread string `json:"thread,omitempty"`
-	// Text is the body of a post or of an inbound message; an inbound
+	// Text is the body of a post, of an inbound message or of an alert; an inbound
 	// message's uploaded files are listed at the end of it, each as a line
 	// with its name and link.
 	Text string `json:"text,omitempty"`

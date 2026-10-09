@@ -30,8 +30,7 @@ func TestHubRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	thread := slack.ThreadKey("C1", ts)
-	hubSlack = f
-	t.Cleanup(func() { hubSlack = nil })
+	slackFlags, _ := fakeSlack(t, dir, f, nil)
 
 	var stdout, stderr syncBuffer
 	t.Cleanup(func() {
@@ -63,7 +62,7 @@ func TestHubRequests(t *testing.T) {
 	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, &stdout, &stderr)
+	stopHub := start(t, append([]string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, slackFlags...), &stdout, &stderr)
 	var addr string
 	waitFor(t, "the hub to listen", func() bool {
 		m := listening.FindStringSubmatch(stdout.String())
@@ -259,5 +258,16 @@ func TestHubConfigAlerts(t *testing.T) {
 		if _, err := readHubConfig(write("bad.json", `{"alerts": {"slack_down": `+bad+`}}`)); err == nil {
 			t.Errorf("readHubConfig accepted slack_down %s", bad)
 		}
+	}
+}
+
+// The example config in deploy/ is one the hub takes.
+func TestExampleHubConfig(t *testing.T) {
+	cfg, err := readHubConfig(filepath.Join("..", "..", "deploy", "hub.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 {
+		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }
