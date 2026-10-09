@@ -44,7 +44,7 @@ fednet 不是：
 9. 上行消息 hub 落盘后才回成功，client 收到成功才删 outbox，否则一直重发，请求没有回应也算失败。[`TestUplinkRetriesUntilStored`](../internal/link/link_test.go)、[`TestRequestsTimeOutAndRetry`](../internal/link/link_test.go)
 10. 连接保持着但心跳停了一个租约期就判为离线，心跳恢复就判为在线；心跳一直发着就一直在线。[`TestOnlineFollowsHeartbeat`](../internal/link/link_test.go)
 11. 超过上限的 payload 入队时就被拒绝，恰好到上限的两个方向都送得到。[`TestPayloadLimit`](../internal/link/link_test.go)
-12. `Hub.Close` 之后没有下行连接留下，包括 Close 时正在握手的。[`TestCloseRefusesHandshakeInFlight`](../internal/link/link_test.go)
+12. `Hub.Close` 之后没有下行连接留下，包括 Close 时正在握手的；关一条连接不会被这条连接正在处理的 ping 卡住。[`TestCloseRefusesHandshakeInFlight`](../internal/link/link_test.go)、[`TestClosingAConnectionDoesNotWaitOnPing`](../internal/link/link_test.go)
 
 仓库层面：
 
