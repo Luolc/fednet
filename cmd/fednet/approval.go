@@ -27,6 +27,9 @@ const (
 	exitUsed         = 8 // this approval_id is already in the used file
 )
 
+// now is the clock approval verify judges expiry by; tests replace it.
+var now = time.Now
+
 func approvalCommand(args []string, stdout io.Writer) error {
 	if len(args) > 0 && args[0] == "verify" {
 		return approvalVerify(args[1:], stdout)
@@ -74,7 +77,7 @@ func approvalVerify(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer used.Close()
-	switch err := approval.Verify(pub, a.Content, a.Signature, time.Now()); {
+	switch err := approval.Verify(pub, a.Content, a.Signature, now()); {
 	case errors.Is(err, approval.ErrBadSignature):
 		return exitError{exitBadSignature, err}
 	case errors.Is(err, approval.ErrExpired):

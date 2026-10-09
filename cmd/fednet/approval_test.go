@@ -114,29 +114,29 @@ func TestApprovalVerify(t *testing.T) {
 			t.Errorf("second run: exit %d, want %d", code, exitUsed)
 		}
 	})
-	t.Run("expires while waiting for the lock", func(t *testing.T) {
-		expiry := time.Now().Add(200 * time.Millisecond)
-		s, a := setupApproval(t, priv, pub, func(c *approval.Content) { c.ExpiresAt = expiry })
-		held, err := os.OpenFile(s.used, os.O_RDWR|os.O_CREATE, 0o600)
-		if err != nil {
-			t.Fatal(err)
+	// The clock is read only once the used file is locked, so an approval
+	// that expires while verify waits for the lock is refused. The fake
+	// clock here is past expiry whenever the used file is locked and before
+	// it otherwise, so a verify that read the clock before locking would
+	// accept the approval.
+	t.Run("expired by the time the lock is held", func(t *testing.T) {
+		s, a := setupApproval(t, priv, pub, nil)
+		realNow := now
+		now = func() time.Time {
+			f, err := os.OpenFile(s.used, os.O_RDWR|os.O_CREATE, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+				return realNow()
+			}
+			return realNow().Add(approval.TTL)
 		}
-		if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX); err != nil {
-			t.Fatal(err)
-		}
-		done := make(chan int, 1)
-		go func() {
-			code, _, _ := verify(t, s.args(a))
-			done <- code
-		}()
-		select {
-		case code := <-done:
-			t.Fatalf("verify returned %d while the used file was locked", code)
-		case <-time.After(time.Until(expiry) + 50*time.Millisecond):
-		}
-		held.Close()
-		if code := <-done; code != exitExpired {
-			t.Errorf("exit %d, want %d", code, exitExpired)
+		defer func() { now = realNow }()
+		code, _, errOut := verify(t, s.args(a))
+		if code != exitExpired {
+			t.Errorf("exit %d, stderr %q; want %d", code, errOut, exitExpired)
 		}
 		if used, _ := os.ReadFile(s.used); len(used) != 0 {
 			t.Errorf("used file = %q, want empty", used)

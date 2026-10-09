@@ -99,9 +99,8 @@ func TestVerifyRejectsChangedField(t *testing.T) {
 	}
 }
 
-// An instant 2^64 nanoseconds later has the same UnixNano, which is how a
-// nanosecond-only encoding let an expiry be moved past now with the
-// signature intact.
+// Two instants 2^64 nanoseconds apart share their UnixNano; they must still
+// encode differently, so a signature over one does not cover the other.
 func TestEncodeDistinguishesWrappedNanoseconds(t *testing.T) {
 	pub, priv := keyPair(t)
 	c := sample()
