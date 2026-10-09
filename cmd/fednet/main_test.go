@@ -122,7 +122,13 @@ func TestHubAndClient(t *testing.T) {
 		return s
 	}
 	t.Cleanup(func() {
-		if t.Failed() {
+		switch {
+		case !t.Failed():
+		case secret == "":
+			// init may have written the file and still failed, so the
+			// output could hold the credential and redact cannot find it.
+			t.Logf("output not shown: %d bytes of stdout, %d of stderr, credential unknown", len(stdout.String()), len(stderr.String()))
+		default:
 			t.Logf("stdout:\n%s\nstderr:\n%s", redact(stdout.String()), redact(stderr.String()))
 		}
 	})
