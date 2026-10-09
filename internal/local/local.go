@@ -100,11 +100,15 @@ const (
 // Timeout bounds one request on either side, except a Handoff, which is
 // bounded by how long the daemon gives the new process to become ready,
 // and a FetchFile or a Post with files, which get FileTimeout: a transfer
-// takes longer.
+// takes longer. The request itself, before the daemon knows which it is,
+// must arrive within headerTimeout.
 const (
 	Timeout     = 10 * time.Second
 	FileTimeout = 5 * time.Minute
 )
+
+// headerTimeout bounds the reading of the request; tests shorten it.
+var headerTimeout = Timeout
 
 // timeout returns ctx bounded for req.
 func timeout(ctx context.Context, req Request) (context.Context, context.CancelFunc) {
@@ -279,7 +283,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(Timeout))
+	conn.SetReadDeadline(time.Now().Add(headerTimeout))
 	var req Request
 	var res Response
 	// The request is bounded; the files' content after it is bounded by
@@ -290,6 +294,10 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	} else {
 		ctx, cancel := timeout(ctx, req)
 		defer cancel()
+		// From here the request's own deadline bounds the reading: a
+		// post's files take longer than the request did.
+		d, _ := ctx.Deadline()
+		conn.SetReadDeadline(d)
 		stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 		defer stop()
 		res = s.handle(ctx, req, io.MultiReader(dec.Buffered(), conn))
@@ -459,13 +467,29 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	if _, err := conn.Write(b); err != nil {
 		return Response{}, err
 	}
-	for i, f := range files {
-		if _, err := io.CopyN(conn, f, req.Files[i].Size); err != nil {
-			return Response{}, fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)
+	// The daemon may answer before it has read all the content, with a
+	// refusal; that answer is what the caller needs, not the write error
+	// that follows it. So the content is sent while the answer is awaited,
+	// and the sending is given up once an answer is in.
+	sent := make(chan error, 1)
+	go func() {
+		for i, f := range files {
+			if _, err := io.CopyN(conn, f, req.Files[i].Size); err != nil {
+				sent <- fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)
+				return
+			}
 		}
-	}
+		sent <- nil
+	}()
 	var res Response
-	if err := json.NewDecoder(conn).Decode(&res); err != nil {
+	err = json.NewDecoder(conn).Decode(&res)
+	// Whether the decode succeeded or not, the sender is ended: with an
+	// answer in, nothing more is read on the other side.
+	conn.Close()
+	if serr := <-sent; err != nil {
+		if serr != nil {
+			return Response{}, serr
+		}
 		return Response{}, err
 	}
 	return res, nil

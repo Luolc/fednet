@@ -189,11 +189,13 @@ func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
 }
 
 // Upload gets an upload URL for each file (files.getUploadURLExternal),
-// posts the content there, then completes the upload
-// (files.completeUploadExternal) into the thread as one message with the
-// files: machine and text go in blocks laid out as PostReply does, or,
-// with CommentUpload, in the initial comment. The content is posted once:
-// the upload to the URL is not retried.
+// posts the content there as the request's body, Size bytes with the
+// token, then completes the upload (files.completeUploadExternal) into
+// the thread as one message with the files: machine and text go in blocks
+// laid out as PostReply does, or, with CommentUpload, in the initial
+// comment. The content is posted once: the upload to the URL is not
+// retried. The upload URL gets the token only if it passes the same check
+// as a download URL.
 func (w *Web) Upload(ctx context.Context, channel, ts, machine, text string, files []Upload) error {
 	var ids []slackgo.FileSummary
 	for _, u := range files {
@@ -205,8 +207,8 @@ func (w *Web) Upload(ctx context.Context, channel, ts, machine, text string, fil
 		if err != nil {
 			return err
 		}
-		if err := w.c.UploadToURL(ctx, slackgo.UploadToURLParameters{UploadURL: res.UploadURL, Reader: u.Body, Filename: u.Name}); err != nil {
-			return fmt.Errorf("slack: uploading %s: %w", u.Name, redact(w.token, err))
+		if err := w.upload(ctx, res.UploadURL, u); err != nil {
+			return fmt.Errorf("slack: uploading %s: %w", u.Name, err)
 		}
 		ids = append(ids, slackgo.FileSummary{ID: res.FileID, Title: u.Name})
 	}
@@ -220,6 +222,30 @@ func (w *Web) Upload(ctx context.Context, channel, ts, machine, text string, fil
 		_, err := w.c.CompleteUploadExternalContext(ctx, p)
 		return err
 	})
+}
+
+// upload posts u's content to uploadURL, the body Size bytes long.
+func (w *Web) upload(ctx context.Context, uploadURL string, u Upload) error {
+	if err := w.mayReceiveToken(uploadURL); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, io.LimitReader(u.Body, u.Size))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = u.Size
+	req.Header.Set("Authorization", "Bearer "+w.token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	res, err := w.files.Do(req)
+	if err != nil {
+		return redact(w.token, err)
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(res.Body, 4<<10))
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		return fmt.Errorf("the upload URL replied %s", res.Status)
+	}
+	return nil
 }
 
 // uploadBlocks lays an upload's message out as PostReply does: the

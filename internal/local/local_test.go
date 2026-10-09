@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -512,4 +513,58 @@ func TestPostWithFiles(t *testing.T) {
 	if _, err := Do(t.Context(), path, req, strings.NewReader("PNG")); err == nil {
 		t.Fatal("Do with fewer readers than files did not fail")
 	}
+	// A refusal that comes before the content has been read, for a file
+	// larger than the socket's buffer, still reaches the caller: the
+	// write that fails after it does not hide it.
+	big := Request{Cmd: Post, Thread: "C1/bad", Files: []link.FileHeader{{Name: "big.bin", Size: 1 << 20}}}
+	res, err = Do(t.Context(), path, big, bytes.NewReader(make([]byte, 1<<20)))
+	if err != nil || res.Kind != BadRequest || !strings.Contains(res.Error, "too big") {
+		t.Fatalf("Do(refused big post) = %+v, %v; want the refusal", res, err)
+	}
+}
+
+// The content may take longer to arrive than the request itself: the
+// request's deadline, not the header's, bounds it.
+func TestPostContentOutlivesTheHeaderTimeout(t *testing.T) {
+	headerTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { headerTimeout = Timeout })
+	path := filepath.Join(t.TempDir(), "fednet.sock")
+	ln, err := Listen(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	var got string
+	s := &Server{Upload: func(_ context.Context, u link.Upload, body io.Reader) error {
+		b, err := io.ReadAll(body)
+		got = string(b)
+		return err
+	}}
+	go func() { done <- s.Serve(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	})
+	slow := Request{Cmd: Post, Thread: "C1/1.1", Files: []link.FileHeader{{Name: "slow.bin", Size: 3}}}
+	res, err := Do(t.Context(), path, slow, &delayed{strings.NewReader("abc"), 150 * time.Millisecond})
+	if err != nil || res.Error != "" || got != "abc" {
+		t.Fatalf("Do(slow post) = %+v, %v, Upload got %q; want it to succeed", res, err, got)
+	}
+}
+
+// delayed is a reader whose first Read waits for d.
+type delayed struct {
+	io.Reader
+	d time.Duration
+}
+
+func (r *delayed) Read(p []byte) (int, error) {
+	if r.d > 0 {
+		time.Sleep(r.d)
+		r.d = 0
+	}
+	return r.Reader.Read(p)
 }
