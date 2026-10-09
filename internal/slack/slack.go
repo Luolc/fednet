@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 )
 
 // ErrNotFound is returned for a channel, thread or message Slack does not
@@ -133,42 +132,30 @@ type Click struct {
 }
 
 // Limits of a card's parameters: Slack takes at most 50 blocks in one
-// message and 3000 characters in one text object. The card has four
-// blocks besides the parameters, and each parameter block keeps room for
-// the code fence and the heading around the text.
+// message and about 3000 characters in one text; the card has four
+// blocks besides the parameters.
 const (
 	paramChunk     = 2900
 	maxParamChunks = 46
 )
 
 // ParamBlocks splits params into the texts of the card's parameter
-// blocks, each at most paramChunk characters once escaped for Slack's
-// markup (& < > become entities), split between characters, never inside
-// an entity. ok is false when they would take more blocks than fit in one
-// message, so that a card either shows the whole parameters or is not
-// posted. Empty params take one empty block.
+// blocks, each at most paramChunk characters, split between characters.
+// The blocks show the text as it is, so nothing is escaped. ok is false
+// when they would take more blocks than fit in one message, so that a
+// card either shows the whole parameters or is not posted. Empty params
+// take one empty block.
 func ParamBlocks(params string) (chunks []string, ok bool) {
 	var b strings.Builder
 	n := 0 // characters in b
 	for _, r := range params {
-		var e string
-		switch r {
-		case '&':
-			e = "&amp;"
-		case '<':
-			e = "&lt;"
-		case '>':
-			e = "&gt;"
-		default:
-			e = string(r)
-		}
-		if n+utf8.RuneCountInString(e) > paramChunk {
+		if n == paramChunk {
 			chunks = append(chunks, b.String())
 			b.Reset()
 			n = 0
 		}
-		b.WriteString(e)
-		n += utf8.RuneCountInString(e)
+		b.WriteRune(r)
+		n++
 	}
 	chunks = append(chunks, b.String())
 	return chunks, len(chunks) <= maxParamChunks

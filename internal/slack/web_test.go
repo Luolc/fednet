@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -351,12 +352,35 @@ func blocksJSON(t *testing.T, bs []slackgo.Block) string {
 	return b.String()
 }
 
+// paramTexts returns the texts of the card's parameter blocks, in order.
+func paramTexts(t *testing.T, bs []slackgo.Block) []string {
+	t.Helper()
+	var texts []string
+	for _, b := range bs {
+		rt, ok := b.(*slackgo.RichTextBlock)
+		if !ok {
+			continue
+		}
+		pre, ok := rt.Elements[0].(*slackgo.RichTextPreformatted)
+		if !ok || len(pre.Elements) != 1 {
+			t.Fatalf("rich text block %+v, want one preformatted element with one text", rt)
+		}
+		texts = append(texts, pre.Elements[0].(*slackgo.RichTextSectionTextElement).Text)
+	}
+	return texts
+}
+
 // A pending card has the two buttons, each carrying the approval id; a
-// decided card has none and says how it ended; long parameters go whole,
-// over several blocks, with Slack's markup characters escaped.
+// decided card has none and says how it ended. What the agent wrote goes
+// in plain text and preformatted blocks, as it is: backticks, stars and
+// angle brackets included, long parameters whole over several blocks.
 func TestCardBlocks(t *testing.T) {
-	c := Card{ID: "apr-1", Summary: "delete b", Params: `{"b":1}`, Machine: "workstation", Agent: "ops-exec", Requester: "U7", Expires: time.Unix(1_760_000_000, 0)}
+	params := "{\n  \"note\": \"```not a fence```\",\n  \"bucket\": \"*example-critical* <https://example.invalid|x>\"\n}"
+	c := Card{ID: "apr-1", Summary: "delete *b* <!channel>", Params: params, Machine: "workstation", Agent: "ops-*exec*", Requester: "<@U7>", Expires: time.Unix(1_760_000_000, 0)}
 	bs := blocks(c)
+	if len(bs) > 50 {
+		t.Fatalf("%d blocks, Slack takes at most 50", len(bs))
+	}
 	actions, ok := bs[len(bs)-1].(*slackgo.ActionBlock)
 	if !ok || len(actions.Elements.ElementSet) != 2 {
 		t.Fatalf("pending card ends with %T, want an action block with two buttons", bs[len(bs)-1])
@@ -367,11 +391,45 @@ func TestCardBlocks(t *testing.T) {
 			t.Fatalf("button %d = %+v, want %s carrying apr-1", i, actions.Elements.ElementSet[i], want)
 		}
 	}
-	text := blocksJSON(t, bs)
-	for _, want := range []string{"delete b", `{\"b\":1}`, "workstation", "ops-exec", "<@U7>", "自报", "<!date^1760000000^"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("pending card %s lacks %q", text, want)
+	if actions.BlockID != CardBlockID("apr-1") {
+		t.Fatalf("buttons are in block %q, want %q", actions.BlockID, CardBlockID("apr-1"))
+	}
+	if got := paramTexts(t, bs); len(got) != 1 || got[0] != params {
+		t.Fatalf("parameter blocks = %q, want the parameters as they are", got)
+	}
+	// Everything the agent wrote is in a plain_text object, never in a
+	// mrkdwn one.
+	var plain, mrkdwn []string
+	for _, b := range bs {
+		sec, ok := b.(*slackgo.SectionBlock)
+		if !ok {
+			continue
 		}
+		objs := sec.Fields
+		if sec.Text != nil {
+			objs = append(objs, sec.Text)
+		}
+		for _, o := range objs {
+			if o.Type == slackgo.PlainTextType {
+				plain = append(plain, o.Text)
+			} else {
+				mrkdwn = append(mrkdwn, o.Text)
+			}
+		}
+	}
+	for _, want := range []string{c.Summary, c.Machine, c.Agent, c.Requester} {
+		if !slices.Contains(plain, want) {
+			t.Errorf("plain text objects %q lack %q", plain, want)
+		}
+		for _, m := range mrkdwn {
+			if strings.Contains(m, want) {
+				t.Errorf("mrkdwn object %q carries what the agent wrote, %q", m, want)
+			}
+		}
+	}
+	text := blocksJSON(t, bs)
+	if !strings.Contains(text, "<!date^1760000000^") || !strings.Contains(text, "apr-1") {
+		t.Errorf("pending card %s lacks the expiry token or the id", text)
 	}
 
 	c.Outcome, c.Approver, c.DecidedAt = "approved", "U1", time.Unix(1_760_000_100, 0)
@@ -392,26 +450,15 @@ func TestCardBlocks(t *testing.T) {
 		t.Errorf("expired card %s does not say expired", text)
 	}
 
-	c.Params = `{"a": "<x & y>", "b": "` + strings.Repeat("é", paramChunk) + `"}`
-	bs = blocks(c)
-	var params []string
-	for _, b := range bs {
-		if sec, ok := b.(*slackgo.SectionBlock); ok && sec.Text != nil && strings.Contains(sec.Text.Text, "```") {
-			params = append(params, strings.Trim(strings.TrimPrefix(sec.Text.Text, "*参数*\n"), "`"))
-		}
-	}
-	if len(params) != 2 || strings.Join(params, "") != escape(c.Params) || !strings.HasPrefix(params[0], `{"a": "&lt;x &amp; y&gt;"`) {
-		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the escaped parameters", len(params), strings.Join(params, ""))
-	}
-	for _, p := range params {
-		if utf8.RuneCountInString(p) > paramChunk || !utf8.ValidString(p) {
-			t.Fatalf("a parameter block has %d characters or is cut inside a character", utf8.RuneCountInString(p))
-		}
+	c.Params = strings.Repeat("é", paramChunk) + "<&>"
+	got := paramTexts(t, blocks(c))
+	if len(got) != 2 || strings.Join(got, "") != c.Params || utf8.RuneCountInString(got[0]) != paramChunk {
+		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the parameters, the first %d characters", len(got), strings.Join(got, ""), paramChunk)
 	}
 }
 
 // ParamBlocks fits at most maxParamChunks blocks of paramChunk characters
-// each; one character more does not fit; an entity is never split.
+// each; one character more does not fit; a character is never split.
 func TestParamBlocks(t *testing.T) {
 	exact := strings.Repeat("x", maxParamChunks*paramChunk)
 	if chunks, ok := ParamBlocks(exact); !ok || len(chunks) != maxParamChunks {
@@ -420,10 +467,9 @@ func TestParamBlocks(t *testing.T) {
 	if _, ok := ParamBlocks(exact + "x"); ok {
 		t.Fatal("ParamBlocks(exact + 1) fits")
 	}
-	// An & at the end of a block moves whole to the next.
-	chunks, _ := ParamBlocks(strings.Repeat("x", paramChunk-2) + "&y")
-	if len(chunks) != 2 || chunks[1] != "&amp;y" {
-		t.Fatalf("ParamBlocks around an entity = %q, want the entity whole in the second block", chunks)
+	chunks, _ := ParamBlocks(strings.Repeat("x", paramChunk-1) + "éy")
+	if len(chunks) != 2 || chunks[1] != "y" || !utf8.ValidString(chunks[0]) {
+		t.Fatalf("ParamBlocks around a two-byte character = %q, want it whole in the first block", chunks)
 	}
 	if chunks, ok := ParamBlocks(""); !ok || len(chunks) != 1 || chunks[0] != "" {
 		t.Fatalf("ParamBlocks(\"\") = %q, %v; want one empty block", chunks, ok)

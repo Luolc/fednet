@@ -531,3 +531,60 @@ func TestFlowRequestUndoneWhenRecordFails(t *testing.T) {
 		t.Fatalf("cards = %+v, want none", cards)
 	}
 }
+
+// stuckSlack is a Fake whose UpdateCard and Whisper wait for their
+// context: Slack that never answers.
+type stuckSlack struct{ *slack.Fake }
+
+func (stuckSlack) UpdateCard(ctx context.Context, _, _ string, _ slack.Card) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (stuckSlack) Whisper(ctx context.Context, _, _, _ string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A Slack that never answers holds up one card or hint for SlackTimeout,
+// not the sweep: a later approval still expires and its outcome goes
+// down, and the hints waiting are capped.
+func TestPassBoundsSlackCalls(t *testing.T) {
+	tf := newFlow(t)
+	tf.TTL = 20 * time.Minute
+	tf.SlackTimeout = 20 * time.Millisecond
+	first, firstTS := tf.request(t, "")
+	tf.Slack = stuckSlack{tf.f}
+	second, _ := tf.request(t, "")
+	tf.clickOnly(t, slack.Click{ID: first, Approve: true, User: "U1", Channel: "C9", TS: firstTS})
+	for range 2 * maxHints {
+		tf.clickOnly(t, slack.Click{ID: first, Approve: true, User: "U3", Channel: "C9", TS: firstTS})
+	}
+	tf.mu.Lock()
+	n := len(tf.hints)
+	tf.mu.Unlock()
+	if n != maxHints {
+		t.Fatalf("%d hints waiting, want the cap %d", n, maxHints)
+	}
+	tf.now = tf.now.Add(20 * time.Minute)
+	start := time.Now()
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > time.Duration(maxHints+2)*tf.SlackTimeout*2 {
+		t.Fatalf("Pass took %s with Slack stuck, want it bounded by the timeouts", took)
+	}
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 2 || ms[0].ApprovalID != first || ms[0].Outcome != payload.Approved || ms[1].ApprovalID != second || ms[1].Outcome != payload.Expired {
+		t.Fatalf("outcomes = %+v, want %s approved then %s expired although Slack is stuck", ms, first, second)
+	}
+	if rec, err := tf.Store.Approval(t.Context(), first); err != nil || rec.CardFinal {
+		t.Fatalf("record = %+v, %v; want the card not final while Slack is stuck", rec, err)
+	}
+	tf.mu.Lock()
+	n = len(tf.hints)
+	tf.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d hints still waiting after the pass, want none: a hint Slack does not take is dropped", n)
+	}
+}

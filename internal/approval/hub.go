@@ -22,6 +22,14 @@ import (
 // and for cards that do not show their outcome yet.
 const DefaultInterval = time.Minute
 
+// DefaultSlackTimeout bounds each Slack call a sweep makes.
+const DefaultSlackTimeout = 30 * time.Second
+
+// maxHints is how many hints wait for a sweep at most; past it a hint is
+// dropped, with a log line, rather than kept without bound while Slack
+// is away.
+const maxHints = 64
+
 // ErrOff is returned by Flow.Request when the hub cannot run approvals:
 // it has no key, no Slack, no card channel or no approvers. Nothing is
 // recorded or posted then, so no approval can be given.
@@ -52,6 +60,10 @@ type Flow struct {
 	TTL time.Duration
 	// Interval is how often Run sweeps; zero means DefaultInterval.
 	Interval time.Duration
+	// SlackTimeout bounds each Slack call a sweep makes, so that a Slack
+	// that does not answer holds up one card or hint, not the sweep; zero
+	// means DefaultSlackTimeout.
+	SlackTimeout time.Duration
 	// Now returns the current time; nil means time.Now.
 	Now func() time.Time
 	// Stored, if set, is called each time an outcome has been queued for
@@ -131,7 +143,11 @@ func (f *Flow) Click(ctx context.Context, c slack.Click) error {
 	}
 	if hint != "" {
 		f.mu.Lock()
-		f.hints = append(f.hints, hintFor{c.Channel, c.User, hint})
+		if len(f.hints) < maxHints {
+			f.hints = append(f.hints, hintFor{c.Channel, c.User, hint})
+		} else {
+			slog.Warn("approval: hints are piling up, dropping one", "approval", c.ID, "user", c.User, "hint", hint)
+		}
 		f.mu.Unlock()
 	}
 	f.Nudge()
@@ -232,11 +248,13 @@ func (f *Flow) decide(ctx context.Context, id, outcome, by string) (d store.Deci
 	return d, true, nil
 }
 
-// finishCard makes a's card show its outcome and records that it does. A
-// card Slack does not update now is left for the next Pass; a card that
-// is gone from Slack has nothing to show.
+// finishCard makes a's card show its outcome and records that it does,
+// giving Slack SlackTimeout. A card Slack does not update now is left for
+// the next Pass; a card that is gone from Slack has nothing to show.
 func (f *Flow) finishCard(ctx context.Context, a store.Approval) {
-	err := f.Slack.UpdateCard(ctx, a.Channel, a.TS, card(a))
+	sctx, cancel := context.WithTimeout(ctx, f.slackTimeout())
+	defer cancel()
+	err := f.Slack.UpdateCard(sctx, a.Channel, a.TS, card(a))
 	if errors.Is(err, slack.ErrNotFound) {
 		slog.Warn("approval: the card is gone from Slack", "approval", a.ID)
 	} else if err != nil {
@@ -290,8 +308,9 @@ func (f *Flow) Run(ctx context.Context) {
 
 // Pass expires every pending approval past its expiry, sending the
 // outcome down, updates every decided card that does not show its
-// outcome yet, and delivers the hints clicks left. A hint Slack does not
-// take is logged and dropped.
+// outcome yet, and delivers the hints clicks left. Each Slack call gets
+// SlackTimeout, so one Pass is bounded; a hint Slack does not take is
+// logged and dropped.
 func (f *Flow) Pass(ctx context.Context) error {
 	pending, err := f.Store.PendingApprovals(ctx)
 	if err != nil {
@@ -317,7 +336,10 @@ func (f *Flow) Pass(ctx context.Context) error {
 	f.hints = nil
 	f.mu.Unlock()
 	for _, h := range hints {
-		if err := f.Slack.Whisper(ctx, h.channel, h.user, h.text); err != nil {
+		sctx, cancel := context.WithTimeout(ctx, f.slackTimeout())
+		err := f.Slack.Whisper(sctx, h.channel, h.user, h.text)
+		cancel()
+		if err != nil {
 			slog.Warn("approval: telling the clicker why the click did not count", "user", h.user, "err", err)
 		}
 	}
@@ -336,6 +358,13 @@ func (f *Flow) ttl() time.Duration {
 		return f.TTL
 	}
 	return TTL
+}
+
+func (f *Flow) slackTimeout() time.Duration {
+	if f.SlackTimeout != 0 {
+		return f.SlackTimeout
+	}
+	return DefaultSlackTimeout
 }
 
 func (f *Flow) interval() time.Duration {

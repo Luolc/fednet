@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
@@ -241,44 +240,47 @@ func (w *Web) Whisper(ctx context.Context, channel, user, text string) error {
 	})
 }
 
-// blocks lays the card out: a header, the summary, the parameters in code
-// blocks (one block each chunk of ParamBlocks, which the caller has
-// checked fit), who asks and when it expires, then the buttons while it
-// waits or how it ended once decided. Times are Slack date tokens, which
-// each reader sees in their own time zone.
+// blocks lays the card out: a header, the summary, the parameters in
+// preformatted blocks (one each chunk of ParamBlocks, which the caller
+// has checked fit), who asks and when it expires, then the buttons while
+// it waits or how it ended once decided. What the agent wrote (summary,
+// parameters, agent, requester) goes in plain text and preformatted
+// blocks, which Slack shows as they are; only the card's own labels, the
+// approver (from the hub's list) and the dates use Slack's markup. Times
+// are Slack date tokens, which each reader sees in their own time zone.
 func blocks(c Card) []slackgo.Block {
+	plain := func(s string) *slackgo.TextBlockObject {
+		return slackgo.NewTextBlockObject(slackgo.PlainTextType, s, false, false)
+	}
+	mrkdwn := func(s string) *slackgo.TextBlockObject {
+		return slackgo.NewTextBlockObject(slackgo.MarkdownType, s, false, false)
+	}
 	bs := []slackgo.Block{
-		slackgo.NewHeaderBlock(slackgo.NewTextBlockObject(slackgo.PlainTextType, "审批请求", false, false)),
-		slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, "*做什么*\n"+escape(c.Summary), false, false), nil, nil),
+		slackgo.NewHeaderBlock(plain("审批请求")),
+		slackgo.NewSectionBlock(mrkdwn("*做什么*"), nil, nil),
+		slackgo.NewSectionBlock(plain(c.Summary), nil, nil),
+		slackgo.NewSectionBlock(mrkdwn("*参数*"), nil, nil),
 	}
 	chunks, _ := ParamBlocks(c.Params)
 	for i, chunk := range chunks {
-		text := "```" + chunk + "```"
-		if i == 0 {
-			text = "*参数*\n" + text
-		}
-		bs = append(bs, slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, text, false, false), nil, nil))
+		bs = append(bs, slackgo.NewRichTextBlock(fmt.Sprintf("params:%d", i),
+			&slackgo.RichTextPreformatted{Type: slackgo.RTEPreformatted, Elements: []slackgo.RichTextSectionElement{slackgo.NewRichTextSectionTextElement(chunk, nil)}}))
 	}
-	who := "*机器* (hub 认证)\n" + c.Machine + "\n*agent* (自报)\n" + c.Agent
+	who := []*slackgo.TextBlockObject{mrkdwn("*机器* (hub 认证)"), plain(c.Machine), mrkdwn("*agent* (自报)"), plain(c.Agent)}
 	if c.Requester != "" {
-		who += "\n*代谁* (agent 自报，不参与校验)\n<@" + c.Requester + ">"
+		who = append(who, mrkdwn("*代谁* (agent 自报，不参与校验)"), plain(c.Requester))
 	}
-	bs = append(bs, slackgo.NewSectionBlock(nil, []*slackgo.TextBlockObject{
-		slackgo.NewTextBlockObject(slackgo.MarkdownType, who, false, false),
-		slackgo.NewTextBlockObject(slackgo.MarkdownType, "*过期*\n"+date(c.Expires)+"\n*编号*\n"+c.ID, false, false),
-	}, nil))
+	bs = append(bs,
+		slackgo.NewSectionBlock(nil, who, nil),
+		slackgo.NewSectionBlock(nil, []*slackgo.TextBlockObject{mrkdwn("*过期*\n" + date(c.Expires)), mrkdwn("*编号*\n" + c.ID)}, nil),
+	)
 	if c.Outcome == "" {
 		return append(bs, slackgo.NewActionBlock(CardBlockID(c.ID),
-			slackgo.NewButtonBlockElement(ApproveAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "批准", false, false)).WithStyle(slackgo.StylePrimary),
-			slackgo.NewButtonBlockElement(RejectAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "拒绝", false, false)).WithStyle(slackgo.StyleDanger),
+			slackgo.NewButtonBlockElement(ApproveAction, c.ID, plain("批准")).WithStyle(slackgo.StylePrimary),
+			slackgo.NewButtonBlockElement(RejectAction, c.ID, plain("拒绝")).WithStyle(slackgo.StyleDanger),
 		))
 	}
-	return append(bs, slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, outcomeText(c), false, false), nil, nil))
-}
-
-// escape makes s show as is in Slack's markup.
-func escape(s string) string {
-	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+	return append(bs, slackgo.NewSectionBlock(mrkdwn(outcomeText(c)), nil, nil))
 }
 
 // outcomeText says how a decided card ended, in one line.
