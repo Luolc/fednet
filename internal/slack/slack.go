@@ -1,6 +1,7 @@
 // Package slack is the part of Slack's Web API the hub uses on behalf of the
 // agents. Only the hub holds a Slack token: clients ask the hub, and the hub
-// calls an API. This version has only Fake; the real API comes later.
+// calls an API. Web calls Slack's Web API; Fake is kept in memory, for
+// tests.
 package slack
 
 import (
