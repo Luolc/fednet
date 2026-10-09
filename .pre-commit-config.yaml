@@ -1,0 +1,25 @@
+# Hooks: secret scan (gitleaks) and Chinese Markdown typography (limae).
+repos:
+  # Runs first: a leaked secret must be stopped before other hooks rewrite
+  # staged files. The upstream entry scans the staged diff only (it ends in
+  # --staged); CI scans the full history, see the gitleaks step in
+  # .github/workflows/ci.yml.
+  #
+  # --redact is repeated here on purpose: the upstream entry already has it,
+  # but inherited args are invisible in this file and could be dropped on a
+  # rev bump. A scanner without --redact prints the secret it found.
+  #
+  # When bumping rev, check the upstream entry still contains --staged;
+  # otherwise the hook silently scans the whole repo instead.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        args: ["--redact", "--no-banner", "."]
+  # The -pre-commit mirror ships a python hook that installs the prebuilt
+  # wheel from PyPI; the main limae repo builds from Rust source, which makes
+  # every cold hook environment slow to build.
+  - repo: https://github.com/Luolc/limae-pre-commit
+    rev: v0.13.3
+    hooks:
+      - id: limae

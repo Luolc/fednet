@@ -1,0 +1,84 @@
+# PR gate: full-history secret scan, pre-commit on all files, then the
+# docs/design.md length check and its test. The job name `check` is the
+# required status check.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: the scan below reads commits, not the working tree,
+          # and a shallow clone would hide everything but the latest commit.
+          fetch-depth: 0
+
+      # The other half of secret scanning. The pre-commit gitleaks hook only
+      # scans the staged diff; CI has no staged diff, so this step scans the
+      # whole history instead. The hook is the only thing that stops a secret
+      # before it becomes a commit; this step is the only thing that catches
+      # one that got in anyway (via --no-verify, or a clone without the hook).
+      #
+      # Pinned by version and SHA-256: the step downloads an executable and
+      # runs it over the repo, so a moved tag must not change what runs. It
+      # unpacks outside the checkout so the scanned tree stays as checkout
+      # left it.
+      - name: Secret scan (gitleaks, full history)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          bindir="$(mktemp -d)"
+          tarball="${bindir}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" -C "$bindir" gitleaks
+          # --redact is mandatory: without it a hit prints the secret into
+          # the Actions log.
+          "${bindir}/gitleaks" git --redact --no-banner --verbose .
+
+      - id: py
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # Hook environments are keyed by the config hash: any rev bump or hook
+      # change misses the cache and rebuilds them. The exact Python version
+      # (patch level included) is part of the key: pre-commit discards a
+      # virtualenv whose base interpreter is not the one now installed, and
+      # the runner image's patch release changes over time.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: pip install --user pre-commit==4.6.2
+
+      # The gitleaks hook scans the staged diff, which is empty in CI, so it
+      # would do nothing but build its environment (Go source build on a cold
+      # cache). The full-history scan above does the work, so skip the hook.
+      - run: pre-commit run --all-files
+        env:
+          SKIP: gitleaks
+
+      - name: Design length test
+        run: .github/scripts/design-length.test.sh
+
+      - name: Design length (docs/design.md, at most 200 lines)
+        run: .github/scripts/design-length.sh
