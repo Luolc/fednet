@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -240,6 +241,14 @@ func TestReopenKeepsData(t *testing.T) {
 	}
 	if !slices.Equal(msgIDs(got), []string{id}) {
 		t.Fatalf("Pending after reopen = %v, want [%s]", msgIDs(got), id)
+	}
+}
+
+func TestOpenPathWithURISyntax(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a?b#c.db")
+	openClient(t, path)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database not created at %q: %v", path, err)
 	}
 }
 

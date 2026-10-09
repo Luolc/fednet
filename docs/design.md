@@ -24,9 +24,15 @@ fednet 不是：
 
 ## 3. 不变量
 
-fednet 本身还只有空壳，也就还没有不变量。仓库层面目前只有一条：
+存储层：
 
-1. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
+1. hub outbox 的 `seq` 只增不减，outbox 删空、库重开之后也不回退。[`TestHubOutboxSeqNeverGoesBack`](../internal/store/store_test.go)
+2. inbox 按 `msg_id` 去重：同一条消息重复送达只入库一次，已交付的也不会再变回未交付。[`TestInboxDedup`](../internal/store/store_test.go)
+3. 迁移按库里记的版本号只跑一次，重复打开不重复执行。[`TestMigrate`](../internal/store/store_test.go)
+
+仓库层面：
+
+4. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
 
 ## 4. 接口
 

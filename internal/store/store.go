@@ -31,7 +31,10 @@ func open(ctx context.Context, path string, migrations []string) (*sql.DB, error
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Set("_txlock", "immediate")
-	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
+	// Building the URI with url.URL escapes a "?" or "#" in the file name,
+	// which would otherwise start the query or fragment.
+	dsn := url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}
+	db, err := sql.Open("sqlite", dsn.String())
 	if err != nil {
 		return nil, err
 	}
