@@ -176,6 +176,107 @@ func TestGetOnce(t *testing.T) {
 	}
 }
 
+// A file whose own name looks like one being written is a file like any
+// other: it is found in the cache and survives pruning. Regression: the
+// files being written used to share the directory and a prefix.
+func TestGetNameLikeATemporaryFile(t *testing.T) {
+	h := newHub()
+	h.add("F1", tmpPrefix+"report.txt", []byte("report"))
+	s := newStore(t, h)
+	path, err := s.Get(t.Context(), "F1")
+	if err != nil || filepath.Base(path) != tmpPrefix+"report.txt" {
+		t.Fatalf("Get = %q, %v", path, err)
+	}
+	if again, err := s.Get(t.Context(), "F1"); err != nil || again != path || h.count("F1") != 1 {
+		t.Fatalf("second Get = %q, %v, fetched %d times; want it from the cache", again, err, h.count("F1"))
+	}
+	if err := s.Prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("pruning removed the file: %v", err)
+	}
+}
+
+// A relative Dir still yields absolute paths: the hook and fetch-file's
+// caller run elsewhere.
+func TestGetAbsolutePath(t *testing.T) {
+	h := newHub()
+	h.add("F1", "shot.png", []byte("PNG..."))
+	t.Chdir(t.TempDir())
+	s := &Store{Dir: "files", Fetch: h.fetch}
+	path, err := s.Get(t.Context(), "F1")
+	if err != nil || !filepath.IsAbs(path) {
+		t.Fatalf("Get with a relative Dir = %q, %v; want an absolute path", path, err)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "PNG..." {
+		t.Fatalf("file at %s holds %q, %v", path, b, err)
+	}
+}
+
+// Waiting for another fetch of the same file ends with the context.
+func TestGetWaitIsCancelled(t *testing.T) {
+	h := newHub()
+	h.add("F1", "shot.png", []byte("PNG..."))
+	h.block = make(chan struct{})
+	s := newStore(t, h)
+	first := make(chan error, 1)
+	go func() {
+		_, err := s.Get(t.Context(), "F1")
+		first <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := s.Get(ctx, "F1")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("second Get = %v after %v; want the deadline, promptly", err, time.Since(start))
+	}
+	close(h.block)
+	if err := <-first; err != nil || h.count("F1") != 1 {
+		t.Fatalf("first Get = %v, fetched %d times", err, h.count("F1"))
+	}
+	// The lock is free again: a third Get hits the cache.
+	if _, err := s.Get(t.Context(), "F1"); err != nil || h.count("F1") != 1 {
+		t.Fatalf("third Get = %v, fetched %d times; want it from the cache", err, h.count("F1"))
+	}
+}
+
+// Run prunes on its timer, with no message delivered.
+func TestRun(t *testing.T) {
+	h := newHub()
+	h.add("F1", "a.bin", []byte("x"))
+	s := newStore(t, h)
+	s.Retention, s.PruneInterval = time.Hour, 10*time.Millisecond
+	path, err := s.Get(t.Context(), "F1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Run(ctx)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the expired file was not pruned by the timer")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
 func TestSafeName(t *testing.T) {
 	long := strings.Repeat("é", 200) + ".png" // 404 bytes
 	tests := map[string]string{
@@ -200,18 +301,28 @@ func TestAttach(t *testing.T) {
 	h.add("F1", "shot.png", []byte("PNG..."))
 	h.add("F3", "big.zip", []byte("zip"))
 	s := newStore(t, h)
-	// Unknown fields of the payload and a file not marked survive; a
-	// marked file the hub does not have gets an error, the message goes on.
+	// Unknown fields of the payload and of its files, marked or not,
+	// survive, and so does a file not marked; a marked file the hub does
+	// not have gets an error, the message goes on.
 	raw := []byte(`{"type":"message","thread":"C1/1.1","later":true,"files":[` +
-		`{"id":"F1","name":"shot.png","mimetype":"image/png","size":6,"url":"https://example.invalid/F1","fetch":true},` +
+		`{"id":"F1","name":"shot.png","mimetype":"image/png","size":6,"url":"https://example.invalid/F1","fetch":true,"later":1},` +
 		`{"id":"F2","name":"gone.png","mimetype":"image/png","size":6,"url":"https://example.invalid/F2","fetch":true},` +
-		`{"id":"F3","name":"big.zip","mimetype":"application/zip","size":3,"url":"https://example.invalid/F3"}]}`)
+		`{"id":"F3","name":"big.zip","mimetype":"application/zip","size":3,"url":"https://example.invalid/F3","later":3}]}`)
+	out := s.Attach(t.Context(), raw)
 	var m struct {
 		Later bool           `json:"later"`
 		Files []payload.File `json:"files"`
 	}
-	if err := json.Unmarshal(s.Attach(t.Context(), raw), &m); err != nil {
+	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatal(err)
+	}
+	var fields []struct {
+		Later int `json:"later"`
+	}
+	var top map[string]json.RawMessage
+	json.Unmarshal(out, &top)
+	if err := json.Unmarshal(top["files"], &fields); err != nil || len(fields) != 3 || fields[0].Later != 1 || fields[2].Later != 3 {
+		t.Fatalf("Attach dropped a field of a file: %s", out)
 	}
 	want := []payload.File{
 		{ID: "F1", Name: "shot.png", Mimetype: "image/png", Size: 6, URL: "https://example.invalid/F1", Fetch: true, Path: filepath.Join(s.Dir, "F1", "shot.png")},
@@ -242,7 +353,7 @@ func TestAttach(t *testing.T) {
 	h.block = make(chan struct{})
 	raw = []byte(`{"type":"message","files":[{"id":"F4","name":"slow.png","fetch":true}]}`)
 	start := time.Now()
-	out := s.Attach(t.Context(), raw)
+	out = s.Attach(t.Context(), raw)
 	if d := time.Since(start); d < s.Timeout || d > 2*time.Second {
 		t.Fatalf("Attach took %v, want about %v", d, s.Timeout)
 	}
@@ -308,21 +419,25 @@ func TestPrune(t *testing.T) {
 	}()
 	<-started
 	time.Sleep(20 * time.Millisecond)
-	if err := os.MkdirAll(filepath.Join(s.Dir, "F6"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(s.Dir, "F6", tmpPrefix+"123"), []byte("part"), 0o600); err != nil {
+	leftover := filepath.Join(s.Dir, tmpPrefix+"F6-123")
+	if err := os.WriteFile(leftover, []byte("part"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	now = base.Add(3 * time.Hour)
 	if err := s.Prune(); err != nil {
 		t.Fatal(err)
 	}
-	if exists("F6") {
-		t.Fatal("the leftover F6 was not pruned")
+	if _, err := os.Stat(leftover); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the leftover of F6 was not pruned")
 	}
-	if es, _ := os.ReadDir(filepath.Join(s.Dir, "F5")); len(es) != 1 || !strings.HasPrefix(es[0].Name(), tmpPrefix) {
-		t.Fatalf("F5 during its fetch holds %v, want just the file being written", es)
+	var writing []string
+	for _, e := range entries(s.Dir) {
+		if strings.HasPrefix(e.Name(), tmpPrefix) {
+			writing = append(writing, e.Name())
+		}
+	}
+	if _, ok := cached(filepath.Join(s.Dir, "F5")); len(writing) != 1 || !strings.HasPrefix(writing[0], tmpPrefix+"F5-") || ok {
+		t.Fatalf("during the fetch of F5: files being written %v, F5 cached %v; want just F5's being written, nothing in its directory", writing, ok)
 	}
 	close(h.block)
 	if err := <-done; err != nil {

@@ -102,10 +102,6 @@ type Runner struct {
 	// file gets; the inbox keeps the original. It is where the files
 	// uploaded with a message are fetched.
 	Prepare func(ctx context.Context, payload []byte) []byte
-	// Prune, if set, is called each time the inbox's delivered messages
-	// are pruned, so that what else is kept for a while (the fetched
-	// files) is pruned on the same occasions.
-	Prune func()
 
 	// nudge has a buffer of one, so a Nudge is kept until Run looks.
 	nudge     chan struct{}
@@ -303,9 +299,6 @@ func (r *Runner) record(ctx context.Context, o outcome) error {
 		}
 		if _, err := r.Store.Inbox.Prune(ctx, time.Now().Add(-r.retention())); err != nil {
 			slog.Warn("hook: prune", "err", err)
-		}
-		if r.Prune != nil {
-			r.Prune()
 		}
 		return nil
 	}

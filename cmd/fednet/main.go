@@ -113,7 +113,8 @@ commands:
         move every thread FROM-ID owns to TO-ID; prints how many moved
   client -hub URL -db PATH -credential PATH -socket PATH [-socket-group GROUP]
          [-hook-timeout D] [-hook-env NAME]... [-handoff-timeout D] [-upgrade-request PATH]
-         [-files-dir DIR] [-files-retention D] [-files-max-total-bytes N] [-prefetch-timeout D]
+         [-files-dir DIR] [-files-retention D] [-files-max-total-bytes N] [-files-prune-interval D]
+         [-prefetch-timeout D]
          [COMMAND [ARG]...]
         run a client on an agent machine; agents reach it through the socket,
         which only this user and the members of GROUP can connect to; COMMAND
@@ -127,7 +128,8 @@ commands:
         of a message before its hook runs (waiting at most -prefetch-timeout,
         default 30s) and the rest on fetch-file; a file is kept for
         -files-retention after it was last fetched (default 168h) and the
-        files are kept under N bytes in all (default 2 GiB)
+        files are kept under N bytes in all (default 2 GiB), pruned every
+        -files-prune-interval (default 1h)
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
@@ -877,6 +879,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	filesDir := fs.String("files-dir", "", "where the files people upload in Slack are kept; default: files next to the database")
 	filesRetention := fs.Duration("files-retention", files.DefaultRetention, "how long a fetched file is kept after it was last fetched")
 	filesMaxTotal := fs.Int64("files-max-total-bytes", files.DefaultMaxTotal, "the most the fetched files add up to, in bytes")
+	pruneInterval := fs.Duration("files-prune-interval", files.DefaultPruneInterval, "how often the fetched files are pruned")
 	prefetchTimeout := fs.Duration("prefetch-timeout", files.DefaultTimeout, "how long fetching one message's files before its hook runs may take")
 	env := hookEnv
 	fs.Func("hook-env", "environment variable to pass to the hook (repeatable)", func(name string) error {
@@ -889,11 +892,16 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	if *hubURL == "" || *dbPath == "" || *credPath == "" || *socket == "" {
 		return usageError("fednet client: -hub, -db, -credential and -socket are required")
 	}
-	if *filesRetention <= 0 || *filesMaxTotal <= 0 || *prefetchTimeout <= 0 {
-		return usageError("fednet client: -files-retention, -files-max-total-bytes and -prefetch-timeout must be positive")
+	if *filesRetention <= 0 || *filesMaxTotal <= 0 || *pruneInterval <= 0 || *prefetchTimeout <= 0 {
+		return usageError("fednet client: -files-retention, -files-max-total-bytes, -files-prune-interval and -prefetch-timeout must be positive")
 	}
 	if *filesDir == "" {
 		*filesDir = filepath.Join(filepath.Dir(*dbPath), "files")
+	}
+	// The hook runs elsewhere, and so does fetch-file: the paths handed
+	// out must not depend on this process's working directory.
+	if *filesDir, err = filepath.Abs(*filesDir); err != nil {
+		return err
 	}
 	proc, err := newProcess(*handoffTimeout)
 	if err != nil {
@@ -917,7 +925,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
 	u := &upgrade.Client{Version: version, Request: *upgradeRequest, Alert: uplinkAlert(c)}
 	c.Divert, c.Upgrade = u.Divert, u.Notice
-	cache := &files.Store{Dir: *filesDir, Fetch: c.Fetch, Retention: *filesRetention, MaxTotal: *filesMaxTotal, Timeout: *prefetchTimeout}
+	cache := &files.Store{Dir: *filesDir, Fetch: c.Fetch, Retention: *filesRetention, MaxTotal: *filesMaxTotal, Timeout: *prefetchTimeout, PruneInterval: *pruneInterval}
 	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err
@@ -937,11 +945,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	}
 	var h *hook.Runner
 	if fs.NArg() > 0 {
-		h = &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c), Prepare: cache.Attach, Prune: func() {
-			if err := cache.Prune(); err != nil {
-				slog.Warn("client: pruning the files", "err", err)
-			}
-		}}
+		h = &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c), Prepare: cache.Attach}
 		c.Received = h.Nudge
 	}
 	// hooked is closed once the hook has stopped, or will never start.
@@ -964,8 +968,16 @@ func clientServe(ctx context.Context, args []string) (err error) {
 				h.Run(ctx)
 			}()
 		}
+		// The files are pruned on a timer, hook or no hook, by one
+		// process at a time, like the link; it stops with the link.
+		pruned := make(chan struct{})
+		go func() {
+			defer close(pruned)
+			cache.Run(ctx)
+		}()
 		c.Run(ctx)
 		<-hooked
+		<-pruned
 	}()
 	stopped, handedOff := false, false
 	select {

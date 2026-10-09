@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,9 +29,10 @@ import (
 
 // Defaults for the zero fields of Store.
 const (
-	DefaultRetention = 7 * 24 * time.Hour
-	DefaultMaxTotal  = 2 << 30
-	DefaultTimeout   = 30 * time.Second
+	DefaultRetention     = 7 * 24 * time.Hour
+	DefaultMaxTotal      = 2 << 30
+	DefaultTimeout       = 30 * time.Second
+	DefaultPruneInterval = time.Hour
 	// pruneTo is the share of MaxTotal pruning brings the total down to.
 	pruneTo = 0.8
 	// maxName is the longest file name kept, in bytes: what most file
@@ -39,9 +41,13 @@ const (
 )
 
 // Store is the cache: Dir holds one directory per file, named by the
-// file's Slack id, with the file in it under its own name. Its exported
-// fields are set before use and not changed after.
+// file's Slack id, with the file in it under its own name; a file being
+// fetched is written in Dir itself, under a name starting with tmpPrefix,
+// and moved into its directory once whole. Its exported fields are set
+// before use and not changed after.
 type Store struct {
+	// Dir is where the files are kept; a relative Dir is taken from the
+	// working directory at each Get, and the paths returned are absolute.
 	Dir string
 	// Fetch gets a file from the hub; it is link.Client.Fetch.
 	Fetch func(ctx context.Context, id string) (link.File, io.ReadCloser, error)
@@ -55,6 +61,9 @@ type Store struct {
 	// Timeout bounds the fetching Attach does for one message. Zero
 	// means DefaultTimeout.
 	Timeout time.Duration
+	// PruneInterval is how often Run prunes. Zero means
+	// DefaultPruneInterval.
+	PruneInterval time.Duration
 	// Now returns the current time; nil means time.Now.
 	Now func() time.Time
 
@@ -62,14 +71,16 @@ type Store struct {
 	// fetching counts the Gets in progress on each id: Prune leaves
 	// those directories alone.
 	fetching map[string]int
-	// locks serializes the Gets of one id, so a file is fetched once.
-	locks map[string]*sync.Mutex
+	// locks serializes the Gets of one id, so a file is fetched once;
+	// each has room for one holder.
+	locks map[string]chan struct{}
 }
 
 // fileID matches a Slack file id: nothing a path could be made of.
 var fileID = regexp.MustCompile(`^[A-Za-z0-9]+$`)
 
-// tmpPrefix starts the name of a file being written.
+// tmpPrefix starts the name of a file being written, in Dir: the id and a
+// random suffix follow.
 const tmpPrefix = ".fetching-"
 
 func (s *Store) retention() time.Duration {
@@ -93,6 +104,13 @@ func (s *Store) timeout() time.Duration {
 	return s.Timeout
 }
 
+func (s *Store) pruneInterval() time.Duration {
+	if s.PruneInterval == 0 {
+		return DefaultPruneInterval
+	}
+	return s.PruneInterval
+}
+
 func (s *Store) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -102,17 +120,26 @@ func (s *Store) now() time.Time {
 
 // Get returns the path of the file with id, fetching it from the hub
 // unless it is here already; either way the file counts as fetched now.
-// The file is written next to its final name and renamed into place once
-// it is whole, so the path never names a part of a file. The directory
-// is this user's alone (0700), and so is the file (0600).
+// The file is written in Dir and renamed into its directory once it is
+// whole, so the path never names a part of a file. The directory is this
+// user's alone (0700), and so is the file (0600). Two Gets of one file at
+// once fetch it once: the second waits for the first, or gives up when
+// its context ends.
 func (s *Store) Get(ctx context.Context, id string) (string, error) {
 	if !fileID.MatchString(id) {
 		return "", fmt.Errorf("%w: %q is not a file id", link.ErrBadRequest, id)
 	}
-	unlock := s.lock(id)
+	root, err := filepath.Abs(s.Dir)
+	if err != nil {
+		return "", err
+	}
+	unlock, err := s.lock(ctx, id)
+	if err != nil {
+		return "", err
+	}
 	defer unlock()
-	dir := filepath.Join(s.Dir, id)
-	if path, ok := s.cached(dir); ok {
+	dir := filepath.Join(root, id)
+	if path, ok := cached(dir); ok {
 		if err := os.Chtimes(path, s.now(), s.now()); err != nil {
 			return "", err
 		}
@@ -123,13 +150,10 @@ func (s *Store) Get(ctx context.Context, id string) (string, error) {
 		return "", err
 	}
 	defer body.Close()
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", err
-	}
-	tmp, err := os.CreateTemp(dir, tmpPrefix)
+	tmp, err := os.CreateTemp(root, tmpPrefix+id+"-")
 	if err != nil {
 		return "", err
 	}
@@ -157,23 +181,21 @@ func (s *Store) Get(ctx context.Context, id string) (string, error) {
 	return path, nil
 }
 
-// lock marks id as being fetched and takes its lock; the returned func
-// undoes both.
-func (s *Store) lock(id string) func() {
+// lock marks id as being fetched and takes its lock, or gives up when
+// ctx ends first; the returned func undoes both.
+func (s *Store) lock(ctx context.Context, id string) (func(), error) {
 	s.mu.Lock()
 	if s.fetching == nil {
-		s.fetching, s.locks = make(map[string]int), make(map[string]*sync.Mutex)
+		s.fetching, s.locks = make(map[string]int), make(map[string]chan struct{})
 	}
 	s.fetching[id]++
 	l := s.locks[id]
 	if l == nil {
-		l = &sync.Mutex{}
+		l = make(chan struct{}, 1)
 		s.locks[id] = l
 	}
 	s.mu.Unlock()
-	l.Lock()
-	return func() {
-		l.Unlock()
+	release := func() {
 		s.mu.Lock()
 		if s.fetching[id]--; s.fetching[id] == 0 {
 			delete(s.fetching, id)
@@ -181,13 +203,23 @@ func (s *Store) lock(id string) func() {
 		}
 		s.mu.Unlock()
 	}
+	select {
+	case l <- struct{}{}:
+	case <-ctx.Done():
+		release()
+		return nil, fmt.Errorf("waiting for another fetch of %s: %w", id, ctx.Err())
+	}
+	return func() {
+		<-l
+		release()
+	}, nil
 }
 
-// cached returns the file in dir, if there is one: the one regular file
-// not being written.
-func (s *Store) cached(dir string) (string, bool) {
+// cached returns the file in dir, if there is one: the regular file
+// there.
+func cached(dir string) (string, bool) {
 	for _, e := range entries(dir) {
-		if e.Type().IsRegular() && !strings.HasPrefix(e.Name(), tmpPrefix) {
+		if e.Type().IsRegular() {
 			return filepath.Join(dir, e.Name()), true
 		}
 	}
@@ -229,30 +261,33 @@ func safeName(name string) string {
 
 // Attach fetches the files of the message in raw, a payload, that the
 // hub marked for fetching, within Timeout for them all, and returns the
-// payload with each such file's Path, or Error when it could not be
+// payload with each such file's "path", or "error" when it could not be
 // fetched: the message goes to the hook either way. Any other payload is
-// returned as it is.
+// returned as it is; the fields of the payload and of its files, known
+// here or not, are kept.
 func (s *Store) Attach(ctx context.Context, raw []byte) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil || string(m["type"]) != `"`+payload.Inbound+`"` {
 		return raw
 	}
-	var fs []payload.File
-	if err := json.Unmarshal(m["files"], &fs); err != nil || !slices.ContainsFunc(fs, func(f payload.File) bool { return f.Fetch }) {
+	var fs []map[string]json.RawMessage
+	if err := json.Unmarshal(m["files"], &fs); err != nil || !slices.ContainsFunc(fs, marked) {
 		return raw
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout())
 	defer cancel()
-	for i := range fs {
-		if !fs[i].Fetch {
+	for _, f := range fs {
+		if !marked(f) {
 			continue
 		}
-		path, err := s.Get(ctx, fs[i].ID)
+		var id string
+		json.Unmarshal(f["id"], &id)
+		path, err := s.Get(ctx, id)
 		if err != nil {
-			fs[i].Error = err.Error()
+			f["error"], _ = json.Marshal(err.Error())
 			continue
 		}
-		fs[i].Path = path
+		f["path"], _ = json.Marshal(path)
 	}
 	b, err := json.Marshal(fs)
 	if err != nil {
@@ -264,6 +299,25 @@ func (s *Store) Attach(ctx context.Context, raw []byte) []byte {
 		return raw
 	}
 	return out
+}
+
+// marked reports whether the hub marked the file f for fetching.
+func marked(f map[string]json.RawMessage) bool { return string(f["fetch"]) == "true" }
+
+// Run prunes every PruneInterval until ctx is done.
+func (s *Store) Run(ctx context.Context) {
+	t := time.NewTicker(s.pruneInterval())
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return
+		}
+		if err := s.Prune(); err != nil {
+			slog.Warn("files: prune", "err", err)
+		}
+	}
 }
 
 // Prune deletes the files not fetched for Retention and, while the rest
@@ -284,16 +338,20 @@ func (s *Store) Prune() error {
 	var errs []error
 	for _, d := range entries(s.Dir) {
 		id := d.Name()
-		if !d.IsDir() || s.fetching[id] > 0 {
+		if !d.IsDir() {
+			// A file being written, or left over from a fetch that never
+			// finished: the name says which id it was for.
+			if left, ok := strings.CutPrefix(id, tmpPrefix); ok && s.fetching[left[:max(strings.LastIndex(left, "-"), 0)]] == 0 {
+				errs = append(errs, os.Remove(filepath.Join(s.Dir, id)))
+			}
+			continue
+		}
+		if s.fetching[id] > 0 {
 			continue
 		}
 		dir := filepath.Join(s.Dir, id)
 		for _, e := range entries(dir) {
 			path := filepath.Join(dir, e.Name())
-			if strings.HasPrefix(e.Name(), tmpPrefix) {
-				errs = append(errs, os.Remove(path))
-				continue
-			}
 			fi, err := e.Info()
 			if err != nil {
 				errs = append(errs, err)
