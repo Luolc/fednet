@@ -53,7 +53,13 @@ func TestHubRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB}, &stdout, &stderr)
+	// workstation may open threads in C1, and no one in C2.
+	f.AddChannel("C2", "")
+	config := filepath.Join(dir, "hub.json")
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, &stdout, &stderr)
 	var addr string
 	waitFor(t, "the hub to listen", func() bool {
 		m := listening.FindStringSubmatch(stdout.String())
@@ -114,6 +120,29 @@ func TestHubRequests(t *testing.T) {
 		t.Fatalf("channel-context get -json: exit %d, stdout %q", code, out)
 	}
 
+	// open-thread starts a thread this machine owns; threads lists it.
+	code, out = fednet("client", "open-thread", "-socket", socket, "-channel", "C1", "nightly report")
+	opened := strings.TrimSpace(out)
+	if code != 0 || !strings.HasPrefix(opened, "C1/") {
+		t.Fatalf("open-thread: exit %d, stdout %q; want a thread key in C1", code, out)
+	}
+	if owner, err := hs.Owner(ctx, opened); err != nil || owner != "workstation" {
+		t.Fatalf("owner of the opened thread = %q, %v; want workstation", owner, err)
+	}
+	if code, _ := fednet("client", "open-thread", "-socket", socket, "-channel", "C2", "not here"); code != 3 {
+		t.Fatalf("open-thread in a channel the config does not allow: exit %d, want 3", code)
+	}
+	if code, out := fednet("client", "threads", "-socket", socket); code != 0 || out != opened+"\n" {
+		t.Fatalf("threads: exit %d, stdout %q; want just %s", code, out, opened)
+	}
+	code, out = fednet("client", "threads", "-socket", socket, "-json")
+	var listed struct {
+		Threads []string `json:"threads"`
+	}
+	if err := json.Unmarshal([]byte(out), &listed); code != 0 || err != nil || !slices.Equal(listed.Threads, []string{opened}) {
+		t.Fatalf("threads -json: exit %d, stdout %q; want just %s", code, out, opened)
+	}
+
 	// adopt takes the thread over from the old machine; hub reassign then
 	// moves everything this machine owns to another.
 	if code, _ := fednet("client", "adopt", "-socket", socket, thread); code != 0 {
@@ -125,8 +154,8 @@ func TestHubRequests(t *testing.T) {
 	if code, _ := fednet("client", "adopt", "-socket", socket, "C1/1600000000.000001"); code != 1 || !strings.Contains(stderr.String(), "has no owner") {
 		t.Fatalf("adopt of an unowned thread: exit %d, want 1 and a message saying so", code)
 	}
-	if code, out := fednet("hub", "reassign", "-db", hubDB, "workstation", "datamachine"); code != 0 || out != "1\n" {
-		t.Fatalf("hub reassign: exit %d, stdout %q; want 1 thread moved", code, out)
+	if code, out := fednet("hub", "reassign", "-db", hubDB, "workstation", "datamachine"); code != 0 || out != "2\n" {
+		t.Fatalf("hub reassign: exit %d, stdout %q; want 2 threads moved", code, out)
 	}
 	if owner, err := hs.Owner(ctx, thread); err != nil || owner != "datamachine" {
 		t.Fatalf("owner after reassign = %q, %v; want datamachine", owner, err)
@@ -147,5 +176,25 @@ func TestHubRequests(t *testing.T) {
 	}
 	if got, err := f.Replies(ctx, "C1", ts); err != nil || !slices.ContainsFunc(got, func(m slack.Message) bool { return m.Text == "on it" }) {
 		t.Fatalf("Slack thread = %+v, %v", got, err)
+	}
+}
+
+// A misspelt field in the hub config is an error, not a silent deny.
+func TestReadHubConfig(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.json")
+	typo := filepath.Join(dir, "typo.json")
+	if err := os.WriteFile(good, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(typo, []byte(`{"channels": {"C1": {"open_threads": ["workstation"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readHubConfig(good)
+	if err != nil || !slices.Equal(cfg.openThread()["C1"], []string{"workstation"}) {
+		t.Fatalf("readHubConfig(good) = %+v, %v; want workstation allowed in C1", cfg, err)
+	}
+	if _, err := readHubConfig(typo); err == nil || !strings.Contains(err.Error(), "open_threads") {
+		t.Fatalf("readHubConfig(typo) = %v, want an error naming the unknown field", err)
 	}
 }

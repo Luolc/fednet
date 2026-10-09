@@ -93,6 +93,31 @@ func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client string, payloa
 	return owner, d, tx.Commit()
 }
 
+// Claim makes client the owner of thread, a thread that has just been
+// started and has no owner yet; it fails if thread already has one.
+func (h *Hub) Claim(ctx context.Context, thread, client string) error {
+	_, err := h.db.ExecContext(ctx, "INSERT INTO owner (thread, client_id) VALUES (?, ?)", thread, client)
+	return err
+}
+
+// Threads returns the threads client owns, in order of their keys.
+func (h *Hub) Threads(ctx context.Context, client string) ([]string, error) {
+	rows, err := h.db.QueryContext(ctx, "SELECT thread FROM owner WHERE client_id = ? ORDER BY thread", client)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var threads []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		threads = append(threads, t)
+	}
+	return threads, rows.Err()
+}
+
 // Reassign makes client the owner of thread, which must already have an
 // owner; otherwise it returns ErrNotFound. This is the explicit takeover of
 // one thread by another machine.

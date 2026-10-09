@@ -683,3 +683,33 @@ func TestClientUpgradeKeepsData(t *testing.T) {
 		t.Fatalf("DeadLetters after upgrade = %v, %v; want none", ds, err)
 	}
 }
+
+func TestClaimAndThreads(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	if got, err := h.Threads(ctx, "a"); err != nil || len(got) != 0 {
+		t.Fatalf("Threads(a) with no threads = %v, %v; want none", got, err)
+	}
+	for thread, client := range map[string]string{"C1/2": "a", "C1/1": "a", "C2/1": "b"} {
+		if err := h.Claim(ctx, thread, client); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A claimed thread is owned, and nothing is queued for it.
+	if got, err := h.Owner(ctx, "C1/1"); err != nil || got != "a" {
+		t.Fatalf("Owner(C1/1) = %q, %v; want a", got, err)
+	}
+	if ds, err := h.Outbox.After(ctx, "a", 0); err != nil || len(ds) != 0 {
+		t.Fatalf("outbox of a = %v, %v; want empty", ds, err)
+	}
+	// A thread that has an owner keeps it.
+	if err := h.Claim(ctx, "C2/1", "a"); err == nil {
+		t.Fatal("Claim of an owned thread succeeded")
+	}
+	if got, err := h.Threads(ctx, "a"); err != nil || !slices.Equal(got, []string{"C1/1", "C1/2"}) {
+		t.Fatalf("Threads(a) = %v, %v; want [C1/1 C1/2]", got, err)
+	}
+	if got, err := h.Threads(ctx, "b"); err != nil || !slices.Equal(got, []string{"C2/1"}) {
+		t.Fatalf("Threads(b) = %v, %v; want [C2/1]", got, err)
+	}
+}
