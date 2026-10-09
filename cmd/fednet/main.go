@@ -145,7 +145,8 @@ commands:
         queued, and returns once Slack has it; TEXT is standard Markdown,
         which the hub puts in a Slack markdown block (headings, tables,
         lists, code blocks); a TEXT over 4000 characters goes out as
-        several messages in order, cut at a line break
+        several messages in order, each cut at the last line break that
+        leaves it at least half full, else at that length
   client read-thread -socket PATH [-json] THREAD-KEY
         print the messages of a thread, read by the hub
   client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
