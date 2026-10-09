@@ -221,9 +221,11 @@ func (h *Hub) readAcks(ctx context.Context, client string, conn *websocket.Conn)
 	}
 }
 
-// serveUplink stores one message and replies 204 once it is on disk.
+// serveUplink stores one message with its sender and replies 204 once it
+// is on disk.
 func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
-	if _, err := h.identify(r); err != nil {
+	client, err := h.identify(r)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
@@ -232,7 +234,7 @@ func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad uplink body", http.StatusBadRequest)
 		return
 	}
-	if _, err := h.Store.Inbox.Put(r.Context(), store.Message{MsgID: u.MsgID, Payload: u.Payload}); err != nil {
+	if _, err := h.Store.Inbox.PutFrom(r.Context(), client, store.Message{MsgID: u.MsgID, Payload: u.Payload}); err != nil {
 		slog.Warn("link: uplink store", "err", err)
 		http.Error(w, "store failed", http.StatusInternalServerError)
 		return

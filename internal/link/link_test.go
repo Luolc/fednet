@@ -2,15 +2,20 @@ package link
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -18,6 +23,7 @@ import (
 const (
 	testLease     = 200 * time.Millisecond
 	testHeartbeat = 20 * time.Millisecond
+	testTimeout   = 100 * time.Millisecond
 )
 
 var testBackoff = Backoff{Min: time.Millisecond, Max: 10 * time.Millisecond}
@@ -80,6 +86,7 @@ func testClient(t *testing.T, st *store.Client, id, hub string, cut *cutter) (*C
 		Hub:        hub,
 		Heartbeat:  testHeartbeat,
 		Backoff:    testBackoff,
+		Timeout:    testTimeout,
 		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: cut.dial}},
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -207,8 +214,8 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the hub inbox", func() bool { return len(inboxIDs(t, h.Store.Inbox)) == 1 })
-	if got := inboxIDs(t, h.Store.Inbox); !slices.Equal(got, []string{id}) {
+	waitFor(t, "the hub inbox", func() bool { return len(inboxIDs(t, h.Store.Inbox.Inbox)) == 1 })
+	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{id}) {
 		t.Fatalf("hub inbox = %v, want [%s]", got, id)
 	}
 	waitFor(t, "the client outbox to be acked", func() bool {
@@ -223,16 +230,289 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 	}
 }
 
+// dialHub opens a raw downlink connection to srv as client id. The
+// connection is closed when the test ends.
+func dialHub(t *testing.T, srv *httptest.Server, id string) *websocket.Conn {
+	t.Helper()
+	conn, _, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http")+DownlinkPath,
+		&websocket.DialOptions{HTTPHeader: http.Header{ClientHeader: {id}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.CloseNow() })
+	return conn
+}
+
+func readDownlink(t *testing.T, conn *websocket.Conn) downlink {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var d downlink
+	if err := wsjson.Read(ctx, conn, &d); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 func TestOnlineFollowsHeartbeat(t *testing.T) {
 	h, srv := testHub(t, nil)
-	cs := openClientStore(t)
 	if h.Online("a") {
 		t.Fatal("online before any connection")
 	}
-	_, stop := testClient(t, cs, "a", srv.URL, &cutter{})
-	waitFor(t, "online", func() bool { return h.Online("a") })
-	stop()
+	// A connection that never pings: online on connect, offline once the
+	// lease runs out with the connection still open, online again on a ping.
+	conn := dialHub(t, srv, "a")
+	conn.CloseRead(t.Context())
+	if !h.Online("a") {
+		t.Fatal("not online right after connecting")
+	}
 	waitFor(t, "offline after the lease", func() bool { return !h.Online("a") })
+	if err := conn.Ping(t.Context()); err != nil {
+		t.Fatalf("ping on the idle connection: %v", err)
+	}
+	if !h.Online("a") {
+		t.Fatal("not online right after a ping")
+	}
+	conn.CloseNow()
+
+	// A Client pings on its heartbeat, so it stays online past the lease.
+	cs := openClientStore(t)
+	_, stop := testClient(t, cs, "b", srv.URL, &cutter{})
+	waitFor(t, "online", func() bool { return h.Online("b") })
+	for end := time.Now().Add(3 * testLease); time.Now().Before(end); time.Sleep(time.Millisecond) {
+		if !h.Online("b") {
+			t.Fatal("went offline while the client was connected and pinging")
+		}
+	}
+	stop()
+	waitFor(t, "offline after the client stopped", func() bool { return !h.Online("b") })
+}
+
+// fakeHub accepts downlink connections from a Client and hands each one to
+// the test.
+func fakeHub(t *testing.T) (*httptest.Server, <-chan *websocket.Conn) {
+	t.Helper()
+	conns := make(chan *websocket.Conn, 8)
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		select {
+		case conns <- conn:
+		default:
+			conn.CloseNow()
+		}
+		<-done
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(done) })
+	return srv, conns
+}
+
+func TestClientStoresBeforeAck(t *testing.T) {
+	srv, conns := fakeHub(t)
+	cs := openClientStore(t)
 	testClient(t, cs, "a", srv.URL, &cutter{})
-	waitFor(t, "online again", func() bool { return h.Online("a") })
+	conn := <-conns
+	defer conn.CloseNow()
+	// With the store closed the client cannot keep the message, so it must
+	// not ack it: the only thing the hub may see is the connection going.
+	cs.Close()
+	if err := wsjson.Write(t.Context(), conn, downlink{Seq: 1, MsgID: "m1", Payload: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var a ack
+	if err := wsjson.Read(ctx, conn, &a); err == nil {
+		t.Fatalf("got ack %d for a message the client could not store", a.Seq)
+	} else if ctx.Err() != nil {
+		t.Fatal("client neither acked nor closed the connection")
+	}
+}
+
+func TestClientStoresReplayOnce(t *testing.T) {
+	srv, conns := fakeHub(t)
+	cs := openClientStore(t)
+	testClient(t, cs, "a", srv.URL, &cutter{})
+	conn := <-conns
+	defer conn.CloseNow()
+	// The same message twice, as a hub does when the first ack was lost.
+	for _, seq := range []int64{1, 2} {
+		if err := wsjson.Write(t.Context(), conn, downlink{Seq: seq, MsgID: "m1", Payload: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+		var a ack
+		if err := wsjson.Read(t.Context(), conn, &a); err != nil {
+			t.Fatal(err)
+		}
+		if a.Seq != seq {
+			t.Fatalf("ack %d, want %d", a.Seq, seq)
+		}
+	}
+	if got := inboxIDs(t, cs.Inbox); !slices.Equal(got, []string{"m1"}) {
+		t.Fatalf("inbox = %v, want [m1]", got)
+	}
+}
+
+func TestHubResendsUntilAcked(t *testing.T) {
+	h, srv := testHub(t, nil)
+	m1, err := h.Send(t.Context(), "a", []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Receive without acking, drop the connection: the message comes again.
+	conn := dialHub(t, srv, "a")
+	if d := readDownlink(t, conn); d.MsgID != m1.MsgID {
+		t.Fatalf("first connection got %q, want %q", d.MsgID, m1.MsgID)
+	}
+	conn.CloseNow()
+	conn = dialHub(t, srv, "a")
+	d := readDownlink(t, conn)
+	if d.MsgID != m1.MsgID || d.Seq != m1.Seq {
+		t.Fatalf("second connection got %+v, want seq %d msg %q", d, m1.Seq, m1.MsgID)
+	}
+	// Ack it: after a reconnect the next message is the one queued later.
+	if err := wsjson.Write(t.Context(), conn, ack{Seq: d.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the hub outbox to be acked", func() bool { return outboxEmpty(t, h, "a") })
+	conn.CloseNow()
+	m2, err := h.Send(t.Context(), "a", []byte("two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn = dialHub(t, srv, "a")
+	if d := readDownlink(t, conn); d.MsgID != m2.MsgID {
+		t.Fatalf("third connection got %q, want %q", d.MsgID, m2.MsgID)
+	}
+}
+
+func TestPayloadLimit(t *testing.T) {
+	h, srv := testHub(t, nil)
+	cs := openClientStore(t)
+	c, _ := testClient(t, cs, "a", srv.URL, &cutter{})
+	full := make([]byte, MaxPayload)
+	over := make([]byte, MaxPayload+1)
+
+	d1, err := h.Send(t.Context(), "a", full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Send(t.Context(), "a", over); !errors.Is(err, ErrPayloadTooBig) {
+		t.Fatalf("Send over the limit: %v, want ErrPayloadTooBig", err)
+	}
+	d2, err := h.Send(t.Context(), "a", []byte("after"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "both downlink messages", func() bool { return len(inboxIDs(t, cs.Inbox)) == 2 })
+	if got := inboxIDs(t, cs.Inbox); !slices.Equal(got, []string{d1.MsgID, d2.MsgID}) {
+		t.Fatalf("client inbox = %v, want [%s %s]", got, d1.MsgID, d2.MsgID)
+	}
+
+	u1, err := c.Post(t.Context(), full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Post(t.Context(), over); !errors.Is(err, ErrPayloadTooBig) {
+		t.Fatalf("Post over the limit: %v, want ErrPayloadTooBig", err)
+	}
+	u2, err := c.Post(t.Context(), []byte("after"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "both uplink messages", func() bool { return len(inboxIDs(t, h.Store.Inbox.Inbox)) == 2 })
+	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{u1, u2}) {
+		t.Fatalf("hub inbox = %v, want [%s %s]", got, u1, u2)
+	}
+}
+
+func TestRequestsTimeOutAndRetry(t *testing.T) {
+	// The first request on each path never gets a reply, so the client has
+	// to give up on it; the server lets it go when the test ends.
+	var held sync.Map
+	var posts atomic.Int32
+	done := make(chan struct{})
+	h, srv := testHub(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == UplinkPath {
+				posts.Add(1)
+			}
+			if _, seen := held.LoadOrStore(r.URL.Path, true); !seen {
+				<-done
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	t.Cleanup(func() { close(done) })
+	cs := openClientStore(t)
+	c, _ := testClient(t, cs, "a", srv.URL, &cutter{})
+	d, err := h.Send(t.Context(), "a", []byte("down"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := c.Post(t.Context(), []byte("up"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the downlink message", func() bool { return len(inboxIDs(t, cs.Inbox)) == 1 })
+	if got := inboxIDs(t, cs.Inbox); !slices.Equal(got, []string{d.MsgID}) {
+		t.Fatalf("client inbox = %v, want [%s]", got, d.MsgID)
+	}
+	waitFor(t, "the uplink message", func() bool { return len(inboxIDs(t, h.Store.Inbox.Inbox)) == 1 })
+	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{u}) {
+		t.Fatalf("hub inbox = %v, want [%s]", got, u)
+	}
+	if n := posts.Load(); n < 2 {
+		t.Fatalf("hub saw %d posts, want at least 2", n)
+	}
+}
+
+func TestCloseRefusesHandshakeInFlight(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	h, srv := testHub(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(arrived)
+			<-release
+			next.ServeHTTP(w, r)
+		})
+	})
+	type dialed struct {
+		conn *websocket.Conn
+		err  error
+	}
+	dc := make(chan dialed, 1)
+	go func() {
+		conn, _, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http")+DownlinkPath,
+			&websocket.DialOptions{HTTPHeader: http.Header{ClientHeader: {"a"}}})
+		dc <- dialed{conn, err}
+	}()
+	<-arrived
+	h.Close()
+	close(release)
+	got := <-dc
+	if got.err != nil {
+		t.Fatalf("dial: %v", got.err)
+	}
+	defer got.conn.CloseNow()
+	// The hub accepted the handshake after Close had begun, so it must
+	// close the connection instead of serving it.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var d downlink
+	err := wsjson.Read(ctx, got.conn, &d)
+	if websocket.CloseStatus(err) != websocket.StatusGoingAway {
+		t.Fatalf("read after Close: %v, want close status going away", err)
+	}
+	h.mu.Lock()
+	n := len(h.sessions)
+	h.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d sessions registered after Close", n)
+	}
 }

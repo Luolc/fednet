@@ -32,8 +32,8 @@ type Client struct {
 	Heartbeat time.Duration
 	// Backoff paces reconnects and uplink retries. Zero means DefaultBackoff.
 	Backoff Backoff
-	// Timeout bounds one dial and one uplink request. Zero means
-	// DefaultTimeout.
+	// Timeout bounds one dial, one uplink request and the wait for one
+	// pong. Zero means DefaultTimeout.
 	Timeout time.Duration
 	// HTTPClient is used for both links. Nil means http.DefaultClient.
 	HTTPClient *http.Client
@@ -168,7 +168,7 @@ func (c *Client) ping(ctx context.Context, conn *websocket.Conn) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		pctx, cancel := context.WithTimeout(ctx, c.heartbeat())
+		pctx, cancel := context.WithTimeout(ctx, c.timeout())
 		err := conn.Ping(pctx)
 		cancel()
 		if err != nil {
