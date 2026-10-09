@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 )
 
 var hubMigrations = []string{`
@@ -23,6 +24,13 @@ CREATE TABLE owner (
 	thread    TEXT PRIMARY KEY,
 	client_id TEXT NOT NULL
 );
+`, `
+-- enqueued_at is in Unix milliseconds. Rows queued before this column
+-- existed get the time of the migration.
+ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0;
+UPDATE outbox SET enqueued_at = CAST(unixepoch('subsec') * 1000 AS INTEGER);
+-- The client an uplink message came from; empty for rows from before.
+ALTER TABLE inbox ADD COLUMN client_id TEXT NOT NULL DEFAULT '';
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.
@@ -34,7 +42,7 @@ type Hub struct {
 	// Outbox holds the downlink messages for each client until it acks them.
 	Outbox HubOutbox
 	// Inbox holds the uplink messages received from clients.
-	Inbox Inbox
+	Inbox HubInbox
 }
 
 // OpenHub opens, or creates, the hub database at path.
@@ -43,18 +51,56 @@ func OpenHub(ctx context.Context, path string) (*Hub, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Hub{db: db, Outbox: HubOutbox{db}, Inbox: Inbox{db}}, nil
+	return &Hub{db: db, Outbox: HubOutbox{db}, Inbox: HubInbox{Inbox{db}}}, nil
 }
 
 // Close closes the database.
 func (h *Hub) Close() error { return h.db.Close() }
 
-// SetOwner records client as the owner of thread, replacing any earlier owner.
-func (h *Hub) SetOwner(ctx context.Context, thread, client string) error {
-	_, err := h.db.ExecContext(ctx,
-		"INSERT INTO owner (thread, client_id) VALUES (?, ?) ON CONFLICT (thread) DO UPDATE SET client_id = excluded.client_id",
-		thread, client)
+// ClaimOwner records client as the owner of thread if thread has no owner
+// yet, and returns the owner the thread ends up with. Of several concurrent
+// claims on a new thread, the first wins and all of them return its client.
+func (h *Hub) ClaimOwner(ctx context.Context, thread, client string) (string, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO owner (thread, client_id) VALUES (?, ?) ON CONFLICT (thread) DO NOTHING",
+		thread, client); err != nil {
+		return "", err
+	}
+	var owner string
+	if err := tx.QueryRowContext(ctx, "SELECT client_id FROM owner WHERE thread = ?", thread).Scan(&owner); err != nil {
+		return "", err
+	}
+	return owner, tx.Commit()
+}
+
+// Reassign makes client the owner of thread, which must already have an
+// owner; otherwise it returns ErrNotFound. This is the explicit takeover of
+// one thread by another machine.
+func (h *Hub) Reassign(ctx context.Context, thread, client string) error {
+	res, err := h.db.ExecContext(ctx, "UPDATE owner SET client_id = ? WHERE thread = ?", client, thread)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err == nil && n == 0 {
+		err = ErrNotFound
+	}
 	return err
+}
+
+// ReassignClient moves every thread owned by from to to, and returns how
+// many threads it moved. Messages already queued for from stay with from.
+func (h *Hub) ReassignClient(ctx context.Context, from, to string) (int64, error) {
+	res, err := h.db.ExecContext(ctx, "UPDATE owner SET client_id = ? WHERE client_id = ?", to, from)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // Owner returns the client that owns thread, or ErrNotFound.
@@ -65,6 +111,22 @@ func (h *Hub) Owner(ctx context.Context, thread string) (string, error) {
 		return "", ErrNotFound
 	}
 	return client, err
+}
+
+// HubInbox is the hub's inbox, which also records which client each message
+// came from.
+type HubInbox struct{ Inbox }
+
+// PutFrom is Put for a message from client.
+func (in HubInbox) PutFrom(ctx context.Context, client string, m Message) (bool, error) {
+	res, err := in.db.ExecContext(ctx,
+		"INSERT INTO inbox (msg_id, payload, client_id) VALUES (?, ?, ?) ON CONFLICT (msg_id) DO NOTHING",
+		m.MsgID, m.Payload, client)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // Downlink is a message queued for one client.
@@ -83,8 +145,8 @@ type HubOutbox struct{ db *sql.DB }
 func (o HubOutbox) Enqueue(ctx context.Context, client string, payload []byte) (Downlink, error) {
 	d := Downlink{Message: Message{MsgID: newMsgID(), Payload: payload}}
 	res, err := o.db.ExecContext(ctx,
-		"INSERT INTO outbox (client_id, msg_id, payload) VALUES (?, ?, ?)",
-		client, d.MsgID, payload)
+		"INSERT INTO outbox (client_id, msg_id, payload, enqueued_at) VALUES (?, ?, ?, ?)",
+		client, d.MsgID, payload, time.Now().UnixMilli())
 	if err != nil {
 		return Downlink{}, err
 	}
@@ -117,4 +179,14 @@ func (o HubOutbox) After(ctx context.Context, client string, seq int64) ([]Downl
 func (o HubOutbox) Ack(ctx context.Context, client string, seq int64) error {
 	_, err := o.db.ExecContext(ctx, "DELETE FROM outbox WHERE client_id = ? AND seq <= ?", client, seq)
 	return err
+}
+
+// QueuedFor reports whether client has a message that has waited in the
+// outbox for d or longer.
+func (o HubOutbox) QueuedFor(ctx context.Context, client string, d time.Duration) (bool, error) {
+	var found bool
+	err := o.db.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM outbox WHERE client_id = ? AND enqueued_at <= ?)",
+		client, time.Now().Add(-d).UnixMilli()).Scan(&found)
+	return found, err
 }
