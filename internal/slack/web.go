@@ -268,7 +268,7 @@ func blocks(c Card) []slackgo.Block {
 		slackgo.NewTextBlockObject(slackgo.MarkdownType, "*过期*\n"+date(c.Expires)+"\n*编号*\n"+c.ID, false, false),
 	}, nil))
 	if c.Outcome == "" {
-		return append(bs, slackgo.NewActionBlock("approval:"+c.ID,
+		return append(bs, slackgo.NewActionBlock(CardBlockID(c.ID),
 			slackgo.NewButtonBlockElement(ApproveAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "批准", false, false)).WithStyle(slackgo.StylePrimary),
 			slackgo.NewButtonBlockElement(RejectAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "拒绝", false, false)).WithStyle(slackgo.StyleDanger),
 		))

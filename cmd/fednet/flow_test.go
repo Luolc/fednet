@@ -220,6 +220,7 @@ func TestApprovalFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	waitFor(t, "the hints to the clickers", func() bool { return len(rig.f.Whispers("U9")) == 1 && len(rig.f.Whispers("U1")) == 1 })
 	if c, _ := rig.f.Card("C9", ts); c.Outcome != "" {
 		t.Fatalf("card after clicks that do not count = %+v, want still pending", c)
 	}
@@ -238,7 +239,8 @@ func TestApprovalFlow(t *testing.T) {
 	if m.ApprovalID != id || m.Outcome != payload.Approved || m.Approver != "U1" || m.Agent != "ops-exec" || m.Text != "delete the example bucket" || len(m.Approval) == 0 {
 		t.Fatalf("outcome = %+v, want %s approved by U1 with the approval document", m, id)
 	}
-	if c, _ := rig.f.Card("C9", ts); c.Outcome != payload.Approved || c.Approver != "U1" {
+	waitFor(t, "the card to show the approval", func() bool { c, _ := rig.f.Card("C9", ts); return c.Outcome == payload.Approved })
+	if c, _ := rig.f.Card("C9", ts); c.Approver != "U1" {
 		t.Fatalf("card after approval = %+v, want approved by U1", c)
 	}
 	approvalPath, used := filepath.Join(rig.dir, "approval.json"), filepath.Join(rig.dir, "used")
@@ -292,10 +294,8 @@ func TestApprovalFlow(t *testing.T) {
 	if err := rig.sr.r.Click(ctx, slack.Click{ID: id2, Approve: true, User: "U1", Channel: "C9", TS: ts2}); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := rig.f.Card("C9", ts2); c.Outcome != payload.Rejected {
-		t.Fatalf("card after approving a rejected card = %+v, want still rejected", c)
-	}
-	time.Sleep(50 * time.Millisecond)
+	waitFor(t, "the card to show the rejection", func() bool { c, _ := rig.f.Card("C9", ts2); return c.Outcome == payload.Rejected })
+	waitFor(t, "the hint to U1", func() bool { return len(rig.f.Whispers("U1")) == 2 })
 	if ms := rig.outcomes(t); len(ms) != 2 {
 		t.Fatalf("outcomes after approving a rejected card = %+v, want still two", ms)
 	}
@@ -322,17 +322,18 @@ func TestApprovalExpires(t *testing.T) {
 	if m.ApprovalID != id || m.Outcome != payload.Expired || m.Approver != "" || len(m.Approval) != 0 {
 		t.Fatalf("outcome = %+v, want %s expired, unsigned", m, id)
 	}
-	tss, cards := rig.f.Cards("C9")
-	if len(cards) != 1 || cards[0].Outcome != payload.Expired {
-		t.Fatalf("cards = %+v, want one expired", cards)
-	}
+	waitFor(t, "the card to show the expiry", func() bool {
+		_, cards := rig.f.Cards("C9")
+		return len(cards) == 1 && cards[0].Outcome == payload.Expired
+	})
+	tss, _ := rig.f.Cards("C9")
 	if err := rig.sr.r.Click(ctx, slack.Click{ID: id, Approve: true, User: "U1", Channel: "C9", TS: tss[0]}); err != nil {
 		t.Fatal(err)
 	}
-	if w := rig.f.Whispers("U1"); len(w) != 1 || !strings.Contains(w[0], "已过期") {
+	waitFor(t, "the hint to U1", func() bool { return len(rig.f.Whispers("U1")) == 1 })
+	if w := rig.f.Whispers("U1"); !strings.Contains(w[0], "已过期") {
 		t.Fatalf("U1 was told %q, want that the card expired", w)
 	}
-	time.Sleep(50 * time.Millisecond)
 	if ms := rig.outcomes(t); len(ms) != 1 {
 		t.Fatalf("outcomes after approving an expired card = %+v, want still one", ms)
 	}

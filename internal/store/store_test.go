@@ -840,24 +840,33 @@ func TestApprovals(t *testing.T) {
 		t.Fatalf("UnfinishedCards while pending = %+v, %v; want none", us, err)
 	}
 
-	// The first decision takes and runs its handler in the transaction; the
-	// second does not run its handler.
+	// The first decision takes, its decide seeing the pending approval and
+	// running in the transaction; the second does not run its decide.
 	decidedAt := at.Add(10 * time.Minute)
 	ran := 0
-	decided, err := h.DecideApproval(ctx, "apr-1", "approved", "U1", decidedAt, func(tx *Hub) error {
+	decided, err := h.DecideApproval(ctx, "apr-1", func(tx *Hub, got Approval) (Decision, error) {
 		ran++
+		if !reflect.DeepEqual(got, a) {
+			t.Errorf("decide saw %+v, want %+v", got, a)
+		}
 		_, err := tx.Outbox.Enqueue(ctx, "workstation", []byte("outcome"))
-		return err
+		return Decision{Status: "approved", By: "U1", At: decidedAt}, err
 	})
 	if err != nil || !decided {
 		t.Fatalf("DecideApproval = %v, %v; want true", decided, err)
 	}
-	decided, err = h.DecideApproval(ctx, "apr-1", "rejected", "U2", decidedAt, func(tx *Hub) error { ran++; return nil })
+	decided, err = h.DecideApproval(ctx, "apr-1", func(*Hub, Approval) (Decision, error) {
+		ran++
+		return Decision{Status: "rejected", By: "U2", At: decidedAt}, nil
+	})
 	if err != nil || decided {
 		t.Fatalf("second DecideApproval = %v, %v; want false", decided, err)
 	}
 	if ran != 1 {
-		t.Fatalf("handlers ran %d times, want 1", ran)
+		t.Fatalf("decide ran %d times, want 1", ran)
+	}
+	if _, err := h.DecideApproval(ctx, "apr-9", func(*Hub, Approval) (Decision, error) { return Decision{}, nil }); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DecideApproval(apr-9) = %v, want ErrNotFound", err)
 	}
 	got, err = h.Approval(ctx, "apr-1")
 	if err != nil || got.Status != "approved" || got.DecidedBy != "U1" || !got.DecidedAt.Equal(decidedAt) || got.CardFinal {
@@ -866,17 +875,27 @@ func TestApprovals(t *testing.T) {
 	if ds, err := h.Outbox.After(ctx, "workstation", 0); err != nil || len(ds) != 1 {
 		t.Fatalf("outbox = %+v, %v; want the one outcome", ds, err)
 	}
-	// A handler that fails leaves the approval pending.
+	// A decide that fails, or that returns no Decision, leaves the
+	// approval pending and queues nothing.
 	b := a
 	b.ID = "apr-2"
 	if err := h.PutApproval(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	if decided, err := h.DecideApproval(ctx, "apr-2", "approved", "U1", decidedAt, func(*Hub) error { return errors.New("no") }); decided || err == nil {
-		t.Fatalf("DecideApproval with a failing handler = %v, %v; want false and the error", decided, err)
+	if decided, err := h.DecideApproval(ctx, "apr-2", func(*Hub, Approval) (Decision, error) { return Decision{}, errors.New("no") }); decided || err == nil {
+		t.Fatalf("DecideApproval with a failing decide = %v, %v; want false and the error", decided, err)
+	}
+	if decided, err := h.DecideApproval(ctx, "apr-2", func(tx *Hub, _ Approval) (Decision, error) {
+		_, err := tx.Outbox.Enqueue(ctx, "workstation", []byte("not this"))
+		return Decision{}, err
+	}); decided || err != nil {
+		t.Fatalf("DecideApproval with no Decision = %v, %v; want false, nil", decided, err)
 	}
 	if got, err := h.Approval(ctx, "apr-2"); err != nil || got.Status != Pending {
-		t.Fatalf("Approval after a failed handler = %+v, %v; want still pending", got, err)
+		t.Fatalf("Approval after a failed decide = %+v, %v; want still pending", got, err)
+	}
+	if ds, err := h.Outbox.After(ctx, "workstation", 0); err != nil || len(ds) != 1 {
+		t.Fatalf("outbox = %+v, %v; want still the one outcome", ds, err)
 	}
 
 	if ps, err := h.PendingApprovals(ctx); err != nil || len(ps) != 1 || ps[0].ID != "apr-2" {

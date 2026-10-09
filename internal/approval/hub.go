@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/Luolc/fednet/internal/payload"
@@ -33,7 +34,7 @@ var ErrTooBig = errors.New("approval: the action does not fit in one card")
 
 // Flow runs approvals on the hub: Request records what an agent asks and
 // posts the card; Click applies a press on a card's button; Run expires
-// what nobody decided and finishes cards. Every outcome goes down to the
+// what nobody decided, finishes cards and delivers the hints clicks left. Every outcome goes down to the
 // client that asked, signed when approved. Its exported fields are set
 // before use and not changed after.
 type Flow struct {
@@ -56,7 +57,16 @@ type Flow struct {
 	// Stored, if set, is called each time an outcome has been queued for
 	// a client. It must not block.
 	Stored func()
+
+	nudge     chan struct{}
+	nudgeOnce sync.Once
+	// mu guards hints, the hints clicks left for Pass to deliver.
+	mu    sync.Mutex
+	hints []hintFor
 }
+
+// hintFor is a hint to show user in channel.
+type hintFor struct{ channel, user, text string }
 
 // Request records an approval client's agent asks for, with summary saying
 // what the action does and action its parameters, and posts the card. It
@@ -98,26 +108,33 @@ func (f *Flow) Request(ctx context.Context, client, agent, requester, summary st
 	return a.ID, nil
 }
 
+// sign is Sign; a test counts through it.
+var sign = Sign
+
 // deleteTimeout bounds the delete that undoes a request whose approval
 // could not be recorded; tests shorten it.
 var deleteTimeout = 30 * time.Second
 
 // Click applies c. A click counts only if the clicker is an approver and
-// not a bot, and the approval is still pending and not expired; a click that does not count changes nothing, and the clicker
-// is told why in an ephemeral message. A click that counts decides the
-// approval, queues the outcome for the client, then updates the card. An
-// error means nothing was decided and the click should not be acked.
+// not a bot, c names the card as recorded, and the approval is still
+// pending and not expired, all judged under the database's write lock; a
+// click that does not count changes nothing, and the clicker is told why
+// in a hint the next Pass delivers. A click that counts decides the
+// approval and queues the outcome for the client in the same
+// transaction; the card is brought up to date by the next Pass. Click
+// calls no Slack API itself, so the caller may ack as soon as it returns.
+// An error means nothing was decided and the click should not be acked.
 func (f *Flow) Click(ctx context.Context, c slack.Click) error {
 	hint, err := f.click(ctx, c)
 	if err != nil {
 		return err
 	}
-	if hint == "" {
-		return nil
+	if hint != "" {
+		f.mu.Lock()
+		f.hints = append(f.hints, hintFor{c.Channel, c.User, hint})
+		f.mu.Unlock()
 	}
-	if err := f.Slack.Whisper(ctx, c.Channel, c.User, hint); err != nil {
-		slog.Warn("approval: telling the clicker why the click did not count", "approval", c.ID, "user", c.User, "err", err)
-	}
+	f.Nudge()
 	return nil
 }
 
@@ -137,26 +154,24 @@ func (f *Flow) click(ctx context.Context, c slack.Click) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if c.Channel != a.Channel || c.TS != a.TS {
+		return "这个按钮不在编号 " + c.ID + " 的审批卡上", nil
+	}
 	if a.Status != store.Pending {
 		return "这张卡已经处理过了：" + outcomeName(a.Status), nil
-	}
-	now := f.now()
-	if !now.Before(a.ExpiresAt) {
-		if _, err := f.decide(ctx, a, payload.Expired, "", now); err != nil {
-			return "", err
-		}
-		return "这张卡已经过期了", nil
 	}
 	outcome := payload.Rejected
 	if c.Approve {
 		outcome = payload.Approved
 	}
-	decided, err := f.decide(ctx, a, outcome, c.User, now)
-	if err != nil {
+	d, decided, err := f.decide(ctx, a.ID, outcome, c.User)
+	switch {
+	case err != nil:
 		return "", err
-	}
-	if !decided {
+	case !decided:
 		return "这张卡已经处理过了", nil
+	case d.Status == payload.Expired:
+		return "这张卡已经过期了", nil
 	}
 	return "", nil
 }
@@ -173,44 +188,53 @@ func outcomeName(outcome string) string {
 	}
 }
 
-// decide moves a from pending to outcome, by `by` at now, and queues the
-// outcome for a's client in the same transaction, signed when approved;
-// then it updates the card. It reports whether a was still pending.
-func (f *Flow) decide(ctx context.Context, a store.Approval, outcome, by string, now time.Time) (bool, error) {
-	m := payload.Message{Type: payload.Approval, ApprovalID: a.ID, Agent: a.Agent, Outcome: outcome, Approver: by, Text: a.Summary}
-	if outcome == payload.Approved {
-		c := Content{
-			ApprovalID: a.ID, ParamsSHA256: sha256.Sum256(a.Action), TargetMachine: a.Client, TargetAgent: a.Agent,
-			Approver: by, ApprovedAt: now, ExpiresAt: now.Add(f.ttl()), Nonce: a.Nonce,
+// decide moves the approval with id from pending to outcome, by `by`, and
+// queues the outcome for the client in the same transaction. The state
+// and the clock are read under the write lock: an approval found expired
+// there expires instead, whatever was asked, and the signature, on an
+// approval, is made only in the transaction that takes it, so two
+// approvers clicking at once make one signature. It returns what was
+// decided and whether the approval was still pending.
+func (f *Flow) decide(ctx context.Context, id, outcome, by string) (d store.Decision, decided bool, err error) {
+	decided, err = f.Store.DecideApproval(ctx, id, func(tx *store.Hub, a store.Approval) (store.Decision, error) {
+		now := f.now()
+		if expired := !now.Before(a.ExpiresAt); expired {
+			outcome, by = payload.Expired, ""
+		} else if outcome == payload.Expired {
+			return store.Decision{}, nil
 		}
-		doc, err := json.Marshal(Approval{Content: c, Signature: Sign(f.Key, c)})
+		d = store.Decision{Status: outcome, By: by, At: now}
+		m := payload.Message{Type: payload.Approval, ApprovalID: a.ID, Agent: a.Agent, Outcome: outcome, Approver: by, Text: a.Summary}
+		if outcome == payload.Approved {
+			c := Content{
+				ApprovalID: a.ID, ParamsSHA256: sha256.Sum256(a.Action), TargetMachine: a.Client, TargetAgent: a.Agent,
+				Approver: by, ApprovedAt: now, ExpiresAt: now.Add(f.ttl()), Nonce: a.Nonce,
+			}
+			doc, err := json.Marshal(Approval{Content: c, Signature: sign(f.Key, c)})
+			if err != nil {
+				return store.Decision{}, err
+			}
+			m.Approval = doc
+		}
+		b, err := json.Marshal(m)
 		if err != nil {
-			return false, err
+			return store.Decision{}, err
 		}
-		m.Approval = doc
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return false, err
-	}
-	decided, err := f.Store.DecideApproval(ctx, a.ID, outcome, by, now, func(tx *store.Hub) error {
-		_, err := tx.Outbox.Enqueue(ctx, a.Client, b)
-		return err
+		_, err = tx.Outbox.Enqueue(ctx, a.Client, b)
+		return d, err
 	})
 	if err != nil || !decided {
-		return false, err
+		return store.Decision{}, false, err
 	}
 	if f.Stored != nil {
 		f.Stored()
 	}
-	a.Status, a.DecidedBy, a.DecidedAt = outcome, by, now
-	f.finishCard(ctx, a)
-	return true, nil
+	return d, true, nil
 }
 
 // finishCard makes a's card show its outcome and records that it does. A
-// card Slack does not update now is left for Run to try again; a card
-// that is gone from Slack has nothing to show.
+// card Slack does not update now is left for the next Pass; a card that
+// is gone from Slack has nothing to show.
 func (f *Flow) finishCard(ctx context.Context, a store.Approval) {
 	err := f.Slack.UpdateCard(ctx, a.Channel, a.TS, card(a))
 	if errors.Is(err, slack.ErrNotFound) {
@@ -233,7 +257,22 @@ func card(a store.Approval) slack.Card {
 	return c
 }
 
-// Run sweeps every Interval until ctx is done. It must be called once.
+// Nudge tells Run that there is a card to finish or a hint to deliver.
+// It never blocks.
+func (f *Flow) Nudge() {
+	select {
+	case f.nudgeCh() <- struct{}{}:
+	default:
+	}
+}
+
+func (f *Flow) nudgeCh() chan struct{} {
+	f.nudgeOnce.Do(func() { f.nudge = make(chan struct{}, 1) })
+	return f.nudge
+}
+
+// Run sweeps every Interval, and when nudged, until ctx is done. It must
+// be called once.
 func (f *Flow) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		if err := f.Pass(ctx); err != nil && ctx.Err() == nil {
@@ -241,6 +280,7 @@ func (f *Flow) Run(ctx context.Context) {
 		}
 		t := time.NewTimer(f.interval())
 		select {
+		case <-f.nudgeCh():
 		case <-t.C:
 		case <-ctx.Done():
 		}
@@ -249,8 +289,9 @@ func (f *Flow) Run(ctx context.Context) {
 }
 
 // Pass expires every pending approval past its expiry, sending the
-// outcome down, and updates every decided card that does not show its
-// outcome yet.
+// outcome down, updates every decided card that does not show its
+// outcome yet, and delivers the hints clicks left. A hint Slack does not
+// take is logged and dropped.
 func (f *Flow) Pass(ctx context.Context) error {
 	pending, err := f.Store.PendingApprovals(ctx)
 	if err != nil {
@@ -259,7 +300,7 @@ func (f *Flow) Pass(ctx context.Context) error {
 	now := f.now()
 	for _, a := range pending {
 		if !now.Before(a.ExpiresAt) {
-			if _, err := f.decide(ctx, a, payload.Expired, "", now); err != nil {
+			if _, _, err := f.decide(ctx, a.ID, payload.Expired, ""); err != nil {
 				return err
 			}
 		}
@@ -270,6 +311,15 @@ func (f *Flow) Pass(ctx context.Context) error {
 	}
 	for _, a := range unfinished {
 		f.finishCard(ctx, a)
+	}
+	f.mu.Lock()
+	hints := f.hints
+	f.hints = nil
+	f.mu.Unlock()
+	for _, h := range hints {
+		if err := f.Slack.Whisper(ctx, h.channel, h.user, h.text); err != nil {
+			slog.Warn("approval: telling the clicker why the click did not count", "user", h.user, "err", err)
+		}
 	}
 	return nil
 }

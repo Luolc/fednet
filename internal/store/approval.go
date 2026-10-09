@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -98,28 +99,55 @@ func (h *Hub) approvals(ctx context.Context, where string, args ...any) ([]Appro
 	return as, rows.Err()
 }
 
-// DecideApproval moves the approval with id from Pending to status, as
-// decided by `by` at `at`, and runs handle against a Hub bound to the same
-// transaction, so that the outcome and what handle queues commit together.
-// An approval that is not Pending is left alone, handle does not run, and
-// DecideApproval reports false: of two decisions, only the first takes.
-func (h *Hub) DecideApproval(ctx context.Context, id, status, by string, at time.Time, handle func(tx *Hub) error) (decided bool, err error) {
+// Decision is how an approval ends: Status is the outcome, By who decided
+// (empty for an expiry) and At when. A Decision with an empty Status
+// leaves the approval as it is.
+type Decision struct {
+	Status, By string
+	At         time.Time
+}
+
+// DecideApproval decides the approval with id, in one transaction that
+// holds the database's write lock from its start: it reads the approval,
+// and if that is still Pending runs decide against it and a Hub bound to
+// the same transaction, then records the Decision decide returns, so the
+// outcome and what decide queues commit together, and decide sees the
+// state no other decision can change under it. An approval that is not
+// Pending, or a Decision with an empty Status, leaves it alone and
+// reports false: of two decisions, only the first takes.
+func (h *Hub) DecideApproval(ctx context.Context, id string, decide func(tx *Hub, a Approval) (Decision, error)) (decided bool, err error) {
 	err = h.transact(ctx, func(tx *Hub) error {
-		res, err := tx.db.ExecContext(ctx,
-			"UPDATE approval SET status = ?, decided_by = ?, decided_at = ? WHERE approval_id = ? AND status = ?",
-			status, by, at.UnixNano(), id, Pending)
+		a, err := tx.Approval(ctx, id)
 		if err != nil {
 			return err
 		}
-		n, err := res.RowsAffected()
-		if err != nil || n == 0 {
+		if a.Status != Pending {
+			return nil
+		}
+		d, err := decide(tx, a)
+		if err != nil {
+			return err
+		}
+		if d.Status == "" {
+			return errNoDecision
+		}
+		if _, err := tx.db.ExecContext(ctx,
+			"UPDATE approval SET status = ?, decided_by = ?, decided_at = ? WHERE approval_id = ? AND status = ?",
+			d.Status, d.By, d.At.UnixNano(), id, Pending); err != nil {
 			return err
 		}
 		decided = true
-		return handle(tx)
+		return nil
 	})
+	if errors.Is(err, errNoDecision) {
+		err = nil
+	}
 	return decided && err == nil, err
 }
+
+// errNoDecision rolls back a DecideApproval whose decide returned no
+// Decision, so that nothing it queued stays.
+var errNoDecision = errors.New("store: no decision")
 
 // MarkCardFinal records that the card of the approval with id shows its
 // outcome.

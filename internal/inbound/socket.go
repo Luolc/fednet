@@ -138,7 +138,8 @@ func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 	return r.Handle(ctx, ev)
 }
 
-// handleInteractive hands each press on an approval card's button to
+// handleInteractive hands each press on an approval card's button, told
+// by its action id and the block id the card gives its buttons, to
 // r.Click; any other interaction is not the hub's business.
 func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
 	cb, ok := data.(slackgo.InteractionCallback)
@@ -149,7 +150,7 @@ func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
 	// name it at the top level instead.
 	channel, ts := cmp.Or(cb.Container.ChannelID, cb.Channel.ID), cmp.Or(cb.Container.MessageTs, cb.Message.Timestamp)
 	for _, a := range cb.ActionCallback.BlockActions {
-		if a.ActionID != slack.ApproveAction && a.ActionID != slack.RejectAction {
+		if (a.ActionID != slack.ApproveAction && a.ActionID != slack.RejectAction) || a.BlockID != slack.CardBlockID(a.Value) {
 			continue
 		}
 		c := slack.Click{ID: a.Value, Approve: a.ActionID == slack.ApproveAction, User: cb.User.ID, Bot: cb.User.IsBot, Channel: channel, TS: ts}

@@ -180,6 +180,11 @@ const (
 	RejectAction  = "reject"
 )
 
+// CardBlockID is the id of the block the buttons of the card for the
+// approval with id are in; a click reports it, so a button from
+// elsewhere carrying the same value is told apart.
+func CardBlockID(id string) string { return "approval:" + id }
+
 // ThreadKey is how fednet names a thread: its channel and the ts of its
 // first message, joined by a slash.
 func ThreadKey(channel, ts string) string { return channel + "/" + ts }
