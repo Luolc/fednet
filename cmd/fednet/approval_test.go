@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -100,6 +101,47 @@ func TestApprovalVerify(t *testing.T) {
 			t.Errorf("used file after the refused run = %q", used)
 		}
 	})
+	t.Run("used file without a final newline", func(t *testing.T) {
+		s, a := setupApproval(t, priv, pub, nil)
+		os.WriteFile(s.used, []byte("previous-id"), 0o600)
+		if code, _, errOut := verify(t, s.args(a)); code != 0 {
+			t.Fatalf("first run: exit %d, stderr %q", code, errOut)
+		}
+		if used, _ := os.ReadFile(s.used); string(used) != "previous-id\napr-7\n" {
+			t.Errorf("used file = %q, want previous-id and apr-7 on their own lines", used)
+		}
+		if code, _, _ := verify(t, s.args(a)); code != exitUsed {
+			t.Errorf("second run: exit %d, want %d", code, exitUsed)
+		}
+	})
+	t.Run("expires while waiting for the lock", func(t *testing.T) {
+		expiry := time.Now().Add(200 * time.Millisecond)
+		s, a := setupApproval(t, priv, pub, func(c *approval.Content) { c.ExpiresAt = expiry })
+		held, err := os.OpenFile(s.used, os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan int, 1)
+		go func() {
+			code, _, _ := verify(t, s.args(a))
+			done <- code
+		}()
+		select {
+		case code := <-done:
+			t.Fatalf("verify returned %d while the used file was locked", code)
+		case <-time.After(time.Until(expiry) + 50*time.Millisecond):
+		}
+		held.Close()
+		if code := <-done; code != exitExpired {
+			t.Errorf("exit %d, want %d", code, exitExpired)
+		}
+		if used, _ := os.ReadFile(s.used); len(used) != 0 {
+			t.Errorf("used file = %q, want empty", used)
+		}
+	})
 	t.Run("action changed", func(t *testing.T) {
 		s, a := setupApproval(t, priv, pub, nil)
 		action, _ := os.ReadFile(s.action)
@@ -109,8 +151,8 @@ func TestApprovalVerify(t *testing.T) {
 		if code != exitMismatch || !strings.Contains(errOut, "hashes to") {
 			t.Errorf("exit %d, stderr %q; want %d", code, errOut, exitMismatch)
 		}
-		if _, err := os.Stat(s.used); !os.IsNotExist(err) {
-			t.Error("a refused approval was recorded as used")
+		if used, _ := os.ReadFile(s.used); len(used) != 0 {
+			t.Errorf("used file = %q after a refused approval, want empty", used)
 		}
 	})
 	t.Run("other machine", func(t *testing.T) {

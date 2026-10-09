@@ -99,6 +99,31 @@ func TestVerifyRejectsChangedField(t *testing.T) {
 	}
 }
 
+// An instant 2^64 nanoseconds later has the same UnixNano, which is how a
+// nanosecond-only encoding let an expiry be moved past now with the
+// signature intact.
+func TestEncodeDistinguishesWrappedNanoseconds(t *testing.T) {
+	pub, priv := keyPair(t)
+	c := sample()
+	sig := Sign(priv, c)
+	for name, at := range map[string]*time.Time{"approved_at": &c.ApprovedAt, "expires_at": &c.ExpiresAt} {
+		t.Run(name, func(t *testing.T) {
+			moved := sample()
+			field := map[string]*time.Time{"approved_at": &moved.ApprovedAt, "expires_at": &moved.ExpiresAt}[name]
+			*field = time.Unix(at.Unix()+18446744073, int64(at.Nanosecond())+709551616).UTC()
+			if field.UnixNano() != at.UnixNano() {
+				t.Fatalf("the moved time does not share UnixNano: %d != %d", field.UnixNano(), at.UnixNano())
+			}
+			if bytes.Equal(moved.Encode(), c.Encode()) {
+				t.Fatal("the moved time encodes the same")
+			}
+			if err := Verify(pub, moved, sig, c.ApprovedAt); !errors.Is(err, ErrBadSignature) {
+				t.Errorf("Verify = %v, want ErrBadSignature", err)
+			}
+		})
+	}
+}
+
 // Moving bytes across a field boundary, or into an empty field, changes the
 // encoding: fields are length-prefixed, not concatenated.
 func TestEncodeFieldBoundaries(t *testing.T) {

@@ -87,7 +87,9 @@ type Approval struct {
 
 // Encode returns the canonical bytes the signature covers: a format tag,
 // then every field of c, each preceded by its length as 4 bytes big-endian.
-// Times are their Unix nanoseconds as 8 bytes big-endian.
+// A time is its Unix seconds as 8 bytes big-endian followed by its
+// nanoseconds as 4 bytes big-endian, so that no two instants encode the
+// same; a single nanosecond count would wrap after 584 years.
 func (c Content) Encode() []byte {
 	var b []byte
 	field := func(v []byte) {
@@ -95,7 +97,8 @@ func (c Content) Encode() []byte {
 		b = append(b, v...)
 	}
 	at := func(t time.Time) []byte {
-		return binary.BigEndian.AppendUint64(nil, uint64(t.UnixNano()))
+		v := binary.BigEndian.AppendUint64(nil, uint64(t.Unix()))
+		return binary.BigEndian.AppendUint32(v, uint32(t.Nanosecond()))
 	}
 	field([]byte("fednet approval v1"))
 	field([]byte(c.ApprovalID))

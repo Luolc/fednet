@@ -39,8 +39,10 @@ func approvalCommand(args []string, stdout io.Writer) error {
 // expired, that this machine and agent are its target, that the action file
 // hashes to what was approved, and that the approval has not been used
 // before; then it records the approval_id as used. The used file is locked
-// while it is checked and appended, so two executors with the same approval
-// cannot both pass.
+// before the checks start and until the id is appended, so two executors
+// with the same approval cannot both pass, and the clock is read only once
+// the lock is held, so an approval that expires while waiting for the lock
+// is refused.
 func approvalVerify(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet approval verify", flag.ContinueOnError)
 	pubPath := fs.String("pubkey", "", "file holding the hub's public key, one ssh-ed25519 line (required)")
@@ -67,6 +69,11 @@ func approvalVerify(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	used, err := lockUsed(*usedPath)
+	if err != nil {
+		return err
+	}
+	defer used.Close()
 	switch err := approval.Verify(pub, a.Content, a.Signature, time.Now()); {
 	case errors.Is(err, approval.ErrBadSignature):
 		return exitError{exitBadSignature, err}
@@ -81,7 +88,7 @@ func approvalVerify(args []string, stdout io.Writer) error {
 	if sum := sha256.Sum256(action); sum != [sha256.Size]byte(a.ParamsSHA256) {
 		return exitError{exitMismatch, fmt.Errorf("%s hashes to %x, the approval is for %x", *actionPath, sum, a.ParamsSHA256[:])}
 	}
-	if err := markUsed(*usedPath, a.ApprovalID); err != nil {
+	if err := markUsed(used, a.ApprovalID); err != nil {
 		return err
 	}
 	_, err = fmt.Fprintf(stdout, "%s approved by %s, expires %s\n", a.ApprovalID, a.Approver, a.ExpiresAt.Format(time.RFC3339))
@@ -108,29 +115,48 @@ func readApproval(path string) (approval.Approval, error) {
 	return a, nil
 }
 
-// markUsed appends id to the used file at path, unless it is already there,
-// which is an exitUsed failure. The file is locked from the check to the
-// append.
-func markUsed(path, id string) error {
+// lockUsed opens the used file at path, creating it if missing, and takes
+// an exclusive lock on it that lasts until the file is closed.
+func lockUsed(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer f.Close()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock %s: %w", path, err)
+		f.Close()
+		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
+	return f, nil
+}
+
+// markUsed appends id as a line of the locked used file f, unless it is
+// already there, which is an exitUsed failure. A last line left without its
+// newline, by a hand edit or an interrupted write, gets one first, so the
+// new id never runs into it.
+func markUsed(f *os.File, id string) error {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		if sc.Text() == id {
-			return exitError{exitUsed, fmt.Errorf("approval %s was already used (listed in %s)", id, path)}
+			return exitError{exitUsed, fmt.Errorf("approval %s was already used (listed in %s)", id, f.Name())}
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return fmt.Errorf("read %s: %w", f.Name(), err)
 	}
-	if _, err := f.WriteString(id + "\n"); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+	line := id + "\n"
+	if fi, err := f.Stat(); err != nil {
+		return err
+	} else if fi.Size() > 0 {
+		end := make([]byte, 1)
+		if _, err := f.ReadAt(end, fi.Size()-1); err != nil {
+			return fmt.Errorf("read %s: %w", f.Name(), err)
+		}
+		if end[0] != '\n' {
+			line = "\n" + line
+		}
+	}
+	if _, err := f.WriteString(line); err != nil {
+		return fmt.Errorf("write %s: %w", f.Name(), err)
 	}
 	return f.Close()
 }
