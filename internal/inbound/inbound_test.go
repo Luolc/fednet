@@ -414,7 +414,7 @@ func TestHandleRepliesInAgentThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Store.Claim(ctx, "C2/"+ts, "workstation"); err != nil {
+	if err := r.Store.Claim(ctx, "C2/"+ts, "workstation", ""); err != nil {
 		t.Fatal(err)
 	}
 	reply := post(t, f, "C2", slack.Message{User: "U1", Text: "noted", ThreadTS: ts})
@@ -429,19 +429,52 @@ func TestHandleRepliesInAgentThread(t *testing.T) {
 	}
 }
 
-// noPurpose is a Slack whose Purpose fails.
-type noPurpose struct{ slack.API }
+// noChannelInfo is a Slack whose ChannelInfo fails.
+type noChannelInfo struct{ slack.API }
 
-func (noPurpose) Purpose(context.Context, string) (string, error) { return "", errors.New("flaky") }
+func (noChannelInfo) ChannelInfo(context.Context, string) (slack.ChannelInfo, error) {
+	return slack.ChannelInfo{}, errors.New("flaky")
+}
 
-func TestHandleWithoutPurpose(t *testing.T) {
+func TestHandleWithoutChannelInfo(t *testing.T) {
 	r, f := newReceiver(t)
-	r.Slack = noPurpose{f}
+	f.RenameChannel("C1", "example-one")
+	r.Slack = noChannelInfo{f}
 	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
 	got := queued(t, r.Store, "workstation")
 	want := []payload.Message{{Type: payload.Inbound, Thread: "C1/1.1", Text: hey + "first", User: "U1", UserName: "maintainer", TS: "1.1", Trigger: payload.Mention}}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("queued when the purpose cannot be read = %+v, want %+v", got, want)
+		t.Fatalf("queued when the channel's name and purpose cannot be read = %+v, want %+v", got, want)
+	}
+}
+
+// The message that hands a thread over carries the channel's name as
+// Slack has it then, and every reply in the thread carries the same name,
+// even after the channel is renamed; a thread owned with no name recorded
+// and a direct message carry none.
+func TestHandleChannelName(t *testing.T) {
+	r, f := newReceiver(t)
+	f.RenameChannel("C1", "example-one")
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
+	f.RenameChannel("C1", "example-renamed")
+	handle(t, r, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	handle(t, r, message("Ev3", "C1", "1.3", "", hey+"second"))
+	if err := r.Store.Claim(t.Context(), "C1/1.4", "workstation", ""); err != nil {
+		t.Fatal(err)
+	}
+	handle(t, r, message("Ev4", "C1", "1.5", "1.4", "in a thread with no name"))
+	// Slack gives a direct message no name; one is set here so that a
+	// direct message carrying it would show.
+	f.RenameChannel("D1", "a-dm")
+	dm := message("Ev5", "D1", "2.1", "", "psst")
+	dm.IM = true
+	handle(t, r, dm)
+	var got []string
+	for _, m := range queued(t, r.Store, "workstation") {
+		got = append(got, m.Trigger+":"+m.ChannelName)
+	}
+	if want := []string{"mention:example-one", "reply:example-one", "mention:example-renamed", "reply:", "dm:"}; !slices.Equal(got, want) {
+		t.Fatalf("triggers and channel names = %q, want %q", got, want)
 	}
 }
 
@@ -582,51 +615,42 @@ func posts(t *testing.T, h *store.Hub) []string {
 	return ps
 }
 
-func TestHandleNoMachineTellsThread(t *testing.T) {
+func TestHandleNoMachine(t *testing.T) {
 	ctx := t.Context()
 	r, f := newReceiver(t)
 	ts, err := f.Start("C3", "U1", hey+"anyone?")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Chatter that mentions nobody is not answered.
-	handle(t, r, message("Ev0", "C3", "0.9", "", "anyone?"))
-	if got := posts(t, r.Store); len(got) != 0 {
-		t.Fatalf("hub inbox after a message that mentions nobody = %q, want nothing", got)
-	}
+	// A mention in a channel no machine takes is recorded, once, but not
+	// answered: the hub's inbox stays empty and so does the thread.
 	ev := message("Ev1", "C3", ts, "", hey+"anyone?")
 	handle(t, r, ev)
 	handle(t, r, ev)
-	// The hub's answer is a post in its inbox, once, that the outbound
-	// side delivers like any other post, under the hub's name.
-	if got, want := posts(t, r.Store), []string{HubName + "/C3/" + ts + "/" + NoMachineText}; !slices.Equal(got, want) {
-		t.Fatalf("hub inbox = %q, want %q", got, want)
+	if got := posts(t, r.Store); len(got) != 0 {
+		t.Fatalf("hub inbox after a mention no machine takes = %q, want nothing", got)
 	}
 	if err := (&outbound.Poster{Store: r.Store, Slack: f}).Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ms, err := f.Replies(ctx, "C3", ts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ms) != 2 || ms[1].Text != NoMachineText || f.Machine(ms[1].TS) != HubName {
-		t.Fatalf("thread after a message no machine takes = %+v, want one reply from the hub saying so", ms)
+	if ms, err := f.Replies(ctx, "C3", ts); err != nil || len(ms) != 1 {
+		t.Fatalf("thread after a mention no machine takes = %+v, %v; want only the mention", ms, err)
 	}
 	if _, err := r.Store.Owner(ctx, "C3/"+ts); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Owner: err = %v, want ErrNotFound", err)
 	}
 	// A reply in that thread is dropped quietly.
 	handle(t, r, message("Ev2", "C3", "9.9", ts, "still there?"))
-	if ms, _ := f.Replies(ctx, "C3", ts); len(ms) != 2 {
-		t.Fatalf("thread after a reply = %+v, want it unchanged", ms)
-	}
 	if got := all(t, r.Store); len(got) != 0 {
 		t.Fatalf("queued = %q, want nothing", got)
 	}
-	// A new direct message with no DM machine is told the same way.
+	// A new direct message with no DM machine is told so, by a post in
+	// the hub's inbox, once, that the outbound side delivers like any
+	// other post, under the hub's name.
 	r.Route.DM = ""
 	dm := message("Ev3", "D1", "5.1", "", "psst")
 	dm.IM = true
+	handle(t, r, dm)
 	handle(t, r, dm)
 	if got := posts(t, r.Store); !slices.Equal(got, []string{HubName + "/D1/5.1/" + NoMachineText}) {
 		t.Fatalf("hub inbox after a DM no machine takes = %q", got)
@@ -1427,25 +1451,25 @@ func TestBackfillFirstMentionInThread(t *testing.T) {
 	}
 }
 
-// purposeGate is a Slack whose Purpose waits, each call, until the test
+// infoGate is a Slack whose ChannelInfo waits, each call, until the test
 // releases it: entered gets a channel to close for each call.
-type purposeGate struct {
+type infoGate struct {
 	slack.API
 	entered chan chan struct{}
 }
 
-func (g *purposeGate) Purpose(ctx context.Context, channel string) (string, error) {
+func (g *infoGate) ChannelInfo(ctx context.Context, channel string) (slack.ChannelInfo, error) {
 	release := make(chan struct{})
 	select {
 	case g.entered <- release:
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return slack.ChannelInfo{}, ctx.Err()
 	}
 	select {
 	case <-release:
-		return g.API.Purpose(ctx, channel)
+		return g.API.ChannelInfo(ctx, channel)
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return slack.ChannelInfo{}, ctx.Err()
 	}
 }
 
@@ -1458,7 +1482,7 @@ func TestHandleConcurrentFirstMentions(t *testing.T) {
 	handle(t, r, root)
 	first := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first", ThreadTS: root.TS})
 	second := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "second", ThreadTS: root.TS})
-	g := &purposeGate{API: f, entered: make(chan chan struct{})}
+	g := &infoGate{API: f, entered: make(chan chan struct{})}
 	r.Slack = g
 	done := make(chan error, 2)
 	go func() { done <- r.Handle(t.Context(), first) }()

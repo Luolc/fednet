@@ -394,16 +394,16 @@ func (w *Web) Delete(ctx context.Context, channel, ts string) error {
 	})
 }
 
-func (w *Web) Purpose(ctx context.Context, channel string) (string, error) {
+func (w *Web) ChannelInfo(ctx context.Context, channel string) (ChannelInfo, error) {
 	var c *slackgo.Channel
 	err := w.call(ctx, "conversations.info", func() (err error) {
 		c, err = w.c.GetConversationInfoContext(ctx, &slackgo.GetConversationInfoInput{ChannelID: channel})
 		return err
 	})
 	if err != nil {
-		return "", err
+		return ChannelInfo{}, err
 	}
-	return c.Purpose.Value, nil
+	return ChannelInfo{Name: c.Name, Purpose: c.Purpose.Value}, nil
 }
 
 func (w *Web) SetPurpose(ctx context.Context, channel, purpose string) error {

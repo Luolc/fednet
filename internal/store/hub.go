@@ -84,6 +84,11 @@ CREATE INDEX approval_status ON approval (status);
 -- How many parts of a split post are in Slack already, so that neither a
 -- retry nor another process posts them again.
 ALTER TABLE inbox ADD COLUMN parts_sent INTEGER NOT NULL DEFAULT 0;
+`, `
+-- The name of the channel a thread is in, as Slack gave it when the
+-- thread got its owner; empty when the hub could not read it, for a
+-- direct message, and for threads owned before this column existed.
+ALTER TABLE owner ADD COLUMN channel_name TEXT NOT NULL DEFAULT '';
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.
@@ -145,12 +150,13 @@ func (h *Hub) transact(ctx context.Context, f func(tx *Hub) error) error {
 // transaction: client becomes the owner of thread unless it already has one,
 // and payload is queued for whichever client the owner then is. It returns
 // that owner. Of several concurrent calls on a new thread, the first wins and
-// all of them queue for its client.
-func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client string, payload []byte) (owner string, d Downlink, err error) {
+// all of them queue for its client. channelName is recorded with the owner
+// it makes, as Claim records it.
+func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client, channelName string, payload []byte) (owner string, d Downlink, err error) {
 	err = h.transact(ctx, func(tx *Hub) error {
 		if _, err := tx.db.ExecContext(ctx,
-			"INSERT INTO owner (thread, client_id) VALUES (?, ?) ON CONFLICT (thread) DO NOTHING",
-			thread, client); err != nil {
+			"INSERT INTO owner (thread, client_id, channel_name) VALUES (?, ?, ?) ON CONFLICT (thread) DO NOTHING",
+			thread, client, channelName); err != nil {
 			return err
 		}
 		if err := tx.db.QueryRowContext(ctx, "SELECT client_id FROM owner WHERE thread = ?", thread).Scan(&owner); err != nil {
@@ -167,8 +173,10 @@ func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client string, payloa
 
 // Claim makes client the owner of thread, a thread that has just been
 // started and has no owner yet; it fails if thread already has one.
-func (h *Hub) Claim(ctx context.Context, thread, client string) error {
-	_, err := h.db.ExecContext(ctx, "INSERT INTO owner (thread, client_id) VALUES (?, ?)", thread, client)
+// channelName, the name of the thread's channel, is recorded with the
+// owner and stays with the thread whoever owns it later.
+func (h *Hub) Claim(ctx context.Context, thread, client, channelName string) error {
+	_, err := h.db.ExecContext(ctx, "INSERT INTO owner (thread, client_id, channel_name) VALUES (?, ?, ?)", thread, client, channelName)
 	return err
 }
 
@@ -223,6 +231,17 @@ func (h *Hub) Owner(ctx context.Context, thread string) (string, error) {
 		return "", ErrNotFound
 	}
 	return client, err
+}
+
+// ChannelName returns the channel name recorded with thread's owner, or
+// ErrNotFound when thread has no owner.
+func (h *Hub) ChannelName(ctx context.Context, thread string) (string, error) {
+	var name string
+	err := h.db.QueryRowContext(ctx, "SELECT channel_name FROM owner WHERE thread = ?", thread).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return name, err
 }
 
 // Registration is a client's row in the hub's registry.

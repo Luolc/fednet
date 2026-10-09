@@ -42,20 +42,21 @@ func New(hub *store.Hub, cfg Config) *Router {
 }
 
 // RouteNew queues payload, the message that starts thread in channel, for
-// the channel's default machine, which becomes the thread's owner. If thread
-// already has an owner, payload goes to that owner instead. It returns the
-// client the message was queued for.
-func (r *Router) RouteNew(ctx context.Context, channel, thread string, payload []byte) (string, error) {
-	return r.routeNew(ctx, r.cfg.Defaults[channel], thread, payload)
+// the channel's default machine, which becomes the thread's owner, with
+// channelName, the channel's name, recorded along. If thread already has an
+// owner, payload goes to that owner instead. It returns the client the
+// message was queued for.
+func (r *Router) RouteNew(ctx context.Context, channel, channelName, thread string, payload []byte) (string, error) {
+	return r.routeNew(ctx, r.cfg.Defaults[channel], channelName, thread, payload)
 }
 
 // RouteNewDM is RouteNew for a thread in a direct message conversation,
-// which the DM client takes.
+// which the DM client takes; it has no channel name.
 func (r *Router) RouteNewDM(ctx context.Context, thread string, payload []byte) (string, error) {
-	return r.routeNew(ctx, r.cfg.DM, thread, payload)
+	return r.routeNew(ctx, r.cfg.DM, "", thread, payload)
 }
 
-func (r *Router) routeNew(ctx context.Context, def, thread string, payload []byte) (string, error) {
+func (r *Router) routeNew(ctx context.Context, def, channelName, thread string, payload []byte) (string, error) {
 	if def == "" {
 		client, err := r.RouteReply(ctx, thread, payload)
 		if errors.Is(err, ErrNoOwner) {
@@ -63,7 +64,7 @@ func (r *Router) routeNew(ctx context.Context, def, thread string, payload []byt
 		}
 		return client, err
 	}
-	client, _, err := r.hub.ClaimAndEnqueue(ctx, thread, def, payload)
+	client, _, err := r.hub.ClaimAndEnqueue(ctx, thread, def, channelName, payload)
 	return client, err
 }
 
