@@ -56,11 +56,13 @@ const Timeout = 10 * time.Second
 // when escaped as a JSON string.
 const maxRequestBytes = 6*link.MaxPayload + 1024
 
-// Listen creates the socket at path. A socket there that no one listens on
-// is left over from a client that stopped, and is replaced; a client still
-// listening on it keeps it, and Listen fails. Without group
-// only this Unix user can connect (mode 0600); with group, members of that
-// group can too (mode 0660), and this user must be a member of it.
+// Listen creates the socket at path. Only one client at a time owns a path:
+// Listen takes an exclusive lock on path + ".lock" and holds it until the
+// listener is closed or the process exits, and fails if another client
+// holds it. A socket already at path is then left over from a client that
+// stopped, and is replaced; any other file there makes Listen fail. Without
+// group only this Unix user can connect (mode 0600); with group, members of
+// that group can too (mode 0660), and this user must be a member of it.
 func Listen(path, group string) (net.Listener, error) {
 	mode, gid := os.FileMode(0o600), -1
 	if group != "" {
@@ -73,7 +75,44 @@ func Listen(path, group string) (net.Listener, error) {
 		}
 		mode = 0o660
 	}
-	if err := checkFree(path); err != nil {
+	lock, err := os.OpenFile(lockPath(path), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("local: another client is using %s", path)
+		}
+		return nil, err
+	}
+	ln, err := listen(path, mode, gid)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return &listener{Listener: ln, lock: lock}, nil
+}
+
+func lockPath(path string) string { return path + ".lock" }
+
+// listener is the socket's listener; closing it releases the lock.
+type listener struct {
+	net.Listener
+	lock *os.File
+}
+
+func (l *listener) Close() error {
+	err := l.Listener.Close()
+	l.lock.Close()
+	return err
+}
+
+// listen creates the socket at path; the caller holds the lock.
+func listen(path string, mode os.FileMode, gid int) (net.Listener, error) {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode().Type() != os.ModeSocket {
+		return nil, fmt.Errorf("local: %s exists and is not a socket", path)
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	// The socket is created in a private directory and moved into place
@@ -94,30 +133,6 @@ func Listen(path, group string) (net.Listener, error) {
 		return nil, err
 	}
 	return ln, nil
-}
-
-// checkFree returns nil if path does not exist or is a socket no one
-// listens on.
-func checkFree(path string) error {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if fi.Mode().Type() != os.ModeSocket {
-		return fmt.Errorf("local: %s exists and is not a socket", path)
-	}
-	conn, err := net.Dial("unix", path)
-	if err == nil {
-		conn.Close()
-		return fmt.Errorf("local: another client is listening on %s", path)
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) {
-		return nil
-	}
-	return err
 }
 
 func setup(tmp, path string, mode os.FileMode, gid int) error {

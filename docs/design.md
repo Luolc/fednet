@@ -28,7 +28,7 @@ fednet 不是：
 
 认证在 [`internal/auth`](../internal/auth)。client 自己生成 256 bit 的随机凭证，存在本机一个只有所有者能读 (0600) 的文件里，连同 client id 一起；hub 只登记它的 SHA-256。每个请求带 `Authorization: Bearer <凭证>` 和 `Fednet-Version`，hub 算哈希、与登记表常数时间比对，并记下版本；未登记、已退役、凭证不对的一律回 401，正文固定是 `unauthorized`，原因只进 hub 的日志，凭证不进日志、错误信息和任何命令的输出。登记 (`fednet hub register`) 写入 id 与哈希，重复登记替换哈希并解除退役；退役 (`fednet hub revoke`) 让这台 client 的凭证失效，已经建立的连接要到断开才生效。Tailscale `WhoIs` 核对来源节点还没有接。
 
-本机 socket 在 [`internal/local`](../internal/local)。agent 拿不到 client 的凭证，只能经这个 socket 把请求交给常驻的 client 进程。socket 的路径由参数给出；不给组时权限是 0600，只有 client 所在的 Unix 用户能连，给了组 (`-socket-group`) 时是 0660，组里的用户也能连。socket 先建在一个只有 client 用户能进的临时目录里，权限和组设好后再改名到给定的路径。路径上已有 socket 时先连一下：连得上说明另一个 client 还在监听，这个 client 就不启动；连接被拒绝说明是旧进程留下的，替换掉。路径上是别的文件时也不启动。一个连接只承载一个请求：调用方写一个 JSON 请求，按 `cmd` 字段分派，client 回一个 JSON 回应后关闭连接。目前只有 `post`：client 把消息写进 outbox 就回 `msg_id`，不等 hub，hub 连不上也照样排队。`fednet client post` 只连 socket，不打开数据库；它的退出码是 0 成功、2 用法错误或请求不合法、3 没有权限连 socket、4 连不上 client，其它失败是 1。client 与 hub 之间的 payload 是一个 JSON 对象，`type` 字段说明它是什么，格式在 [`internal/payload`](../internal/payload)，两端共用；post 的 payload 带线程 key 和正文。
+本机 socket 在 [`internal/local`](../internal/local)。agent 拿不到 client 的凭证，只能经这个 socket 把请求交给常驻的 client 进程。socket 的路径由参数给出；不给组时权限是 0600，只有 client 所在的 Unix 用户能连，给了组 (`-socket-group`) 时是 0660，组里的用户也能连。socket 先建在一个只有 client 用户能进的临时目录里，权限和组设好后再改名到给定的路径。一个路径同一时间只归一个 client：启动时先对 socket 旁边的 `<socket>.lock` 加排他的 `flock`，拿不到就不启动，拿到后一直持有到进程退出 (进程死了由内核释放)。检查和改名都在持锁之后，所以路径上已有的 socket 一定是旧进程留下的，直接替换；路径上是别的文件时不启动。一个连接只承载一个请求：调用方写一个 JSON 请求，按 `cmd` 字段分派，client 回一个 JSON 回应后关闭连接。目前只有 `post`：client 把消息写进 outbox 就回 `msg_id`，不等 hub，hub 连不上也照样排队。`fednet client post` 只连 socket，不打开数据库；它的退出码是 0 成功、2 用法错误或请求不合法、3 没有权限连 socket、4 连不上 client，其它失败是 1。client 与 hub 之间的 payload 是一个 JSON 对象，`type` 字段说明它是什么，格式在 [`internal/payload`](../internal/payload)，两端共用；post 的 payload 带线程 key 和正文。
 
 ## 3. 不变量
 
@@ -61,7 +61,7 @@ fednet 不是：
 本机 socket：
 
 18. `post` 写进 client 的 outbox 就返回 `msg_id`；hub 连不上时照样返回，连上后送到 hub。[`TestPost`](../internal/local/local_test.go)、[`TestPostWhileHubDown`](../internal/local/local_test.go)
-19. socket 不给组时只有 client 的用户能连 (0600)，给了组时组里的用户也能连 (0660)。同一个路径上已有 client 在监听时，第二个 client 起不来，socket 仍归第一个；没人监听的旧 socket 被替换，别的文件不被替换。[`TestListen`](../internal/local/local_test.go)、[`TestListenRefusesAFile`](../internal/local/local_test.go)
+19. socket 不给组时只有 client 的用户能连 (0600)，给了组时组里的用户也能连 (0660)。同一个路径同一时间只归一个 client：已有 client 持锁时 (包括它还没发布 socket 的时候) 第二个 client 起不来，几个 client 同时启动只有一个成功，连接都进它；持锁的 client 关闭后新 client 能接手；旧 socket 被替换，别的文件不被替换。[`TestListen`](../internal/local/local_test.go)、[`TestListenWhileAnotherIsStarting`](../internal/local/local_test.go)、[`TestListenConcurrent`](../internal/local/local_test.go)、[`TestListenRefusesAFile`](../internal/local/local_test.go)
 20. agent 经 `fednet client post` 发的消息，hub 的 inbox 收到时 `type` 是 `post`，线程 key 和正文不变。[`TestHubAndClient`](../cmd/fednet/main_test.go)
 21. `fednet client post` 用法错误退 2，没有权限连 socket 退 3，连不上 client 退 4。[`TestRun`](../cmd/fednet/main_test.go)、[`TestPostDenied`](../cmd/fednet/main_test.go)
 

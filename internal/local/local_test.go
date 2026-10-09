@@ -3,6 +3,8 @@ package local
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -205,7 +207,8 @@ func TestListen(t *testing.T) {
 	}
 	ln.Close()
 
-	// With a group this user belongs to, other than its primary group if it
+	// Once the first client has closed, a new one takes the path over; it
+	// uses a group this user belongs to, other than its primary group if it
 	// has one, so that the group visibly changes.
 	gid := os.Getgid()
 	if gids, err := os.Getgroups(); err == nil {
@@ -226,8 +229,8 @@ func TestListen(t *testing.T) {
 	}
 	defer ln.Close()
 	checkMode(t, path, 0o660, gid)
-	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 1 {
-		t.Fatalf("dir holds %v, %v; want only the socket", entries, err)
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 2 {
+		t.Fatalf("dir holds %v, %v; want only the socket and its lock", entries, err)
 	}
 }
 
@@ -253,5 +256,75 @@ func TestListenRefusesAFile(t *testing.T) {
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "not a socket" {
 		t.Fatalf("file now holds %q, %v", b, err)
+	}
+}
+
+// A client that holds the lock but has not published its socket yet, as
+// one does between taking the lock and the rename, keeps the path: another
+// Listen fails and publishes nothing.
+func TestListenWhileAnotherIsStarting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fednet.sock")
+	lock, err := os.OpenFile(lockPath(path), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if ln, err := Listen(path, ""); err == nil {
+		ln.Close()
+		t.Fatal("Listen succeeded while another client held the lock")
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Lstat(%s) = %v; want nothing published", path, err)
+	}
+}
+
+// Of several clients starting on one path at once, exactly one gets it.
+func TestListenConcurrent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fednet.sock")
+	const n = 8
+	start := make(chan struct{})
+	results := make(chan net.Listener, n)
+	for range n {
+		go func() {
+			<-start
+			ln, err := Listen(path, "")
+			if err != nil {
+				ln = nil
+			}
+			results <- ln
+		}()
+	}
+	close(start)
+	var won []net.Listener
+	for range n {
+		if ln := <-results; ln != nil {
+			won = append(won, ln)
+		}
+	}
+	for _, ln := range won {
+		defer ln.Close()
+	}
+	if len(won) != 1 {
+		t.Fatalf("%d of %d concurrent Listen calls succeeded, want 1", len(won), n)
+	}
+	// Connections to the path reach the one that won.
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := won[0].Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("the winner did not get the connection: %v", err)
 	}
 }
