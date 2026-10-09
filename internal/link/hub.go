@@ -30,7 +30,10 @@ type Hub struct {
 	mu       sync.Mutex
 	seen     map[string]time.Time
 	sessions map[string]*session
-	wg       sync.WaitGroup
+	closed   bool
+	// wg counts registered sessions; register adds under mu, so no session
+	// is added once Close has started waiting.
+	wg sync.WaitGroup
 }
 
 // DefaultLease is the Lease used when Hub.Lease is zero.
@@ -71,6 +74,9 @@ func (h *Hub) Handler() http.Handler {
 
 // Send queues payload for client and pushes it if client is connected.
 func (h *Hub) Send(ctx context.Context, client string, payload []byte) (store.Downlink, error) {
+	if len(payload) > MaxPayload {
+		return store.Downlink{}, ErrPayloadTooBig
+	}
 	d, err := h.Store.Outbox.Enqueue(ctx, client, payload)
 	if err != nil {
 		return d, err
@@ -103,9 +109,11 @@ func (h *Hub) heartbeat(client string) {
 	h.seen[client] = time.Now()
 }
 
-// Close drops every open downlink connection and waits for their handlers.
+// Close drops every open downlink connection, refuses new ones, and waits
+// for the dropped connections' handlers.
 func (h *Hub) Close() {
 	h.mu.Lock()
+	h.closed = true
 	for _, s := range h.sessions {
 		s.conn.CloseNow()
 	}
@@ -113,10 +121,16 @@ func (h *Hub) Close() {
 	h.wg.Wait()
 }
 
+// errClosed is returned by register after Close.
+var errClosed = errors.New("hub closed")
+
 // register makes s the client's session, dropping any earlier one.
-func (h *Hub) register(client string, s *session) {
+func (h *Hub) register(client string, s *session) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed {
+		return errClosed
+	}
 	if old := h.sessions[client]; old != nil {
 		old.conn.CloseNow()
 	}
@@ -124,6 +138,8 @@ func (h *Hub) register(client string, s *session) {
 		h.sessions = make(map[string]*session)
 	}
 	h.sessions[client] = s
+	h.wg.Add(1)
+	return nil
 }
 
 func (h *Hub) unregister(client string, s *session) {
@@ -132,6 +148,7 @@ func (h *Hub) unregister(client string, s *session) {
 	if h.sessions[client] == s {
 		delete(h.sessions, client)
 	}
+	h.wg.Done()
 }
 
 func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
@@ -140,8 +157,6 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	h.wg.Add(1)
-	defer h.wg.Done()
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OnPingReceived: func(context.Context, []byte) bool {
 			h.heartbeat(client)
@@ -152,10 +167,13 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
-	h.heartbeat(client)
 	s := &session{conn: conn, wake: make(chan struct{}, 1)}
-	h.register(client, s)
+	if err := h.register(client, s); err != nil {
+		conn.Close(websocket.StatusGoingAway, err.Error())
+		return
+	}
 	defer h.unregister(client, s)
+	h.heartbeat(client)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -210,7 +228,7 @@ func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var u uplink
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUplinkBytes)).Decode(&u); err != nil || u.MsgID == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFrameBytes)).Decode(&u); err != nil || u.MsgID == "" {
 		http.Error(w, "bad uplink body", http.StatusBadRequest)
 		return
 	}
@@ -221,6 +239,3 @@ func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// maxUplinkBytes bounds one uplink request body.
-const maxUplinkBytes = 1 << 20

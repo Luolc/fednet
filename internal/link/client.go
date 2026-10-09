@@ -32,6 +32,9 @@ type Client struct {
 	Heartbeat time.Duration
 	// Backoff paces reconnects and uplink retries. Zero means DefaultBackoff.
 	Backoff Backoff
+	// Timeout bounds one dial and one uplink request. Zero means
+	// DefaultTimeout.
+	Timeout time.Duration
 	// HTTPClient is used for both links. Nil means http.DefaultClient.
 	HTTPClient *http.Client
 
@@ -42,7 +45,10 @@ type Client struct {
 }
 
 // Defaults for the zero fields of Client.
-const DefaultHeartbeat = 10 * time.Second
+const (
+	DefaultHeartbeat = 10 * time.Second
+	DefaultTimeout   = 30 * time.Second
+)
 
 // DefaultBackoff is the Backoff used when Client.Backoff is zero.
 var DefaultBackoff = Backoff{Min: time.Second, Max: time.Minute}
@@ -61,6 +67,13 @@ func (c *Client) backoff() Backoff {
 	return c.Backoff
 }
 
+func (c *Client) timeout() time.Duration {
+	if c.Timeout == 0 {
+		return DefaultTimeout
+	}
+	return c.Timeout
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient == nil {
 		return http.DefaultClient
@@ -75,6 +88,9 @@ func (c *Client) header() http.Header {
 // Post queues payload for the hub and returns its msg_id. The message is
 // sent by Run, now if it is running, otherwise when it next starts.
 func (c *Client) Post(ctx context.Context, payload []byte) (string, error) {
+	if len(payload) > MaxPayload {
+		return "", ErrPayloadTooBig
+	}
 	id, err := c.Store.Outbox.Enqueue(ctx, payload)
 	if err != nil {
 		return "", err
@@ -128,11 +144,14 @@ func (c *Client) downlink(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	url := "ws" + strings.TrimPrefix(c.Hub, "http") + DownlinkPath
-	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPClient: c.httpClient(), HTTPHeader: c.header()})
+	dctx, cancelDial := context.WithTimeout(ctx, c.timeout())
+	conn, _, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: c.httpClient(), HTTPHeader: c.header()})
+	cancelDial()
 	if err != nil {
 		return err
 	}
 	defer conn.CloseNow()
+	conn.SetReadLimit(maxFrameBytes)
 
 	errc := make(chan error, 2)
 	go func() { errc <- c.ping(ctx, conn) }()
@@ -213,6 +232,8 @@ func (c *Client) send(ctx context.Context, m store.Message) error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Hub+UplinkPath, bytes.NewReader(body))
 	if err != nil {
 		return err

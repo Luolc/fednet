@@ -8,6 +8,8 @@ package link
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"math/rand/v2"
 	"time"
 )
@@ -22,6 +24,18 @@ const (
 
 // ClientHeader carries the client's id on every request to the hub.
 const ClientHeader = "Fednet-Client"
+
+// MaxPayload is the largest payload either link carries. Send and Post
+// refuse anything larger, so a queued message always fits the frame and
+// request limits on the other side.
+const MaxPayload = 256 << 10
+
+// maxFrameBytes bounds a downlink frame and an uplink request body: the
+// base64 of MaxPayload plus the other fields.
+var maxFrameBytes = int64(base64.StdEncoding.EncodedLen(MaxPayload) + 256)
+
+// ErrPayloadTooBig is returned by Send and Post for a payload over MaxPayload.
+var ErrPayloadTooBig = errors.New("link: payload over MaxPayload")
 
 // downlink is a frame the hub sends on the WebSocket: one queued message.
 type downlink struct {
