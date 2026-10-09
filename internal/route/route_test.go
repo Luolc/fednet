@@ -33,24 +33,33 @@ func queued(t *testing.T, h *store.Hub, client string) []string {
 	return ps
 }
 
-func route(t *testing.T, r *Router, channel, thread, payload string) string {
+func routeNew(t *testing.T, r *Router, channel, thread, payload string) string {
 	t.Helper()
-	client, err := r.Route(t.Context(), channel, thread, []byte(payload))
+	client, err := r.RouteNew(t.Context(), channel, thread, []byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return client
 }
 
-// No client is connected in these tests: Route queues regardless, and the
-// messages wait in the outbox.
+func routeReply(t *testing.T, r *Router, thread, payload string) string {
+	t.Helper()
+	client, err := r.RouteReply(t.Context(), thread, []byte(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// No client is connected in these tests: messages are queued regardless and
+// wait in the outbox.
 func TestRoute(t *testing.T) {
 	ctx := t.Context()
 	h := openHub(t)
 	r := New(h, Config{Defaults: map[string]string{"dev": "workstation", "data": "datamachine"}})
 
 	// A new thread goes to its channel's default machine, which becomes the owner.
-	if got := route(t, r, "data", "t1", "first"); got != "datamachine" {
+	if got := routeNew(t, r, "data", "t1", "first"); got != "datamachine" {
 		t.Fatalf("new thread in data went to %q, want datamachine", got)
 	}
 	if owner, err := h.Owner(ctx, "t1"); err != nil || owner != "datamachine" {
@@ -59,7 +68,7 @@ func TestRoute(t *testing.T) {
 
 	// A reply goes to the owner even after the channel's default changes.
 	r = New(h, Config{Defaults: map[string]string{"data": "workstation"}})
-	if got := route(t, r, "data", "t1", "reply"); got != "datamachine" {
+	if got := routeReply(t, r, "t1", "reply"); got != "datamachine" {
 		t.Fatalf("reply in t1 went to %q, want the owner datamachine", got)
 	}
 	if got := queued(t, h, "datamachine"); len(got) != 2 || got[1] != "reply" {
@@ -70,16 +79,27 @@ func TestRoute(t *testing.T) {
 	if err := h.Reassign(ctx, "t1", "workstation"); err != nil {
 		t.Fatal(err)
 	}
-	if got := route(t, r, "data", "t1", "after"); got != "workstation" {
+	if got := routeReply(t, r, "t1", "after"); got != "workstation" {
 		t.Fatalf("reply after Reassign went to %q, want workstation", got)
 	}
 
-	// A channel with no default machine takes nothing.
-	if _, err := r.Route(ctx, "random", "t2", []byte("x")); !errors.Is(err, ErrNoMachine) {
-		t.Fatalf("Route in a channel with no default: err = %v, want ErrNoMachine", err)
+	// A new thread in a channel with no default machine goes nowhere.
+	if _, err := r.RouteNew(ctx, "random", "t2", []byte("x")); !errors.Is(err, ErrNoMachine) {
+		t.Fatalf("RouteNew in a channel with no default: err = %v, want ErrNoMachine", err)
 	}
 	if _, err := h.Owner(ctx, "t2"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Owner(t2) err = %v, want ErrNotFound", err)
+	}
+
+	// A reply in a thread with no owner goes nowhere, not to the default machine.
+	if _, err := r.RouteReply(ctx, "t3", []byte("x")); !errors.Is(err, ErrNoOwner) {
+		t.Fatalf("RouteReply in a thread with no owner: err = %v, want ErrNoOwner", err)
+	}
+	if _, err := h.Owner(ctx, "t3"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Owner(t3) err = %v, want ErrNotFound", err)
+	}
+	if got := queued(t, h, "workstation"); len(got) != 1 {
+		t.Fatalf("queued for workstation = %v, want only [after]", got)
 	}
 }
 
@@ -95,7 +115,7 @@ func TestRouteConcurrentFirstMessages(t *testing.T) {
 	var wg sync.WaitGroup
 	for i, r := range routers {
 		wg.Go(func() {
-			client, err := r.Route(t.Context(), "dev", "t1", []byte("m"))
+			client, err := r.RouteNew(t.Context(), "dev", "t1", []byte("m"))
 			if err != nil {
 				t.Error(err)
 			}

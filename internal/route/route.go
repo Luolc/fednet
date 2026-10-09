@@ -9,9 +9,13 @@ import (
 	"github.com/Luolc/fednet/internal/store"
 )
 
-// ErrNoMachine is returned for a thread with no owner in a channel that has
-// no default machine. The message is not queued anywhere.
+// ErrNoMachine is returned for a new thread in a channel that has no
+// default machine. The message is not queued anywhere.
 var ErrNoMachine = errors.New("route: no machine takes this channel")
+
+// ErrNoOwner is returned for a reply in a thread that has no owner, such as
+// one started before fednet. The message is not queued anywhere.
+var ErrNoOwner = errors.New("route: thread has no owner")
 
 // Config is the routing part of the hub's configuration.
 type Config struct {
@@ -19,7 +23,9 @@ type Config struct {
 	Defaults map[string]string
 }
 
-// Router queues the messages people post in threads.
+// Router queues the messages people post in threads. A message is queued
+// whether or not its client is connected; it waits in the outbox until the
+// client takes it.
 type Router struct {
 	hub *store.Hub
 	cfg Config
@@ -30,19 +36,25 @@ func New(hub *store.Hub, cfg Config) *Router {
 	return &Router{hub: hub, cfg: cfg}
 }
 
-// Route queues payload, posted in thread of channel, for the client that owns
-// the thread and returns that client. A thread with no owner goes to the
-// channel's default machine, which becomes its owner. The message is queued
-// whether or not the client is connected; it waits in the outbox until the
-// client takes it.
-func (r *Router) Route(ctx context.Context, channel, thread string, payload []byte) (string, error) {
+// RouteNew queues payload, the message that starts thread in channel, for
+// the channel's default machine, which becomes the thread's owner. If thread
+// already has an owner, payload goes to that owner instead. It returns the
+// client the message was queued for.
+func (r *Router) RouteNew(ctx context.Context, channel, thread string, payload []byte) (string, error) {
+	def, ok := r.cfg.Defaults[channel]
+	if !ok {
+		return "", ErrNoMachine
+	}
+	client, _, err := r.hub.ClaimAndEnqueue(ctx, thread, def, payload)
+	return client, err
+}
+
+// RouteReply queues payload, a reply in thread, for the thread's owner and
+// returns the owner.
+func (r *Router) RouteReply(ctx context.Context, thread string, payload []byte) (string, error) {
 	client, err := r.hub.Owner(ctx, thread)
 	if errors.Is(err, store.ErrNotFound) {
-		def, ok := r.cfg.Defaults[channel]
-		if !ok {
-			return "", ErrNoMachine
-		}
-		client, err = r.hub.ClaimOwner(ctx, thread, def)
+		return "", ErrNoOwner
 	}
 	if err != nil {
 		return "", err

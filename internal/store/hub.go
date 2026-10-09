@@ -57,25 +57,31 @@ func OpenHub(ctx context.Context, path string) (*Hub, error) {
 // Close closes the database.
 func (h *Hub) Close() error { return h.db.Close() }
 
-// ClaimOwner records client as the owner of thread if thread has no owner
-// yet, and returns the owner the thread ends up with. Of several concurrent
-// claims on a new thread, the first wins and all of them return its client.
-func (h *Hub) ClaimOwner(ctx context.Context, thread, client string) (string, error) {
+// ClaimAndEnqueue queues payload for the first message of thread, in one
+// transaction: client becomes the owner of thread unless it already has one,
+// and payload is queued for whichever client the owner then is. It returns
+// that owner. Of several concurrent calls on a new thread, the first wins and
+// all of them queue for its client.
+func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client string, payload []byte) (string, Downlink, error) {
 	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", Downlink{}, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO owner (thread, client_id) VALUES (?, ?) ON CONFLICT (thread) DO NOTHING",
 		thread, client); err != nil {
-		return "", err
+		return "", Downlink{}, err
 	}
 	var owner string
 	if err := tx.QueryRowContext(ctx, "SELECT client_id FROM owner WHERE thread = ?", thread).Scan(&owner); err != nil {
-		return "", err
+		return "", Downlink{}, err
 	}
-	return owner, tx.Commit()
+	d, err := enqueue(ctx, tx, owner, payload)
+	if err != nil {
+		return "", Downlink{}, err
+	}
+	return owner, d, tx.Commit()
 }
 
 // Reassign makes client the owner of thread, which must already have an
@@ -143,8 +149,17 @@ type HubOutbox struct{ db *sql.DB }
 
 // Enqueue queues payload for client under a new msg_id.
 func (o HubOutbox) Enqueue(ctx context.Context, client string, payload []byte) (Downlink, error) {
+	return enqueue(ctx, o.db, client, payload)
+}
+
+// execer is a *sql.DB or a *sql.Tx.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func enqueue(ctx context.Context, db execer, client string, payload []byte) (Downlink, error) {
 	d := Downlink{Message: Message{MsgID: newMsgID(), Payload: payload}}
-	res, err := o.db.ExecContext(ctx,
+	res, err := db.ExecContext(ctx,
 		"INSERT INTO outbox (client_id, msg_id, payload, enqueued_at) VALUES (?, ?, ?, ?)",
 		client, d.MsgID, payload, time.Now().UnixMilli())
 	if err != nil {

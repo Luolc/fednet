@@ -236,14 +236,22 @@ func TestOwner(t *testing.T) {
 	if err := h.Reassign(ctx, "t1", "a"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Reassign of a thread with no owner: err = %v, want ErrNotFound", err)
 	}
-	// The first claim wins; a later claim gets the existing owner back.
+	// The first claim wins; a later claim gets the existing owner back, and
+	// its message is queued for that owner.
 	for _, claim := range []string{"a", "b"} {
-		got, err := h.ClaimOwner(ctx, "t1", claim)
+		got, d, err := h.ClaimAndEnqueue(ctx, "t1", claim, []byte(claim))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got != "a" {
-			t.Fatalf("ClaimOwner(t1, %s) = %q, want a", claim, got)
+			t.Fatalf("ClaimAndEnqueue(t1, %s) = %q, want a", claim, got)
+		}
+		queued, err := h.Outbox.After(ctx, "a", d.Seq-1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(queued) != 1 || string(queued[0].Payload) != claim {
+			t.Fatalf("message of claim %s not queued for a: %v", claim, queued)
 		}
 	}
 	if err := h.Reassign(ctx, "t1", "b"); err != nil {
@@ -255,7 +263,7 @@ func TestOwner(t *testing.T) {
 
 	// ReassignClient moves only the threads of the given client.
 	for thread, client := range map[string]string{"t2": "b", "t3": "c"} {
-		if _, err := h.ClaimOwner(ctx, thread, client); err != nil {
+		if _, _, err := h.ClaimAndEnqueue(ctx, thread, client, []byte("x")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -273,7 +281,7 @@ func TestOwner(t *testing.T) {
 	}
 }
 
-func TestClaimOwnerConcurrent(t *testing.T) {
+func TestClaimAndEnqueueConcurrent(t *testing.T) {
 	ctx := t.Context()
 	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
 
@@ -282,7 +290,7 @@ func TestClaimOwnerConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for i, c := range clients {
 		wg.Go(func() {
-			owner, err := h.ClaimOwner(ctx, "t1", c)
+			owner, _, err := h.ClaimAndEnqueue(ctx, "t1", c, []byte(c))
 			if err != nil {
 				t.Error(err)
 			}
@@ -297,6 +305,29 @@ func TestClaimOwnerConcurrent(t *testing.T) {
 	}
 	if owner, err := h.Owner(ctx, "t1"); err != nil || owner != got[0] {
 		t.Fatalf("Owner(t1) = %q, %v; want %q", owner, err, got[0])
+	}
+	queued, err := h.Outbox.After(ctx, got[0], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != len(clients) {
+		t.Fatalf("owner %s has %d queued, want %d", got[0], len(queued), len(clients))
+	}
+}
+
+func TestClaimAndEnqueueAtomic(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	if _, err := h.db.ExecContext(ctx,
+		"CREATE TRIGGER fail BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'outbox write fails'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.ClaimAndEnqueue(ctx, "t1", "a", []byte("x")); err == nil {
+		t.Fatal("ClaimAndEnqueue with a failing outbox: err = nil")
+	}
+	// The failed enqueue leaves the thread unowned.
+	if _, err := h.Owner(ctx, "t1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Owner(t1) after a failed enqueue: err = %v, want ErrNotFound", err)
 	}
 }
 
