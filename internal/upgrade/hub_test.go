@@ -435,20 +435,31 @@ func TestUpgradeTo(t *testing.T) {
 }
 
 // slowRespond is a Fake whose Respond returns only when its context is
-// done.
-type slowRespond struct{ *slack.Fake }
+// done, reporting why on ended.
+type slowRespond struct {
+	*slack.Fake
+	ended chan error
+}
 
-func (slowRespond) Respond(ctx context.Context, _, _ string) error {
+func (s slowRespond) Respond(ctx context.Context, _, _ string) error {
 	<-ctx.Done()
+	s.ended <- ctx.Err()
 	return ctx.Err()
 }
 
 // Click returns, so that the press can be acked, without waiting for the
-// answer to the clicker to go out.
+// answer to the clicker to go out; the answer still on its way out when
+// Run stops is cancelled and waited for.
 func TestClickDoesNotWaitForTheResponse(t *testing.T) {
 	b := newBench(t)
-	b.h.Slack = slowRespond{b.sl}
-	b.run(t)
+	slow := slowRespond{b.sl, make(chan error, 1)}
+	b.h.Slack = slow
+	ctx, cancel := context.WithCancel(t.Context())
+	ran := make(chan struct{})
+	go func() {
+		defer close(ran)
+		b.h.Run(ctx)
+	}()
 	card := b.cmd(t, "U1", "upgrade").Card
 	done := make(chan struct{})
 	go func() {
@@ -462,6 +473,25 @@ func TestClickDoesNotWaitForTheResponse(t *testing.T) {
 	}
 	if s := b.next(t); !strings.Contains(s, "开始升级到 v0.2.0") {
 		t.Fatalf("the hub said %q", s)
+	}
+	select {
+	case err := <-slow.ended:
+		t.Fatalf("the response ended with %v before Run stopped", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	select {
+	case err := <-slow.ended:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the response ended with %v, want it cancelled", err)
+		}
+	default:
+		t.Fatal("Run returned while the response was still on its way out")
 	}
 }
 

@@ -91,6 +91,27 @@ type Hub struct {
 	// start carries the upgrades Click begins to Run.
 	start     chan rollout
 	startOnce sync.Once
+	// responses are the answers to clicks on their way out: Run cancels
+	// and waits for them when it returns; at most maxResponses at once.
+	responses     sync.WaitGroup
+	responseCtx   context.Context
+	stopResponses context.CancelFunc
+	responseOnce  sync.Once
+	inFlight      chan struct{}
+}
+
+// maxResponses is how many answers to clicks may be on their way out at
+// once; one more is dropped with a log line.
+const maxResponses = 16
+
+// responseContext returns the context the answers to clicks run under,
+// made on first use.
+func (h *Hub) responseContext() context.Context {
+	h.responseOnce.Do(func() {
+		h.responseCtx, h.stopResponses = context.WithCancel(context.Background())
+		h.inFlight = make(chan struct{}, maxResponses)
+	})
+	return h.responseCtx
 }
 
 // card is a confirmation `/fednet upgrade` showed and nobody has clicked.
@@ -257,9 +278,26 @@ func (h *Hub) upgrade(ctx context.Context, c slack.Command) (slack.CommandReply,
 // pressed by the admin the card was shown to while the card is still
 // good, starts the upgrade; the cancel button, or any press that does not
 // count, only tells the clicker. The clicker is told after Click returns,
-// so the press is acked in time whatever Slack's response URL does.
+// so the press is acked in time whatever Slack's response URL does; the
+// answer is cancelled and waited for when Run returns.
 func (h *Hub) Click(_ context.Context, c slack.Click) error {
-	go h.respond(c, h.click(c))
+	text := h.click(c)
+	if h.Slack == nil || c.ResponseURL == "" {
+		return nil
+	}
+	ctx := h.responseContext()
+	select {
+	case h.inFlight <- struct{}{}:
+	default:
+		slog.Warn("upgrade: too many answers to clicks on their way out, dropping one", "user", c.User)
+		return nil
+	}
+	h.responses.Add(1)
+	go func() {
+		defer h.responses.Done()
+		defer func() { <-h.inFlight }()
+		h.respond(ctx, c, text)
+	}()
 	return nil
 }
 
@@ -295,11 +333,8 @@ func (h *Hub) click(c slack.Click) string {
 // respond tells the clicker text through the click's response URL,
 // which replaces the card, within respondTimeout; a response that fails
 // is logged.
-func (h *Hub) respond(c slack.Click, text string) {
-	if h.Slack == nil || c.ResponseURL == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), respondTimeout)
+func (h *Hub) respond(ctx context.Context, c slack.Click, text string) {
+	ctx, cancel := context.WithTimeout(ctx, respondTimeout)
 	defer cancel()
 	if err := h.Slack.Respond(ctx, c.ResponseURL, text); err != nil {
 		slog.Warn("upgrade: answering the click", "user", c.User, "err", err)
@@ -328,8 +363,14 @@ func (h *Hub) tell(ctx context.Context, client, version string) error {
 
 // Run carries out the upgrades Click starts and, when Auto is set, looks
 // for a new release every Interval and upgrades to it, until ctx is done
-// or the hub has handed off. It must be called once.
+// or the hub has handed off; then it cancels the answers to clicks still
+// on their way out and waits for them. It must be called once.
 func (h *Hub) Run(ctx context.Context) {
+	h.responseContext()
+	defer func() {
+		h.stopResponses()
+		h.responses.Wait()
+	}()
 	var tick <-chan time.Time
 	if h.Auto && release.IsRelease(h.Version) {
 		t := time.NewTicker(or(h.Interval, DefaultInterval))

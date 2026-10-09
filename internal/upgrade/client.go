@@ -29,7 +29,7 @@ type Client struct {
 	Alert func(ctx context.Context, text string) error
 
 	mu sync.Mutex
-	// alerted is the release the last alert was about.
+	// alerted is the release the last report that was queued was about.
 	alerted string
 }
 
@@ -68,13 +68,19 @@ func (c *Client) Notice(ctx context.Context, version string) {
 		return
 	}
 	slog.Warn("upgrade: the hub's notice could not be turned into a request", "to", m.Version, "err", err)
-	c.mu.Lock()
-	first := c.alerted != m.Version
-	c.alerted = m.Version
-	c.mu.Unlock()
-	if first && c.Alert != nil {
-		if aerr := c.Alert(ctx, fmt.Sprintf("cannot upgrade from %s to %s: %v", c.Version, m.Version, err)); aerr != nil {
-			slog.Warn("upgrade: reporting the failure to the hub", "err", aerr)
-		}
+	if c.Alert == nil {
+		return
 	}
+	// One report per release, counted once it is queued: a report that
+	// could not be queued is tried again on the next notice.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.alerted == m.Version {
+		return
+	}
+	if aerr := c.Alert(ctx, fmt.Sprintf("cannot upgrade from %s to %s: %v", c.Version, m.Version, err)); aerr != nil {
+		slog.Warn("upgrade: reporting the failure to the hub", "err", aerr)
+		return
+	}
+	c.alerted = m.Version
 }

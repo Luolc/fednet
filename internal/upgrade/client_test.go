@@ -66,4 +66,21 @@ func TestClientDivert(t *testing.T) {
 	if len(alerts) != 1 || !strings.Contains(alerts[0], "writing the request") {
 		t.Fatalf("alerts = %q, want one about the request that cannot be written", alerts)
 	}
+	// A report that could not be queued does not count: the next notice
+	// for the same release reports again; once queued, no more.
+	alerts, fail := nil, true
+	flaky := &Client{Version: "v0.1.0", Alert: func(_ context.Context, text string) error {
+		if fail {
+			return errors.New("outbox is read-only")
+		}
+		alerts = append(alerts, text)
+		return nil
+	}}
+	flaky.Divert(t.Context(), notice("v0.2.0"))
+	fail = false
+	flaky.Divert(t.Context(), notice("v0.2.0"))
+	flaky.Divert(t.Context(), notice("v0.2.0"))
+	if len(alerts) != 1 {
+		t.Fatalf("alerts = %q, want one once the report could be queued", alerts)
+	}
 }

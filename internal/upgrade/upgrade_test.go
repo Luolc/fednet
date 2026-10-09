@@ -254,4 +254,25 @@ func TestRequestFile(t *testing.T) {
 	if got := ReadResult(path); got != "" {
 		t.Fatalf("ReadResult reads the result twice: %q", got)
 	}
+	// A link planted where the result goes is replaced, not followed: the
+	// upgrader writing the result is root, the directory the service's.
+	target := filepath.Join(t.TempDir(), "binary")
+	if err := os.WriteFile(target, []byte("the binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, Result(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteResult(path, "ok v0.4.0"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "the binary" {
+		t.Fatalf("the link's target is %q after WriteResult, want it untouched", b)
+	}
+	if fi, err := os.Lstat(Result(path)); err != nil || fi.Mode().Type() != 0 {
+		t.Fatalf("the result is %v, %v; want a regular file", fi.Mode(), err)
+	}
+	if got := ReadResult(path); got != "ok v0.4.0" {
+		t.Fatalf("ReadResult = %q, want ok v0.4.0", got)
+	}
 }

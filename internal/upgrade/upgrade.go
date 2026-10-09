@@ -216,9 +216,30 @@ func Restore(path string) error {
 }
 
 // WriteResult writes what became of the request at path, for whoever
-// wrote the request to read: the text, in the file Result names.
+// wrote the request to read: the text, in the file Result names. The
+// upgrader runs as root in a directory the service's user can write, so
+// the text goes to a fresh file of its own, renamed over Result: a link
+// planted at Result is replaced, never followed.
 func WriteResult(path, text string) error {
-	return os.WriteFile(Result(path), []byte(text+"\n"), 0o644)
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".result-*")
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(text + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(f.Name(), 0o644)
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), Result(path))
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	return nil
 }
 
 // Result is the path the upgrader writes the outcome of the request at
@@ -274,9 +295,11 @@ func ReadRequest(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// The contents are not quoted: the file is the service user's, and the
+	// upgrader reading it is root.
 	v := strings.TrimSpace(string(b))
 	if !release.IsRelease(v) {
-		return "", fmt.Errorf("upgrade: the request at %s names %q, not a release", path, v)
+		return "", fmt.Errorf("upgrade: the request at %s does not name a release", path)
 	}
 	return v, nil
 }
