@@ -298,8 +298,8 @@ func (rc *rechecks) wrap(next identify) identify {
 }
 
 // changeAfterRecheck makes change from inside the next recheck of client's
-// open downlink, once that recheck has read the registry: the change lands
-// a full recheck interval before the following one. Then it forgets the
+// open downlink, once that recheck has read the registry: the following
+// recheck is not due for a full interval. Then it forgets the
 // identifications reported so far, so count sees only those that start
 // after the change.
 func (rc *rechecks) changeAfterRecheck(t *testing.T, client string, change func() error) {
@@ -369,8 +369,9 @@ func receives(t *testing.T, h *link.Hub, client string, frames <-chan []byte) bo
 // An open downlink is dropped by the first recheck that starts after its
 // client is revoked or re-registered with another credential; other
 // clients stay connected. Each change is made right after a recheck, so the
-// next recheck is a full interval later. The test counts rechecks instead
-// of timing them: how long one takes depends on how busy the machine is.
+// next recheck is not due for a full interval. The test counts rechecks
+// instead of timing them: how long one takes depends on how busy the
+// machine is.
 func TestRegistryChangeDropsConnection(t *testing.T) {
 	ctx := t.Context()
 	rc := newRechecks()
