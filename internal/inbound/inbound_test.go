@@ -1387,7 +1387,11 @@ func TestHandleChatterRootAfterReplyHandsOver(t *testing.T) {
 // A first mention posted while the hub was away is backfilled whether
 // the thread's first message mentioned the bot (the thread is owned) or
 // not (it is not, and the backfill finds the thread by its latest
-// reply); a thread started before the window is not read.
+// reply). A thread started before the window, with no owner, is not
+// read: Slack's history does not give its first message, so the hub
+// cannot find it, and the mention is neither sent nor hands the thread
+// over. That is the limit the design records as a known issue; the
+// person mentions the bot again.
 func TestBackfillFirstMentionInThread(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -1396,7 +1400,7 @@ func TestBackfillFirstMentionInThread(t *testing.T) {
 	}{
 		{"chatter root", slack.Message{User: "U1", Text: "chatter"}, true},
 		{"mentioned root", slack.Message{User: "U1", Text: hey + "first"}, true},
-		{"root before the window", slack.Message{TS: slackTS(epoch.Add(-2 * DefaultWindow)), User: "U1", Text: "long ago"}, false},
+		{"root before the window, the known limit", slack.Message{TS: slackTS(epoch.Add(-2 * DefaultWindow)), User: "U1", Text: "long ago"}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			r, f := newReceiver(t)
