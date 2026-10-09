@@ -50,21 +50,27 @@ type Request struct {
 	Channel string `json:"channel,omitempty"`
 	Text    string `json:"text,omitempty"`
 	User    string `json:"user,omitempty"`
+	// Agent, Requester and Action are the arguments of
+	// hubapi.RequestApproval.
+	Agent     string `json:"agent,omitempty"`
+	Requester string `json:"requester,omitempty"`
+	Action    []byte `json:"action,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
 // Kind says why when the reason is one of the Kind constants.
 type Response struct {
-	MsgID    string          `json:"msg_id,omitempty"`
-	Messages []slack.Message `json:"messages,omitempty"`
-	Text     string          `json:"text,omitempty"`
-	Thread   string          `json:"thread,omitempty"`
-	Threads  []string        `json:"threads,omitempty"`
-	Users    []hubapi.User   `json:"users,omitempty"`
-	Version  string          `json:"version,omitempty"`
-	PID      int             `json:"pid,omitempty"`
-	Error    string          `json:"error,omitempty"`
-	Kind     string          `json:"kind,omitempty"`
+	MsgID      string          `json:"msg_id,omitempty"`
+	Messages   []slack.Message `json:"messages,omitempty"`
+	Text       string          `json:"text,omitempty"`
+	Thread     string          `json:"thread,omitempty"`
+	Threads    []string        `json:"threads,omitempty"`
+	Users      []hubapi.User   `json:"users,omitempty"`
+	ApprovalID string          `json:"approval_id,omitempty"`
+	Version    string          `json:"version,omitempty"`
+	PID        int             `json:"pid,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Kind       string          `json:"kind,omitempty"`
 }
 
 // Why a request failed, for Response.Kind.
@@ -275,7 +281,7 @@ func (s *Server) handle(ctx context.Context, req Request) Response {
 		}
 		return s.post(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
-		hubapi.Users, hubapi.DM:
+		hubapi.Users, hubapi.DM, hubapi.RequestApproval:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
@@ -329,7 +335,8 @@ var kinds = []struct {
 
 // ask hands req to the hub and replies with the hub's answer.
 func (s *Server) ask(ctx context.Context, req Request) Response {
-	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User})
+	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User,
+		Agent: req.Agent, Requester: req.Requester, Action: req.Action})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -350,7 +357,7 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err := json.Unmarshal(answer, &reply); err != nil {
 		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
 	}
-	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users}
+	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An

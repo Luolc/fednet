@@ -77,7 +77,7 @@ func TestPost(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := payload.Message{Type: payload.Post, Thread: "C1/1700000000.000100", Text: "build is green"}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("payload = %+v, want %+v", got, want)
 	}
 }

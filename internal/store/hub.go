@@ -58,6 +58,29 @@ CREATE TABLE slack_state (
 	value TEXT NOT NULL
 );
 `, `
+-- The approvals agents requested: the request, the card in Slack, and
+-- how it ended. Times are Unix nanoseconds. status is pending until the
+-- approval is approved, rejected or expired; card_final is set once the
+-- card in Slack shows that.
+CREATE TABLE approval (
+	approval_id  TEXT PRIMARY KEY,
+	client_id    TEXT NOT NULL,
+	agent        TEXT NOT NULL,
+	requester    TEXT NOT NULL DEFAULT '',
+	summary      TEXT NOT NULL,
+	action       BLOB NOT NULL,
+	nonce        BLOB NOT NULL,
+	requested_at INTEGER NOT NULL,
+	expires_at   INTEGER NOT NULL,
+	channel      TEXT NOT NULL,
+	ts           TEXT NOT NULL,
+	status       TEXT NOT NULL DEFAULT 'pending',
+	decided_by   TEXT NOT NULL DEFAULT '',
+	decided_at   INTEGER NOT NULL DEFAULT 0,
+	card_final   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX approval_status ON approval (status);
+`, `
 -- How many parts of a split post are in Slack already, so that neither a
 -- retry nor another process posts them again.
 ALTER TABLE inbox ADD COLUMN parts_sent INTEGER NOT NULL DEFAULT 0;

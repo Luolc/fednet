@@ -1,6 +1,7 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,11 +10,13 @@ import (
 	"net/url"
 	"path"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	slackgo "github.com/slack-go/slack"
 )
@@ -333,5 +336,201 @@ func TestWebPostReplyAndDelete(t *testing.T) {
 	}
 	if rs[1].method != "chat.delete" || rs[1].form.Get("channel") != "C1" || rs[1].form.Get("ts") != "1.5" {
 		t.Fatalf("Delete sent %s %v", rs[1].method, rs[1].form)
+	}
+}
+
+// blocksJSON writes bs as JSON without escaping < and >, which Slack's
+// date and user tokens are made of.
+func blocksJSON(t *testing.T, bs []slackgo.Block) string {
+	t.Helper()
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(bs); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+// paramTexts returns the texts of the card's parameter blocks, in order.
+func paramTexts(t *testing.T, bs []slackgo.Block) []string {
+	t.Helper()
+	var texts []string
+	for _, b := range bs {
+		rt, ok := b.(*slackgo.RichTextBlock)
+		if !ok {
+			continue
+		}
+		pre, ok := rt.Elements[0].(*slackgo.RichTextPreformatted)
+		if !ok || len(pre.Elements) != 1 {
+			t.Fatalf("rich text block %+v, want one preformatted element with one text", rt)
+		}
+		texts = append(texts, pre.Elements[0].(*slackgo.RichTextSectionTextElement).Text)
+	}
+	return texts
+}
+
+// A pending card has the two buttons, each carrying the approval id; a
+// decided card has none and says how it ended. What the agent wrote goes
+// in plain text and preformatted blocks, as it is: backticks, stars and
+// angle brackets included, long parameters whole over several blocks.
+func TestCardBlocks(t *testing.T) {
+	params := "{\n  \"note\": \"```not a fence```\",\n  \"bucket\": \"*example-critical* <https://example.invalid|x>\"\n}"
+	c := Card{ID: "apr-1", Summary: "delete *b* <!channel>", Params: params, Machine: "workstation", Agent: "ops-*exec*", Requester: "<@U7>", Expires: time.Unix(1_760_000_000, 0)}
+	bs := blocks(c)
+	if len(bs) != fixedBlocks+1 {
+		t.Fatalf("%d blocks with one parameter block, want the %d fixed ones and it", len(bs), fixedBlocks)
+	}
+	actions, ok := bs[len(bs)-1].(*slackgo.ActionBlock)
+	if !ok || len(actions.Elements.ElementSet) != 2 {
+		t.Fatalf("pending card ends with %T, want an action block with two buttons", bs[len(bs)-1])
+	}
+	for i, want := range []string{ApproveAction, RejectAction} {
+		b, ok := actions.Elements.ElementSet[i].(*slackgo.ButtonBlockElement)
+		if !ok || b.ActionID != want || b.Value != "apr-1" {
+			t.Fatalf("button %d = %+v, want %s carrying apr-1", i, actions.Elements.ElementSet[i], want)
+		}
+	}
+	if actions.BlockID != CardBlockID("apr-1") {
+		t.Fatalf("buttons are in block %q, want %q", actions.BlockID, CardBlockID("apr-1"))
+	}
+	if got := paramTexts(t, bs); len(got) != 1 || got[0] != params {
+		t.Fatalf("parameter blocks = %q, want the parameters as they are", got)
+	}
+	// Everything the agent wrote is in a plain_text object, never in a
+	// mrkdwn one.
+	var plain, mrkdwn []string
+	for _, b := range bs {
+		sec, ok := b.(*slackgo.SectionBlock)
+		if !ok {
+			continue
+		}
+		objs := sec.Fields
+		if sec.Text != nil {
+			objs = append(objs, sec.Text)
+		}
+		for _, o := range objs {
+			if o.Type == slackgo.PlainTextType {
+				plain = append(plain, o.Text)
+			} else {
+				mrkdwn = append(mrkdwn, o.Text)
+			}
+		}
+	}
+	for _, want := range []string{c.Summary, c.Machine, c.Agent, c.Requester} {
+		if !slices.Contains(plain, want) {
+			t.Errorf("plain text objects %q lack %q", plain, want)
+		}
+		for _, m := range mrkdwn {
+			if strings.Contains(m, want) {
+				t.Errorf("mrkdwn object %q carries what the agent wrote, %q", m, want)
+			}
+		}
+	}
+	text := blocksJSON(t, bs)
+	if !strings.Contains(text, "<!date^1760000000^") || !strings.Contains(text, "apr-1") {
+		t.Errorf("pending card %s lacks the expiry token or the id", text)
+	}
+
+	c.Outcome, c.Approver, c.DecidedAt = "approved", "U1", time.Unix(1_760_000_100, 0)
+	bs = blocks(c)
+	if _, ok := bs[len(bs)-1].(*slackgo.ActionBlock); ok {
+		t.Fatal("decided card still has buttons")
+	}
+	text = blocksJSON(t, bs)
+	if !strings.Contains(text, "已批准") || !strings.Contains(text, "<@U1>") || !strings.Contains(text, "<!date^1760000100^") {
+		t.Errorf("approved card %s does not say approved by U1 at the time", text)
+	}
+	c.Outcome, c.Approver = "rejected", "U2"
+	if text = blocksJSON(t, blocks(c)); !strings.Contains(text, "已拒绝") || !strings.Contains(text, "<@U2>") {
+		t.Errorf("rejected card %s does not say rejected by U2", text)
+	}
+	c.Outcome, c.Approver = "expired", ""
+	if text = blocksJSON(t, blocks(c)); !strings.Contains(text, "已过期") {
+		t.Errorf("expired card %s does not say expired", text)
+	}
+
+	c.Params = strings.Repeat("é", ParamChunk) + "<&>"
+	got := paramTexts(t, blocks(c))
+	if len(got) != 2 || strings.Join(got, "") != c.Params || utf8.RuneCountInString(got[0]) != ParamChunk {
+		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the parameters, the first %d characters", len(got), strings.Join(got, ""), ParamChunk)
+	}
+	// The largest parameters that fit make exactly the largest message
+	// Slack takes, pending or decided, with or without a requester; the
+	// Fake refuses one block more, as Slack would.
+	c.Params = strings.Repeat("x", MaxParamChunks*ParamChunk)
+	for _, outcome := range []string{"", "approved"} {
+		c.Outcome = outcome
+		if n := len(blocks(c)); n != maxBlocks {
+			t.Fatalf("largest card (outcome %q) has %d blocks, want %d", outcome, n, maxBlocks)
+		}
+	}
+	f := &Fake{}
+	f.AddChannel("C9", "")
+	if _, err := f.PostCard(context.Background(), "C9", c); err != nil {
+		t.Fatalf("the Fake refused the largest card: %v", err)
+	}
+	c.Params += "x"
+	if _, err := f.PostCard(context.Background(), "C9", c); err == nil {
+		t.Fatal("the Fake took a card of more blocks than Slack does")
+	}
+}
+
+// ParamBlocks fits at most MaxParamChunks blocks of ParamChunk characters
+// each; one character more does not fit; a character is never split.
+func TestParamBlocks(t *testing.T) {
+	exact := strings.Repeat("x", MaxParamChunks*ParamChunk)
+	if chunks, ok := ParamBlocks(exact); !ok || len(chunks) != MaxParamChunks {
+		t.Fatalf("ParamBlocks(exact) = %d blocks, %v; want %d, true", len(chunks), ok, MaxParamChunks)
+	}
+	if _, ok := ParamBlocks(exact + "x"); ok {
+		t.Fatal("ParamBlocks(exact + 1) fits")
+	}
+	chunks, _ := ParamBlocks(strings.Repeat("x", ParamChunk-1) + "éy")
+	if len(chunks) != 2 || chunks[1] != "y" || !utf8.ValidString(chunks[0]) {
+		t.Fatalf("ParamBlocks around a two-byte character = %q, want it whole in the first block", chunks)
+	}
+	if chunks, ok := ParamBlocks(""); !ok || len(chunks) != 1 || chunks[0] != "" {
+		t.Fatalf("ParamBlocks(\"\") = %q, %v; want one empty block", chunks, ok)
+	}
+}
+
+// PostCard, UpdateCard and Whisper call chat.postMessage, chat.update and
+// chat.postEphemeral with the card's blocks and the summary as the text.
+func TestWebCards(t *testing.T) {
+	ctx := context.Background()
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "chat.postMessage", "chat.update":
+			return 200, `{"ok":true,"channel":"C9","ts":"1.5"}`
+		case "chat.postEphemeral":
+			return 200, `{"ok":true,"message_ts":"1.6"}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	c := Card{ID: "apr-1", Summary: "delete b", Params: `{"b":1}`, Machine: "workstation", Agent: "ops-exec", Expires: time.Unix(1_760_000_000, 0)}
+	if got, err := w.PostCard(ctx, "C9", c); err != nil || got != "1.5" {
+		t.Fatalf("PostCard = %q, %v; want 1.5", got, err)
+	}
+	c.Outcome, c.Approver, c.DecidedAt = "approved", "U1", time.Unix(1_760_000_100, 0)
+	if err := w.UpdateCard(ctx, "C9", "1.5", c); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Whisper(ctx, "C9", "U2", "你不在审批人名单上"); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := ts.got()
+	if len(rs) != 3 {
+		t.Fatalf("%d requests, want 3", len(rs))
+	}
+	post, update, whisper := rs[0], rs[1], rs[2]
+	if post.method != "chat.postMessage" || post.form.Get("channel") != "C9" || post.form.Get("text") != "delete b" || !strings.Contains(post.form.Get("blocks"), `"action_id":"approve"`) {
+		t.Errorf("PostCard sent %s %v, want a message in C9 with the buttons", post.method, post.form)
+	}
+	if update.method != "chat.update" || update.form.Get("channel") != "C9" || update.form.Get("ts") != "1.5" || strings.Contains(update.form.Get("blocks"), `"action_id"`) || !strings.Contains(update.form.Get("blocks"), "已批准") {
+		t.Errorf("UpdateCard sent %s %v, want an update of 1.5 in C9 without buttons", update.method, update.form)
+	}
+	if whisper.method != "chat.postEphemeral" || whisper.form.Get("channel") != "C9" || whisper.form.Get("user") != "U2" || whisper.form.Get("text") != "你不在审批人名单上" {
+		t.Errorf("Whisper sent %s %v, want an ephemeral message to U2 in C9", whisper.method, whisper.form)
 	}
 }

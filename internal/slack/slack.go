@@ -8,11 +8,13 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrNotFound is returned for a channel, thread or message Slack does not
@@ -78,7 +80,102 @@ type API interface {
 	// DM sends text to user as a direct message, which belongs to no
 	// thread.
 	DM(ctx context.Context, user, text string) error
+	// PostCard posts c in channel as a new message and returns its ts.
+	PostCard(ctx context.Context, channel string, c Card) (string, error)
+	// UpdateCard replaces the message at ts in channel with c.
+	UpdateCard(ctx context.Context, channel, ts string, c Card) error
+	// Whisper shows text in channel to user alone, as an ephemeral message.
+	Whisper(ctx context.Context, channel, user, text string) error
 }
+
+// Card is an approval card: what an agent asks leave to do, and, once
+// decided, how it ended. While Outcome is empty the card has an approve
+// and a reject button, each carrying ID; a decided card has no buttons.
+type Card struct {
+	// ID is the approval id; a click on a button reports it.
+	ID string
+	// Summary says what the action does; Params is the action's
+	// parameters, the JSON the agent handed in.
+	Summary string
+	Params  string
+	// Machine is who asked, as the hub authenticated it: the client id.
+	// Agent is the agent on it, and Requester the person it says it asks
+	// on behalf of; both are what the agent reported, shown as such and
+	// used by no check.
+	Machine   string
+	Agent     string
+	Requester string
+	// Expires is when the approval expires unless decided.
+	Expires time.Time
+	// Outcome is empty while the card waits, and otherwise one of the
+	// payload package's outcomes.
+	Outcome string
+	// Approver is the Slack user id of who approved or rejected.
+	Approver string
+	// DecidedAt is when Outcome was reached.
+	DecidedAt time.Time
+}
+
+// Click is a press on one of a card's buttons, as the interactive callback
+// reports it.
+type Click struct {
+	// ID is the approval id the button carried.
+	ID string
+	// Approve is set for the approve button, clear for the reject button.
+	Approve bool
+	// User is the Slack user id of who clicked; Bot is set when the user is
+	// a bot.
+	User string
+	Bot  bool
+	// Channel and TS locate the card.
+	Channel string
+	TS      string
+}
+
+// Limits of a card: Slack takes at most maxBlocks blocks in one message
+// and about 3000 characters in one text. The card has fixedBlocks blocks
+// besides the parameters (the header, the two labels, the summary, who
+// asks, the expiry with the id, and the buttons or the outcome), so the
+// parameters get the rest, ParamChunk characters each.
+const (
+	maxBlocks      = 50
+	fixedBlocks    = 7
+	ParamChunk     = 2900
+	MaxParamChunks = maxBlocks - fixedBlocks
+)
+
+// ParamBlocks splits params into the texts of the card's parameter
+// blocks, each at most ParamChunk characters, split between characters.
+// The blocks show the text as it is, so nothing is escaped. ok is false
+// when they would take more blocks than fit in one message, so that a
+// card either shows the whole parameters or is not posted. Empty params
+// take one empty block.
+func ParamBlocks(params string) (chunks []string, ok bool) {
+	var b strings.Builder
+	n := 0 // characters in b
+	for _, r := range params {
+		if n == ParamChunk {
+			chunks = append(chunks, b.String())
+			b.Reset()
+			n = 0
+		}
+		b.WriteRune(r)
+		n++
+	}
+	chunks = append(chunks, b.String())
+	return chunks, len(chunks) <= MaxParamChunks
+}
+
+// Action ids of a card's buttons.
+const (
+	ApproveAction = "approve"
+	RejectAction  = "reject"
+)
+
+// CardBlockID is the id of the block the buttons of the card for the
+// approval with id are in; a click reports it, so a button from
+// elsewhere carrying the same value is told apart.
+func CardBlockID(id string) string { return "approval:" + id }
 
 // ThreadKey is how fednet names a thread: its channel and the ts of its
 // first message, joined by a slash.
@@ -132,6 +229,10 @@ type Fake struct {
 	// machines maps the ts of each message PostReply posted to the machine
 	// it named.
 	machines map[string]string
+	// cards maps channel and ts, as a thread key, to the card there.
+	cards map[string]Card
+	// whispers maps a user to the ephemeral texts shown to them.
+	whispers map[string][]string
 	clock    int
 }
 
@@ -275,6 +376,7 @@ func (f *Fake) Delete(_ context.Context, channel, ts string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	delete(f.cards, ThreadKey(channel, ts))
 	if c.threads[ts] != nil {
 		delete(c.threads, ts)
 		return nil
@@ -326,4 +428,92 @@ func (f *Fake) DMs(user string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.dms[user]...)
+}
+
+// PostCard posts the card as a message from the user "fednet" whose text
+// is the card's summary, and keeps the card for Card. Like Slack, it
+// refuses a card of more than maxBlocks blocks, as Web would lay it out.
+func (f *Fake) PostCard(_ context.Context, channel string, c Card) (string, error) {
+	if err := fits(c); err != nil {
+		return "", err
+	}
+	ts, err := f.Add(channel, Message{User: "fednet", Text: c.Summary})
+	if err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cards == nil {
+		f.cards = make(map[string]Card)
+	}
+	f.cards[ThreadKey(channel, ts)] = c
+	return ts, nil
+}
+
+func (f *Fake) UpdateCard(_ context.Context, channel, ts string, c Card) error {
+	if err := fits(c); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.cards[ThreadKey(channel, ts)]; !ok {
+		return ErrNotFound
+	}
+	f.cards[ThreadKey(channel, ts)] = c
+	return nil
+}
+
+// fits is the check Slack would make on the card's blocks.
+func fits(c Card) error {
+	if n := len(blocks(c)); n > maxBlocks {
+		return fmt.Errorf("slack: the card has %d blocks, Slack takes at most %d", n, maxBlocks)
+	}
+	return nil
+}
+
+// Card returns the card at ts in channel as it is now, and whether there
+// is one.
+func (f *Fake) Card(channel, ts string) (Card, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.cards[ThreadKey(channel, ts)]
+	return c, ok
+}
+
+// Cards returns the cards in channel, oldest first, each with its ts.
+func (f *Fake) Cards(channel string) (ts []string, cards []Card) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, key := range slices.SortedFunc(maps.Keys(f.cards), func(a, b string) int {
+		_, ats, _ := ParseThreadKey(a)
+		_, bts, _ := ParseThreadKey(b)
+		return CompareTS(ats, bts)
+	}) {
+		ch, t, _ := ParseThreadKey(key)
+		if ch == channel {
+			ts = append(ts, t)
+			cards = append(cards, f.cards[key])
+		}
+	}
+	return ts, cards
+}
+
+func (f *Fake) Whisper(_ context.Context, channel, user, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.channels[channel]; !ok {
+		return ErrNotFound
+	}
+	if f.whispers == nil {
+		f.whispers = make(map[string][]string)
+	}
+	f.whispers[user] = append(f.whispers[user], text)
+	return nil
+}
+
+// Whispers returns the ephemeral texts shown to user, oldest first.
+func (f *Fake) Whispers(user string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.whispers[user]...)
 }

@@ -1,0 +1,590 @@
+package approval
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	_ "modernc.org/sqlite" // the store's driver, for a test that holds its lock
+
+	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/slack"
+	"github.com/Luolc/fednet/internal/store"
+)
+
+const action = `{"op": "delete", "bucket": "b"}`
+
+// testFlow is a Flow on a fresh store and a Fake Slack with the channel
+// "C9" for cards, U1 and U2 as approvers, and a clock the test moves.
+type testFlow struct {
+	*Flow
+	f    *slack.Fake
+	pub  ed25519.PublicKey
+	path string
+	now  time.Time
+	sent int
+}
+
+func newFlow(t *testing.T) *testFlow {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hub.db")
+	st, err := store.OpenHub(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	f := &slack.Fake{}
+	f.AddChannel("C9", "approvals")
+	pub, priv := keyPair(t)
+	tf := &testFlow{f: f, pub: pub, path: path, now: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
+	tf.Flow = &Flow{Store: st, Slack: f, Key: priv, Channel: "C9", Approvers: []string{"U1", "U2"},
+		Now: func() time.Time { return tf.now }, Stored: func() { tf.sent++ }}
+	return tf
+}
+
+// request asks for approval of action on behalf of requester and returns
+// the id and the card's ts.
+func (tf *testFlow) request(t *testing.T, requester string) (id, ts string) {
+	t.Helper()
+	id, err := tf.Request(t.Context(), "workstation", "ops-exec", requester, "delete bucket b", []byte(action))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tss, cards := tf.f.Cards("C9")
+	for i, c := range cards {
+		if c.ID == id {
+			return id, tss[i]
+		}
+	}
+	t.Fatalf("no card for %s in C9, cards = %+v", id, cards)
+	return "", ""
+}
+
+// click clicks as user and runs a Pass, which delivers the hint and
+// finishes the card as Run would.
+func (tf *testFlow) click(t *testing.T, id, ts, user string, approve bool) {
+	t.Helper()
+	tf.clickOnly(t, slack.Click{ID: id, Approve: approve, User: user, Channel: "C9", TS: ts})
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// clickOnly clicks without a Pass: what Click alone does.
+func (tf *testFlow) clickOnly(t *testing.T, c slack.Click) {
+	t.Helper()
+	if err := tf.Click(t.Context(), c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// outcomes returns the approval outcomes queued for client.
+func (tf *testFlow) outcomes(t *testing.T, client string) []payload.Message {
+	t.Helper()
+	ds, err := tf.Store.Outbox.After(t.Context(), client, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ms []payload.Message
+	for _, d := range ds {
+		var m payload.Message
+		if err := json.Unmarshal(d.Payload, &m); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, m)
+	}
+	return ms
+}
+
+func (tf *testFlow) card(t *testing.T, ts string) slack.Card {
+	t.Helper()
+	c, ok := tf.f.Card("C9", ts)
+	if !ok {
+		t.Fatalf("no card at %s", ts)
+	}
+	return c
+}
+
+// A request posts a card with the buttons; an approver's click signs the
+// approval, sends it to the client and makes the card final; a second
+// click on the same card changes nothing and only tells the clicker.
+func TestFlowApprove(t *testing.T) {
+	tf := newFlow(t)
+	id, ts := tf.request(t, "")
+	c := tf.card(t, ts)
+	if c.Outcome != "" || c.ID != id || c.Summary != "delete bucket b" || c.Params != action || c.Machine != "workstation" || c.Agent != "ops-exec" || !c.Expires.Equal(tf.now.Add(TTL)) {
+		t.Fatalf("card = %+v, want a pending card for %s expiring at %s", c, id, tf.now.Add(TTL))
+	}
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 0 {
+		t.Fatalf("outcomes before any click = %+v", ms)
+	}
+
+	// Both approvers click at once: one signature, one outcome.
+	tf.now = tf.now.Add(10 * time.Minute)
+	signatures := countSignatures(t)
+	var wg sync.WaitGroup
+	for _, user := range []string{"U1", "U2"} {
+		wg.Go(func() {
+			if err := tf.Click(t.Context(), slack.Click{ID: id, Approve: true, User: user, Channel: "C9", TS: ts}); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if n := signatures(); n != 1 {
+		t.Fatalf("%d signatures made for two clicks at once, want 1", n)
+	}
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 1 || ms[0].Type != payload.Approval || ms[0].ApprovalID != id || ms[0].Outcome != payload.Approved || ms[0].Agent != "ops-exec" || ms[0].Text != "delete bucket b" {
+		t.Fatalf("outcomes = %+v, want one approved %s", ms, id)
+	}
+	by := ms[0].Approver
+	if by != "U1" && by != "U2" {
+		t.Fatalf("approved by %q, want U1 or U2", by)
+	}
+	if tf.sent != 1 {
+		t.Fatalf("Stored called %d times, want 1", tf.sent)
+	}
+	var a Approval
+	if err := json.Unmarshal(ms[0].Approval, &a); err != nil {
+		t.Fatal(err)
+	}
+	want := Content{ApprovalID: id, ParamsSHA256: sha256.Sum256([]byte(action)), TargetMachine: "workstation", TargetAgent: "ops-exec",
+		Approver: by, ApprovedAt: tf.now, ExpiresAt: tf.now.Add(TTL), Nonce: a.Nonce}
+	if !a.ApprovedAt.Equal(want.ApprovedAt) || !a.ExpiresAt.Equal(want.ExpiresAt) || len(a.Nonce) != 32 {
+		t.Fatalf("approval = %+v, want approved at %s, expiring at %s, with a 32-byte nonce", a.Content, want.ApprovedAt, want.ExpiresAt)
+	}
+	a.ApprovedAt, a.ExpiresAt = want.ApprovedAt, want.ExpiresAt
+	if err := Verify(tf.pub, a.Content, a.Signature, tf.now.Add(TTL-time.Second)); err != nil {
+		t.Fatalf("the hub's signature does not verify: %v", err)
+	}
+	if a.ParamsSHA256 != want.ParamsSHA256 || a.TargetMachine != want.TargetMachine || a.TargetAgent != want.TargetAgent || a.Approver != want.Approver {
+		t.Fatalf("content = %+v, want %+v", a.Content, want)
+	}
+	c = tf.card(t, ts)
+	if c.Outcome != payload.Approved || c.Approver != by || !c.DecidedAt.Equal(tf.now) {
+		t.Fatalf("card after approval = %+v, want approved by %s at %s", c, by, tf.now)
+	}
+	rec, err := tf.Store.Approval(t.Context(), id)
+	if err != nil || !rec.CardFinal {
+		t.Fatalf("record = %+v, %v; want the card marked final", rec, err)
+	}
+
+	// The loser was told; clicking again, either button, changes nothing.
+	tf.click(t, id, ts, "U2", true)
+	tf.click(t, id, ts, "U1", false)
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 {
+		t.Fatalf("outcomes after clicking again = %+v, want still one", ms)
+	}
+	if n := signatures(); n != 1 {
+		t.Fatalf("%d signatures after clicking again, want still 1", n)
+	}
+	for _, user := range []string{"U1", "U2"} {
+		for i, w := range tf.f.Whispers(user) {
+			if !strings.Contains(w, "已经处理过了") {
+				t.Fatalf("%s was told %q (hint %d), want that the card was handled", user, w, i)
+			}
+		}
+	}
+	if n := len(tf.f.Whispers("U1")) + len(tf.f.Whispers("U2")); n != 3 {
+		t.Fatalf("%d hints in all, want 3: the loser's and the two later clicks'", n)
+	}
+}
+
+// countSignatures counts the signatures made until the test ends.
+func countSignatures(t *testing.T) func() int {
+	t.Helper()
+	var mu sync.Mutex
+	n := 0
+	saved := sign
+	sign = func(key ed25519.PrivateKey, c Content) []byte {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		return saved(key, c)
+	}
+	t.Cleanup(func() { sign = saved })
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+}
+
+// A click that is waiting for the database's write lock when the
+// approval expires finds it expired: the state and the clock are read
+// under the lock, so no signature is made past the expiry.
+func TestFlowClickExpiresWhileWaitingForTheLock(t *testing.T) {
+	tf := newFlow(t)
+	tf.TTL = 20 * time.Minute
+	id, ts := tf.request(t, "")
+	// Another connection holds the write lock.
+	db, err := sql.Open("sqlite", "file:"+tf.path+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(t.Context(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	var now sync.Mutex
+	tf.now = tf.now.Add(20*time.Minute - time.Second)
+	tf.Now = func() time.Time {
+		now.Lock()
+		defer now.Unlock()
+		return tf.now
+	}
+	clicked := make(chan error, 1)
+	go func() {
+		clicked <- tf.Click(t.Context(), slack.Click{ID: id, Approve: true, User: "U1", Channel: "C9", TS: ts})
+	}()
+	// The click is in flight, waiting; the expiry passes; the lock goes.
+	time.Sleep(200 * time.Millisecond)
+	now.Lock()
+	tf.now = tf.now.Add(time.Second)
+	now.Unlock()
+	if _, err := conn.ExecContext(t.Context(), "COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-clicked; err != nil {
+		t.Fatal(err)
+	}
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 1 || ms[0].Outcome != payload.Expired || len(ms[0].Approval) != 0 {
+		t.Fatalf("outcomes = %+v, want one expired, unsigned", ms)
+	}
+	if w := tf.f.Whispers("U1"); len(w) != 1 || !strings.Contains(w[0], "过期") {
+		t.Fatalf("U1 was told %q, want that the card expired", w)
+	}
+}
+
+// Clicks by someone not on the approver list and by a bot do not count:
+// the approval stays pending, nothing is sent, and the clicker is told
+// why. The requester the agent named is a note on the card, read by no
+// check: an approver named there still decides.
+func TestFlowRefusesClicks(t *testing.T) {
+	tf := newFlow(t)
+	id, ts := tf.request(t, "U1")
+	if c := tf.card(t, ts); c.Requester != "U1" || c.Machine != "workstation" {
+		t.Fatalf("card = %+v, want the requester note U1 and the authenticated machine", c)
+	}
+	for _, c := range []struct {
+		user string
+		bot  bool
+		want string
+	}{
+		{"U3", false, "不在审批人名单"},
+		{"B1", true, "bot"},
+	} {
+		tf.clickOnly(t, slack.Click{ID: id, Approve: true, User: c.user, Bot: c.bot, Channel: "C9", TS: ts})
+		if err := tf.Pass(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if w := tf.f.Whispers(c.user); len(w) != 1 || !strings.Contains(w[0], c.want) {
+			t.Errorf("%s (bot %v) was told %q, want %q", c.user, c.bot, w, c.want)
+		}
+		tf.clickOnly(t, slack.Click{ID: id, Approve: false, User: c.user, Bot: c.bot, Channel: "C9", TS: ts})
+	}
+	// An approver, but from a button elsewhere: a click names the card's
+	// channel and ts as recorded, or does not count.
+	tf.f.AddChannel("C8", "")
+	for _, c := range []slack.Click{
+		{ID: id, Approve: true, User: "U1", Channel: "C8", TS: ts},
+		{ID: id, Approve: true, User: "U1", Channel: "C9", TS: ts + "1"},
+	} {
+		tf.clickOnly(t, c)
+	}
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if w := tf.f.Whispers("U1"); len(w) != 2 || !strings.Contains(w[0], "不在编号") || !strings.Contains(w[1], "不在编号") {
+		t.Fatalf("U1 was told %q, want twice that the button is not on this card", w)
+	}
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 0 {
+		t.Fatalf("outcomes after refused clicks = %+v, want none", ms)
+	}
+	if c := tf.card(t, ts); c.Outcome != "" {
+		t.Fatalf("card after refused clicks = %+v, want still pending", c)
+	}
+	// A click on a card that does not exist is told so.
+	tf.click(t, "nope", ts, "U1", true)
+	if w := tf.f.Whispers("U1"); len(w) != 3 || !strings.Contains(w[2], "没有这张审批卡") {
+		t.Fatalf("U1 was told %q, want last that there is no such card", w)
+	}
+
+	tf.click(t, id, ts, "U1", true)
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 || ms[0].Outcome != payload.Approved || ms[0].Approver != "U1" {
+		t.Fatalf("outcomes after U1's click = %+v, want one approved by U1", ms)
+	}
+}
+
+// The card shows the whole action: one that just fits is shown whole and
+// signed over whole; one character more is refused before any card is
+// posted.
+func TestFlowActionMustFitTheCard(t *testing.T) {
+	tf := newFlow(t)
+	// The most parameter blocks a card takes, each full, as a JSON string.
+	fits := `"` + strings.Repeat("x", slack.MaxParamChunks*slack.ParamChunk-2) + `"`
+	id, err := tf.Request(t.Context(), "workstation", "ops-exec", "", "big one", []byte(fits))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tss, cards := tf.f.Cards("C9")
+	if len(cards) != 1 || cards[0].Params != fits {
+		t.Fatalf("card shows %d characters of the action, want all %d", len(cards[0].Params), len(fits))
+	}
+	tf.click(t, id, tss[0], "U1", true)
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 1 || ms[0].Outcome != payload.Approved {
+		t.Fatalf("outcomes = %+v, want one approved", ms)
+	}
+	var a Approval
+	if err := json.Unmarshal(ms[0].Approval, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.ParamsSHA256 != sha256.Sum256([]byte(fits)) {
+		t.Fatal("the signature is not over the whole action")
+	}
+
+	_, err = tf.Request(t.Context(), "workstation", "ops-exec", "", "too big", []byte(fits+" "))
+	if !errors.Is(err, ErrTooBig) {
+		t.Fatalf("Request with one character too many = %v, want ErrTooBig", err)
+	}
+	if _, cards := tf.f.Cards("C9"); len(cards) != 1 {
+		t.Fatalf("cards = %d, want still the one that fit", len(cards))
+	}
+	if ps, err := tf.Store.PendingApprovals(t.Context()); err != nil || len(ps) != 0 {
+		t.Fatalf("pending = %+v, %v; want none left", ps, err)
+	}
+}
+
+// A rejection is sent to the client without a signature, and the card
+// says so.
+func TestFlowReject(t *testing.T) {
+	tf := newFlow(t)
+	id, ts := tf.request(t, "")
+	tf.click(t, id, ts, "U2", false)
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 1 || ms[0].ApprovalID != id || ms[0].Outcome != payload.Rejected || ms[0].Approver != "U2" || len(ms[0].Approval) != 0 {
+		t.Fatalf("outcomes = %+v, want one rejected %s by U2 with no approval document", ms, id)
+	}
+	if c := tf.card(t, ts); c.Outcome != payload.Rejected || c.Approver != "U2" {
+		t.Fatalf("card = %+v, want rejected by U2", c)
+	}
+	tf.click(t, id, ts, "U1", true)
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 {
+		t.Fatalf("outcomes after approving a rejected card = %+v, want still one", ms)
+	}
+}
+
+// At the expiry a pending approval expires: the sweep sends the outcome,
+// unsigned, and the card says so; a click at the expiry does the same and
+// signs nothing; a click after that only tells the clicker.
+func TestFlowExpiry(t *testing.T) {
+	tf := newFlow(t)
+	tf.TTL = 20 * time.Minute
+	swept, _ := tf.request(t, "")
+	clicked, clickedTS := tf.request(t, "")
+	tf.now = tf.now.Add(20*time.Minute - time.Second)
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 0 {
+		t.Fatalf("outcomes a second before the expiry = %+v, want none", ms)
+	}
+	tf.now = tf.now.Add(time.Second)
+	tf.click(t, clicked, clickedTS, "U1", true)
+	if w := tf.f.Whispers("U1"); len(w) != 1 || !strings.Contains(w[0], "过期") {
+		t.Fatalf("U1 was told %q, want that the card expired", w)
+	}
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 2 || ms[0].ApprovalID != clicked || ms[1].ApprovalID != swept {
+		t.Fatalf("outcomes = %+v, want the clicked one then the swept one", ms)
+	}
+	for _, m := range ms {
+		if m.Outcome != payload.Expired || m.Approver != "" || len(m.Approval) != 0 {
+			t.Fatalf("outcome %+v, want expired, by no one, unsigned", m)
+		}
+	}
+	_, cards := tf.f.Cards("C9")
+	for _, c := range cards {
+		if c.Outcome != payload.Expired || !c.DecidedAt.Equal(tf.now) {
+			t.Fatalf("card %+v, want expired at %s", c, tf.now)
+		}
+	}
+	tf.click(t, clicked, clickedTS, "U1", true)
+	if w := tf.f.Whispers("U1"); len(w) != 2 || !strings.Contains(w[1], "已经处理过了：已过期") {
+		t.Fatalf("U1 was told %q, want that the card was handled, expired", w)
+	}
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 2 {
+		t.Fatalf("outcomes after clicking an expired card = %+v, want still two", ms)
+	}
+}
+
+// Without a key, Slack, a channel or approvers, a request fails with
+// ErrOff and posts nothing.
+func TestFlowOff(t *testing.T) {
+	tf := newFlow(t)
+	key, sl, channel, approvers := tf.Key, tf.Slack, tf.Channel, tf.Approvers
+	for name, off := range map[string]func(f *Flow){
+		"key":       func(f *Flow) { f.Key = nil },
+		"slack":     func(f *Flow) { f.Slack = nil },
+		"channel":   func(f *Flow) { f.Channel = "" },
+		"approvers": func(f *Flow) { f.Approvers = nil },
+	} {
+		off(tf.Flow)
+		_, err := tf.Request(t.Context(), "workstation", "ops-exec", "", "delete bucket b", []byte(action))
+		if !errors.Is(err, ErrOff) {
+			t.Errorf("without the %s: Request returned %v, want ErrOff", name, err)
+		}
+		tf.Key, tf.Slack, tf.Channel, tf.Approvers = key, sl, channel, approvers
+	}
+	if _, cards := tf.f.Cards("C9"); len(cards) != 0 {
+		t.Fatalf("cards posted while off = %+v, want none", cards)
+	}
+	if ps, err := tf.Store.PendingApprovals(t.Context()); err != nil || len(ps) != 0 {
+		t.Fatalf("pending while off = %+v, %v; want none", ps, err)
+	}
+}
+
+// A card Slack does not update when the approval is decided is updated by
+// the next sweep.
+func TestFlowCardFinishedLater(t *testing.T) {
+	tf := newFlow(t)
+	fl := &flakyUpdate{Fake: tf.f, fail: true}
+	tf.Slack = fl
+	id, ts := tf.request(t, "")
+	tf.click(t, id, ts, "U1", true)
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 || ms[0].Outcome != payload.Approved {
+		t.Fatalf("outcomes = %+v, want one approved although the card update failed", ms)
+	}
+	if c := tf.card(t, ts); c.Outcome != "" {
+		t.Fatalf("card = %+v, want still as posted after the failed update", c)
+	}
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c := tf.card(t, ts); c.Outcome != "" {
+		t.Fatalf("card = %+v, want still as posted while updates fail", c)
+	}
+	rec, err := tf.Store.Approval(t.Context(), id)
+	if err != nil || rec.CardFinal {
+		t.Fatalf("record = %+v, %v; want the card not final yet", rec, err)
+	}
+	fl.fail = false
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c := tf.card(t, ts); c.Outcome != payload.Approved {
+		t.Fatalf("card after the sweep = %+v, want approved", c)
+	}
+	if rec, err := tf.Store.Approval(t.Context(), id); err != nil || !rec.CardFinal {
+		t.Fatalf("record after the sweep = %+v, %v; want the card final", rec, err)
+	}
+	if ms := tf.outcomes(t, "workstation"); len(ms) != 1 {
+		t.Fatalf("outcomes after the sweep = %+v, want still one", ms)
+	}
+}
+
+// flakyUpdate is a Fake whose UpdateCard fails while fail is set.
+type flakyUpdate struct {
+	*slack.Fake
+	fail bool
+}
+
+func (f *flakyUpdate) UpdateCard(ctx context.Context, channel, ts string, c slack.Card) error {
+	if f.fail {
+		return errors.New("slack is away")
+	}
+	return f.Fake.UpdateCard(ctx, channel, ts, c)
+}
+
+// A request whose approval cannot be recorded takes its card down and
+// fails, so no card without an approval behind it stays in Slack.
+func TestFlowRequestUndoneWhenRecordFails(t *testing.T) {
+	tf := newFlow(t)
+	tf.Store.Close()
+	_, err := tf.Request(t.Context(), "workstation", "ops-exec", "", "delete bucket b", []byte(action))
+	if err == nil || !strings.Contains(err.Error(), "card was deleted") {
+		t.Fatalf("Request = %v, want an error saying the card was deleted", err)
+	}
+	if _, cards := tf.f.Cards("C9"); len(cards) != 0 {
+		t.Fatalf("cards = %+v, want none", cards)
+	}
+}
+
+// stuckSlack is a Fake whose UpdateCard and Whisper wait for their
+// context: Slack that never answers.
+type stuckSlack struct{ *slack.Fake }
+
+func (stuckSlack) UpdateCard(ctx context.Context, _, _ string, _ slack.Card) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (stuckSlack) Whisper(ctx context.Context, _, _, _ string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A Slack that never answers holds up one card or hint for SlackTimeout,
+// not the sweep: a later approval still expires and its outcome goes
+// down, and the hints waiting are capped.
+func TestPassBoundsSlackCalls(t *testing.T) {
+	tf := newFlow(t)
+	tf.TTL = 20 * time.Minute
+	tf.SlackTimeout = 20 * time.Millisecond
+	first, firstTS := tf.request(t, "")
+	tf.Slack = stuckSlack{tf.f}
+	second, _ := tf.request(t, "")
+	tf.clickOnly(t, slack.Click{ID: first, Approve: true, User: "U1", Channel: "C9", TS: firstTS})
+	for range 2 * maxHints {
+		tf.clickOnly(t, slack.Click{ID: first, Approve: true, User: "U3", Channel: "C9", TS: firstTS})
+	}
+	tf.mu.Lock()
+	n := len(tf.hints)
+	tf.mu.Unlock()
+	if n != maxHints {
+		t.Fatalf("%d hints waiting, want the cap %d", n, maxHints)
+	}
+	tf.now = tf.now.Add(20 * time.Minute)
+	start := time.Now()
+	if err := tf.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > time.Duration(maxHints+2)*tf.SlackTimeout*2 {
+		t.Fatalf("Pass took %s with Slack stuck, want it bounded by the timeouts", took)
+	}
+	ms := tf.outcomes(t, "workstation")
+	if len(ms) != 2 || ms[0].ApprovalID != first || ms[0].Outcome != payload.Approved || ms[1].ApprovalID != second || ms[1].Outcome != payload.Expired {
+		t.Fatalf("outcomes = %+v, want %s approved then %s expired although Slack is stuck", ms, first, second)
+	}
+	if rec, err := tf.Store.Approval(t.Context(), first); err != nil || rec.CardFinal {
+		t.Fatalf("record = %+v, %v; want the card not final while Slack is stuck", rec, err)
+	}
+	tf.mu.Lock()
+	n = len(tf.hints)
+	tf.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d hints still waiting after the pass, want none: a hint Slack does not take is dropped", n)
+	}
+}
