@@ -94,18 +94,21 @@ func testClient(t *testing.T, st *store.Client, id, hub string, cut *cutter) (*C
 	return testClientWith(t, st, id, hub, cut, nil)
 }
 
-// testClientWith is testClient with the header the client sends.
-func testClientWith(t *testing.T, st *store.Client, id, hub string, cut *cutter, header http.Header) (*Client, func()) {
+// testClientWith is testClient with configure, if set, run on the Client
+// before it runs.
+func testClientWith(t *testing.T, st *store.Client, id, hub string, cut *cutter, configure func(*Client)) (*Client, func()) {
 	t.Helper()
 	c := &Client{
 		Store:      st,
 		ID:         id,
 		Hub:        hub,
-		Header:     header,
 		Heartbeat:  testHeartbeat,
 		Backoff:    testBackoff,
 		Timeout:    testTimeout,
 		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: cut.dial}},
+	}
+	if configure != nil {
+		configure(c)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -120,6 +123,11 @@ func testClientWith(t *testing.T, st *store.Client, id, hub string, cut *cutter,
 	}
 	t.Cleanup(stop)
 	return c, stop
+}
+
+// withVersion sets the version a test client sends.
+func withVersion(v string) func(*Client) {
+	return func(c *Client) { c.Header = http.Header{VersionHeader: {v}} }
 }
 
 func openClientStore(t *testing.T) *store.Client {
@@ -218,14 +226,36 @@ func TestDownlinkResumesAfterDisconnect(t *testing.T) {
 }
 
 func TestUplinkRetriesUntilStored(t *testing.T) {
+	// The hub refuses the first three posts, then stores the fourth but
+	// holds its reply until the client has given up on it and posted again,
+	// so the message reaches the store twice whatever the client's timeout.
 	var posts atomic.Int32
+	retried := make(chan struct{})
 	h, srv := testHub(t, func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == UplinkPath && posts.Add(1) <= 3 {
-				http.Error(w, "not now", http.StatusServiceUnavailable)
+			if r.URL.Path != UplinkPath {
+				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r)
+			switch n := posts.Add(1); {
+			case n <= 3:
+				http.Error(w, "not now", http.StatusServiceUnavailable)
+			case n == 4:
+				rec := httptest.NewRecorder()
+				next.ServeHTTP(rec, r)
+				if rec.Code != http.StatusNoContent {
+					t.Errorf("held post: hub replied %d, want %d", rec.Code, http.StatusNoContent)
+				}
+				select {
+				case <-retried:
+				case <-t.Context().Done():
+				}
+			default:
+				if n == 5 {
+					close(retried)
+				}
+				next.ServeHTTP(w, r)
+			}
 		})
 	})
 	cs := openClientStore(t)
@@ -234,10 +264,6 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the hub inbox", func() bool { return len(inboxIDs(t, h.Store.Inbox.Inbox)) == 1 })
-	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{id}) {
-		t.Fatalf("hub inbox = %v, want [%s]", got, id)
-	}
 	waitFor(t, "the client outbox to be acked", func() bool {
 		ms, err := cs.Outbox.Pending(t.Context())
 		if err != nil {
@@ -245,8 +271,8 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 		}
 		return len(ms) == 0
 	})
-	if n := posts.Load(); n != 4 {
-		t.Fatalf("hub saw %d posts, want 4", n)
+	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{id}) {
+		t.Fatalf("hub inbox = %v, want [%s]", got, id)
 	}
 }
 
@@ -420,7 +446,10 @@ func TestHubResendsUntilAcked(t *testing.T) {
 func TestPayloadLimit(t *testing.T) {
 	h, srv := testHub(t, nil)
 	cs := openClientStore(t)
-	c, _ := testClient(t, cs, "a", srv.URL, &cutter{})
+	// A full payload takes the hub a good part of testTimeout to store
+	// under -race, so a slow machine would time out every attempt. The
+	// limits do not depend on the timeout: leave it at the default.
+	c, _ := testClientWith(t, cs, "a", srv.URL, &cutter{}, func(c *Client) { c.Timeout = 0 })
 	full := make([]byte, MaxPayload)
 	over := make([]byte, MaxPayload+1)
 
@@ -703,9 +732,9 @@ func TestOutdatedClientGetsNoDownlink(t *testing.T) {
 		}
 	}, nil)
 	old := openClientStore(t)
-	oldClient, stopOld := testClientWith(t, old, "a", srv.URL, &cutter{}, http.Header{VersionHeader: {"v1"}})
+	oldClient, stopOld := testClientWith(t, old, "a", srv.URL, &cutter{}, withVersion("v1"))
 	served := openClientStore(t)
-	testClientWith(t, served, "b", srv.URL, &cutter{}, http.Header{VersionHeader: {"v2"}})
+	testClientWith(t, served, "b", srv.URL, &cutter{}, withVersion("v2"))
 	forA, err := h.Send(ctx, "a", []byte("for a"))
 	if err != nil {
 		t.Fatal(err)
@@ -736,7 +765,7 @@ func TestOutdatedClientGetsNoDownlink(t *testing.T) {
 	}
 	// a upgraded: the same client id at a served version.
 	stopOld()
-	testClientWith(t, old, "a", srv.URL, &cutter{}, http.Header{VersionHeader: {"v2"}})
+	testClientWith(t, old, "a", srv.URL, &cutter{}, withVersion("v2"))
 	waitFor(t, "a's message after the upgrade", func() bool { return len(inboxIDs(t, old.Inbox)) == 1 })
 	if got := inboxIDs(t, old.Inbox); !slices.Equal(got, []string{forA.MsgID}) {
 		t.Fatalf("a's inbox = %v, want [%s]", got, forA.MsgID)
