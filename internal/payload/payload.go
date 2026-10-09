@@ -29,4 +29,8 @@ type Message struct {
 	User string `json:"user,omitempty"`
 	// TS is the Slack ts of an inbound message.
 	TS string `json:"ts,omitempty"`
+	// Context is the description of the channel, its Slack purpose, sent
+	// with the inbound message that starts a thread in it; empty for a
+	// reply, a direct message, or when the hub could not read it.
+	Context string `json:"context,omitempty"`
 }

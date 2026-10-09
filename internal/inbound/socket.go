@@ -13,36 +13,68 @@ import (
 	"github.com/Luolc/fednet/internal/slack"
 )
 
-// DefaultRetry is how long Run waits before trying a failed backfill again.
+// DefaultRetry is how long Run waits before trying a failed backfill, or a
+// failed Connected, again.
 const DefaultRetry = time.Minute
 
 // Run keeps a Socket Mode connection to Slack up until ctx is done, hands
 // every message event it brings to r.Handle and acks it once that has
 // returned without error; other events are acked at once. Each time the
-// connection comes up, a backfill runs in the background, again after
-// retry (DefaultRetry when zero) while it fails. appToken is the app-level
-// token Socket Mode connects with. Run returns ctx.Err() when ctx is done,
-// and earlier only when Slack rejects the token, which no retry fixes.
+// connection comes up, r.Connected fixes where the backfill starts before
+// any event of the connection is handled, and the backfill runs in the
+// background, again after retry (DefaultRetry when zero) while it fails.
+// appToken is the app-level token Socket Mode connects with. Run returns
+// ctx.Err() when ctx is done, and earlier only when Slack rejects the
+// token, which no retry fixes.
 func Run(ctx context.Context, appToken string, r *Receiver, retry time.Duration) error {
+	smc := socketmode.New(slackgo.New("", slackgo.OptionAppLevelToken(appToken)))
+	return run(ctx, socketClient{smc}, r, retry)
+}
+
+// transport is what run needs of a socketmode.Client.
+type transport interface {
+	// RunContext keeps the connection up until ctx is done, sending what
+	// happens to the Events channel.
+	RunContext(ctx context.Context) error
+	Events() <-chan socketmode.Event
+	// Ack acks the request with envelopeID.
+	Ack(ctx context.Context, envelopeID string) error
+}
+
+type socketClient struct{ *socketmode.Client }
+
+func (c socketClient) Events() <-chan socketmode.Event { return c.Client.Events }
+
+func (c socketClient) Ack(ctx context.Context, envelopeID string) error {
+	return c.AckCtx(ctx, envelopeID, nil)
+}
+
+func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) error {
 	if retry == 0 {
 		retry = DefaultRetry
 	}
-	smc := socketmode.New(slackgo.New("", slackgo.OptionAppLevelToken(appToken)))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	r.Disconnected()
 	ran := make(chan error, 1)
-	go func() { ran <- smc.RunContext(ctx) }()
+	go func() { ran <- t.RunContext(ctx) }()
 	var backfill backfill
 	defer backfill.stop()
 	for {
 		select {
 		case err := <-ran:
 			return err
-		case ev := <-smc.Events:
+		case ev := <-t.Events():
 			switch ev.Type {
 			case socketmode.EventTypeConnected:
-				r.Connected()
+				// Connected must have fixed the backfill's start before
+				// the connection's first message is handled; without
+				// the database nothing can be handled anyway.
+				for r.Connected(ctx) != nil {
+					if err := wait(ctx, retry); err != nil {
+						return err
+					}
+				}
 				backfill.start(ctx, r, retry)
 			case socketmode.EventTypeConnecting, socketmode.EventTypeConnectionError:
 				r.Disconnected()
@@ -56,7 +88,7 @@ func Run(ctx context.Context, appToken string, r *Receiver, retry time.Duration)
 					slog.Warn("inbound: event not acked", "err", err)
 					continue
 				}
-				if err := smc.AckCtx(ctx, ev.Request.EnvelopeID, nil); err != nil {
+				if err := t.Ack(ctx, ev.Request.EnvelopeID); err != nil {
 					slog.Warn("inbound: ack", "err", err)
 				}
 			}
@@ -90,7 +122,7 @@ func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 	return r.Handle(ctx, ev)
 }
 
-// backfill is the backfill goroutine Run keeps: one at a time, the last
+// backfill is the backfill goroutine run keeps: one at a time, the last
 // one stopped when a new one starts.
 type backfill struct {
 	cancel context.CancelFunc
@@ -123,12 +155,20 @@ func backfillUntilDone(ctx context.Context, r *Receiver, retry time.Duration) {
 			return
 		}
 		slog.Warn("inbound: backfill failed, retrying", "retry_in", retry, "err", err)
-		t := time.NewTimer(retry)
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-			t.Stop()
+		if wait(ctx, retry) != nil {
 			return
 		}
+	}
+}
+
+// wait sleeps for d, or until ctx is done.
+func wait(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

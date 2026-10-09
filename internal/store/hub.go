@@ -63,9 +63,8 @@ CREATE TABLE slack_state (
 var ErrNotFound = errors.New("store: not found")
 
 // Hub is the hub's database. A Hub that ReceiveSlack hands to its callback
-// is bound to one transaction: its Outbox and the thread ownership it
-// reads and writes are part of that transaction. Its Inbox is not; nothing
-// inbound writes the inbox.
+// is bound to one transaction: its Outbox, its Inbox and the thread
+// ownership it reads and writes are all part of that transaction.
 type Hub struct {
 	// db runs the queries: the database, or the transaction the Hub is
 	// bound to.
@@ -109,7 +108,7 @@ func (h *Hub) transact(ctx context.Context, f func(tx *Hub) error) error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := f(&Hub{db: tx, conn: h.conn, Outbox: HubOutbox{tx}, Inbox: h.Inbox}); err != nil {
+	if err := f(&Hub{db: tx, conn: h.conn, Outbox: HubOutbox{tx}, Inbox: HubInbox{Inbox{tx}}}); err != nil {
 		return err
 	}
 	return tx.Commit()

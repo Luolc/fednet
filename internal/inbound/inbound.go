@@ -29,14 +29,17 @@ const DefaultWindow = 24 * time.Hour
 // NoMachineText is what the hub says in a new thread no machine takes.
 const NoMachineText = "没有机器接这个 channel"
 
-// HubName is the machine name the hub's own replies carry.
+// HubName is the name the hub's own posts carry, as the client id of a
+// post in the hub's inbox.
 const HubName = "hub"
 
 // subtypes are the message subtypes taken in besides a plain message: a
-// message with files uploaded, and a reply also sent to the channel. Every
-// other subtype is a change to a message or something Slack did (someone
-// joined, a topic changed), not something a person said.
-var subtypes = []string{"", "file_share", "thread_broadcast"}
+// message typed with /me, a message with files uploaded, and a reply also
+// sent to the channel. Every other subtype is a change to a message or
+// something Slack did (someone joined, a topic changed), not something a
+// person said; the list of subtypes is at
+// https://docs.slack.dev/reference/events/message.
+var subtypes = []string{"", "me_message", "file_share", "thread_broadcast"}
 
 // Event is one message event, as the transport parsed it or as a backfill
 // read it from history.
@@ -82,24 +85,35 @@ type Receiver struct {
 // Handle takes in ev: if it is a message to hand on, Handle records it and
 // queues it for the client the routing picks, in one transaction, and
 // returns once that has committed; the caller then acks the event. A
-// message recorded before is not queued again. One that passes the filter
-// but that no client takes is recorded all the same, and in a new thread
-// the hub says so in the thread. An error means nothing was recorded, and
-// the event must not be acked.
+// message recorded before is not queued again. A reply in a thread the hub
+// does not know is preceded by the thread's first message, read from
+// Slack, when that is recent enough for a backfill to read; a reply whose
+// thread still has no owner is recorded and dropped. A new thread no
+// machine takes is recorded too, with a post from the hub saying so put in
+// the hub's inbox for the outbound side to deliver. An error means
+// nothing was recorded, and the event must not be acked.
 func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	if !r.wanted(ev) {
 		return nil
+	}
+	if ev.ThreadTS != "" {
+		if err := r.rootFirst(ctx, ev); err != nil {
+			return err
+		}
 	}
 	thread := slack.ThreadKey(ev.Channel, ev.ThreadTS)
 	if ev.ThreadTS == "" {
 		thread = slack.ThreadKey(ev.Channel, ev.TS)
 	}
-	b, err := json.Marshal(payload.Message{Type: payload.Inbound, Thread: thread, Text: text(ev), User: ev.User, TS: ev.TS})
+	m := payload.Message{Type: payload.Inbound, Thread: thread, Text: text(ev), User: ev.User, TS: ev.TS}
+	if ev.ThreadTS == "" && !ev.IM {
+		m.Context = r.purpose(ctx, ev.Channel)
+	}
+	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	var noMachine bool
-	fresh, err := r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
+	_, err = r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
 		rt := route.New(tx, r.Route)
 		var err error
 		switch {
@@ -112,22 +126,16 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		}
 		switch {
 		case errors.Is(err, route.ErrNoMachine):
-			noMachine = true
+			slog.Warn("inbound: new thread no machine takes", "thread", thread)
+			return r.tell(ctx, tx, thread, NoMachineText)
 		case errors.Is(err, route.ErrNoOwner):
 			slog.Warn("inbound: reply in a thread with no owner, dropped", "thread", thread, "ts", ev.TS)
-		default:
-			return err
+			return nil
 		}
-		return nil
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("inbound: %s: %w", slack.ThreadKey(ev.Channel, ev.TS), err)
-	}
-	if fresh && noMachine {
-		slog.Warn("inbound: new thread in a channel no machine takes", "thread", thread)
-		if _, err := r.Slack.PostReply(ctx, ev.Channel, ev.TS, HubName, NoMachineText); err != nil {
-			slog.Warn("inbound: telling the thread no machine takes it", "thread", thread, "err", err)
-		}
 	}
 	return nil
 }
@@ -153,16 +161,65 @@ func text(ev Event) string {
 	return strings.Join(lines, "\n")
 }
 
-// Backfill reads from Slack what the hub may have missed and takes it in
-// as Handle does, deduplicated against what came in live: for every
-// conversation the bot is in, the messages after the latest the hub has
-// seen, at most Window back, and the replies in that conversation's owned
-// threads after it. Nothing is read before the hub has seen any message.
-// Where a backfill starts is recorded before it reads, and cleared only
-// when all of it has been read, so that a backfill that failed partway
-// starts from the same place next time even though live messages have
-// moved the latest seen on; a hub restart starts there too.
-func (r *Receiver) Backfill(ctx context.Context) error {
+// purpose returns channel's purpose, the context a new thread carries, or
+// "" when Slack does not give it; the message goes without, and the agent
+// can still ask for it.
+func (r *Receiver) purpose(ctx context.Context, channel string) string {
+	p, err := r.Slack.Purpose(ctx, channel)
+	if err != nil {
+		slog.Warn("inbound: reading the channel's purpose, sending without", "channel", channel, "err", err)
+		return ""
+	}
+	return p
+}
+
+// rootFirst takes in the first message of ev's thread before ev when the
+// hub does not know the thread: the reply may have arrived before the
+// message that started the thread, as when Slack redelivers what was in
+// flight at a disconnection. The first message is read from Slack and
+// taken in only if a backfill could read it, that is if it is within
+// Window; an older thread is one the hub never had.
+func (r *Receiver) rootFirst(ctx context.Context, ev Event) error {
+	_, err := r.Store.Owner(ctx, slack.ThreadKey(ev.Channel, ev.ThreadTS))
+	if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	ms, err := r.Slack.Replies(ctx, ev.Channel, ev.ThreadTS)
+	if errors.Is(err, slack.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inbound: reading the thread of a reply: %w", err)
+	}
+	if len(ms) == 0 || ms[0].TS != ev.ThreadTS || slack.CompareTS(ms[0].TS, slackTS(r.now().Add(-r.window()))) <= 0 {
+		return nil
+	}
+	return r.Handle(ctx, Event{Channel: ev.Channel, IM: ev.IM, Message: ms[0]})
+}
+
+// tell puts a post from the hub saying text in thread into the hub's
+// inbox, in tx, for the outbound side to post; the msg_id is the thread's
+// key, so the same thread is told once.
+func (r *Receiver) tell(ctx context.Context, tx *store.Hub, thread, text string) error {
+	b, err := json.Marshal(payload.Message{Type: payload.Post, Thread: thread, Text: text})
+	if err != nil {
+		return err
+	}
+	_, err = tx.Inbox.PutFrom(ctx, HubName, store.Message{MsgID: HubName + "/" + thread, Payload: b})
+	return err
+}
+
+// Connected records that the connection to Slack is up and fixes where
+// the next backfill starts: at the latest message seen, or earlier where
+// a backfill is still pending. It must return before any message of the
+// new connection is handled, since a message handled moves the latest
+// seen on.
+func (r *Receiver) Connected(ctx context.Context) error {
+	r.mu.Lock()
+	if !r.connected {
+		r.connected, r.since = true, r.now()
+	}
+	r.mu.Unlock()
 	st := r.Store
 	from, err := st.SlackState(ctx, store.LastSeen)
 	if err != nil {
@@ -175,15 +232,26 @@ func (r *Receiver) Backfill(ctx context.Context) error {
 	if pending != "" && (from == "" || slack.CompareTS(pending, from) < 0) {
 		from = pending
 	}
-	if from == "" {
-		return nil
+	return st.SetSlackState(ctx, store.BackfillFrom, from)
+}
+
+// Backfill reads from Slack what the hub may have missed and takes it in
+// as Handle does, deduplicated against what came in live: for every
+// conversation the bot is in, the messages after the point Connected
+// fixed, at most Window back, and the replies in that conversation's
+// owned threads after it. There is nothing to read before the hub has seen
+// any message. The start is cleared only when all of it has been read, so
+// that a backfill that failed partway starts from the same place next
+// time, and so does a hub that restarted.
+func (r *Receiver) Backfill(ctx context.Context) error {
+	st := r.Store
+	from, err := st.SlackState(ctx, store.BackfillFrom)
+	if err != nil || from == "" {
+		return err
 	}
 	now := r.now()
 	if floor := slackTS(now.Add(-r.window())); slack.CompareTS(from, floor) < 0 {
 		from = floor
-	}
-	if err := st.SetSlackState(ctx, store.BackfillFrom, from); err != nil {
-		return err
 	}
 	convs, err := r.Slack.Conversations(ctx)
 	if err != nil {
@@ -236,15 +304,6 @@ func (r *Receiver) backfill(ctx context.Context, c slack.Conversation, from stri
 		}
 	}
 	return nil
-}
-
-// Connected records that the connection to Slack is up.
-func (r *Receiver) Connected() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.connected {
-		r.connected, r.since = true, r.now()
-	}
 }
 
 // Disconnected records that the connection to Slack is down, or that the
