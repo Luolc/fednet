@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,10 @@ type Hub struct {
 	// Identify returns the id of the client behind r. Nil means the id is
 	// read from ClientHeader as is.
 	Identify func(r *http.Request) (string, error)
+	// Recheck is how often Identify runs again on an open downlink's
+	// handshake, so a client revoked or re-registered while connected is
+	// dropped. Zero means DefaultRecheck.
+	Recheck time.Duration
 	// Answer answers a request from client. An error made by Refuse goes
 	// back to the client; any other error is logged and the client only
 	// learns that the request failed. Nil means every request fails.
@@ -41,8 +46,11 @@ type Hub struct {
 	wg sync.WaitGroup
 }
 
-// DefaultLease is the Lease used when Hub.Lease is zero.
-const DefaultLease = 30 * time.Second
+// Defaults for the zero fields of Hub.
+const (
+	DefaultLease   = 30 * time.Second
+	DefaultRecheck = DefaultHeartbeat
+)
 
 // session is one client's open downlink connection.
 type session struct {
@@ -56,6 +64,13 @@ func (h *Hub) lease() time.Duration {
 		return DefaultLease
 	}
 	return h.Lease
+}
+
+func (h *Hub) recheckEvery() time.Duration {
+	if h.Recheck == 0 {
+		return DefaultRecheck
+	}
+	return h.Recheck
 }
 
 // authorize identifies the client behind r. When it cannot, it logs why,
@@ -198,11 +213,33 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	go func() { errc <- h.push(ctx, client, s) }()
 	go func() { errc <- h.readAcks(ctx, client, conn) }()
+	if h.Identify != nil {
+		go func() { errc <- h.recheck(ctx, r) }()
+	}
 	if err := <-errc; err != nil && ctx.Err() == nil && websocket.CloseStatus(err) == -1 {
 		slog.Warn("link: downlink closed", "client", client, "err", err)
+	}
+}
+
+// recheck identifies the client behind r again every Recheck and returns
+// once it cannot, which ends the connection. The registry may have changed
+// since the handshake: hub revoke and hub register are other processes.
+func (h *Hub) recheck(ctx context.Context, r *http.Request) error {
+	t := time.NewTicker(h.recheckEvery())
+	defer t.Stop()
+	r = r.WithContext(ctx)
+	for {
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if _, err := h.Identify(r); err != nil {
+			return fmt.Errorf("link: no longer authorized: %w", err)
+		}
 	}
 }
 
