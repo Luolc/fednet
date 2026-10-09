@@ -14,6 +14,7 @@ import (
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	"github.com/Luolc/fednet/internal/watch"
 )
 
 // The fake Slack's clock starts at this ts; tests set Now near it.
@@ -245,8 +246,8 @@ func TestHandleNoMachineTellsThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ms) != 2 || ms[1].User != "fednet" || ms[1].Text != NoMachineText {
-		t.Fatalf("thread after a message no machine takes = %+v, want one reply saying so", ms)
+	if len(ms) != 2 || ms[1].User != "fednet" || ms[1].Text != NoMachineText || f.Machine(ms[1].TS) != HubName {
+		t.Fatalf("thread after a message no machine takes = %+v, want one reply from the hub saying so", ms)
 	}
 	if _, err := r.Store.Owner(ctx, "C3/"+ts); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Owner: err = %v, want ErrNotFound", err)
@@ -413,29 +414,33 @@ func TestBackfillRetriesFromWhereItFailed(t *testing.T) {
 	}
 }
 
+// The Receiver is the watch's view of the Slack connection.
+var _ watch.SlackLink = (*Receiver)(nil)
+
 func TestStatus(t *testing.T) {
 	now := epoch
 	r := &Receiver{Now: func() time.Time { return now }}
-	if s := r.Status(); s.Connected || !s.Since.IsZero() {
-		t.Fatalf("Status before any attempt = %+v, want disconnected since zero", s)
+	if s := r.Status(); s.Connected || !s.Since.IsZero() || r.DownFor() != 0 {
+		t.Fatalf("Status before any attempt = %+v, DownFor %v; want disconnected since zero, down for 0", s, r.DownFor())
 	}
 	r.Disconnected()
 	now = now.Add(time.Second)
 	r.Disconnected()
-	if s := r.Status(); s.Connected || !s.Since.Equal(epoch) {
-		t.Fatalf("Status while connecting = %+v, want disconnected since the first attempt", s)
+	if s := r.Status(); s.Connected || !s.Since.Equal(epoch) || r.DownFor() != time.Second {
+		t.Fatalf("Status while connecting = %+v, DownFor %v; want disconnected since the first attempt, down for 1s", s, r.DownFor())
 	}
 	now = now.Add(time.Second)
 	r.Connected()
 	now = now.Add(time.Second)
 	r.Connected()
-	if s := r.Status(); !s.Connected || !s.Since.Equal(epoch.Add(2*time.Second)) {
-		t.Fatalf("Status once connected = %+v, want connected since the connection came up", s)
+	if s := r.Status(); !s.Connected || !s.Since.Equal(epoch.Add(2*time.Second)) || r.DownFor() != 0 {
+		t.Fatalf("Status once connected = %+v, DownFor %v; want connected since the connection came up, down for 0", s, r.DownFor())
 	}
 	now = now.Add(time.Second)
 	r.Disconnected()
-	if s := r.Status(); s.Connected || !s.Since.Equal(epoch.Add(4*time.Second)) {
-		t.Fatalf("Status after a drop = %+v, want disconnected since the drop", s)
+	now = now.Add(3 * time.Second)
+	if s := r.Status(); s.Connected || !s.Since.Equal(epoch.Add(4*time.Second)) || r.DownFor() != 3*time.Second {
+		t.Fatalf("Status after a drop = %+v, DownFor %v; want disconnected since the drop, down for 3s", s, r.DownFor())
 	}
 }
 

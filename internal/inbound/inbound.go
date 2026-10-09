@@ -29,6 +29,9 @@ const DefaultWindow = 24 * time.Hour
 // NoMachineText is what the hub says in a new thread no machine takes.
 const NoMachineText = "没有机器接这个 channel"
 
+// HubName is the machine name the hub's own replies carry.
+const HubName = "hub"
+
 // subtypes are the message subtypes taken in besides a plain message: a
 // message with files uploaded, and a reply also sent to the channel. Every
 // other subtype is a change to a message or something Slack did (someone
@@ -122,7 +125,7 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	}
 	if fresh && noMachine {
 		slog.Warn("inbound: new thread in a channel no machine takes", "thread", thread)
-		if _, err := r.Slack.PostReply(ctx, ev.Channel, ev.TS, NoMachineText); err != nil {
+		if _, err := r.Slack.PostReply(ctx, ev.Channel, ev.TS, HubName, NoMachineText); err != nil {
 			slog.Warn("inbound: telling the thread no machine takes it", "thread", thread, "err", err)
 		}
 	}
@@ -259,6 +262,18 @@ func (r *Receiver) Status() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Status{Connected: r.connected, Since: r.since}
+}
+
+// DownFor returns how long the hub has been without a connection to
+// Slack: zero while it has one, and zero before the first attempt to
+// connect; from that attempt on, a hub that has never connected counts as
+// down since the attempt.
+func (r *Receiver) DownFor() time.Duration {
+	s := r.Status()
+	if s.Connected || s.Since.IsZero() {
+		return 0
+	}
+	return r.now().Sub(s.Since)
 }
 
 func (r *Receiver) now() time.Time {

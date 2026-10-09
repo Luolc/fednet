@@ -15,7 +15,8 @@ import (
 	"sync"
 )
 
-// ErrNotFound is returned for a channel or thread Slack does not know.
+// ErrNotFound is returned for a channel, thread or message Slack does not
+// know.
 var ErrNotFound = errors.New("slack: not found")
 
 // Message is one message in a channel or a thread.
@@ -64,13 +65,16 @@ type API interface {
 	// Post posts text in channel as a new message, which starts a thread,
 	// and returns its ts.
 	Post(ctx context.Context, channel, text string) (string, error)
-	// PostReply posts text as a reply in the thread that starts at ts in
-	// channel, and returns the reply's ts.
-	PostReply(ctx context.Context, channel, ts, text string) (string, error)
 	// Purpose returns channel's purpose, the description shown with it.
 	Purpose(ctx context.Context, channel string) (string, error)
 	// SetPurpose replaces channel's purpose.
 	SetPurpose(ctx context.Context, channel, purpose string) error
+	// PostReply posts text in the thread that starts at ts in channel,
+	// under a line that names machine, the machine the text comes from, and
+	// returns the new message's ts.
+	PostReply(ctx context.Context, channel, ts, machine, text string) (string, error)
+	// Delete deletes the message at ts in channel.
+	Delete(ctx context.Context, channel, ts string) error
 	// DM sends text to user as a direct message, which belongs to no
 	// thread.
 	DM(ctx context.Context, user, text string) error
@@ -125,6 +129,9 @@ type Fake struct {
 	mu       sync.Mutex
 	channels map[string]*fakeChannel
 	dms      map[string][]string
+	// machines maps the ts of each message PostReply posted to the machine
+	// it named.
+	machines map[string]string
 	clock    int
 }
 
@@ -228,15 +235,59 @@ func (f *Fake) Post(_ context.Context, channel, text string) (string, error) {
 	return f.Start(channel, "fednet", text)
 }
 
-// PostReply replies as the user "fednet".
-func (f *Fake) PostReply(_ context.Context, channel, ts, text string) (string, error) {
-	return f.Reply(channel, ts, "fednet", text)
-}
-
 // Start posts text from user in channel as a new message, which starts a
 // thread, and returns its ts.
 func (f *Fake) Start(channel, user, text string) (string, error) {
 	return f.Add(channel, Message{User: user, Text: text})
+}
+
+// PostReply posts as the user "fednet" and records machine, which Machine
+// returns.
+func (f *Fake) PostReply(_ context.Context, channel, ts, machine, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.channels[channel]
+	if !ok || c.threads[ts] == nil {
+		return "", ErrNotFound
+	}
+	m := Message{TS: f.next(), User: "fednet", Text: text}
+	c.threads[ts] = append(c.threads[ts], m)
+	if f.machines == nil {
+		f.machines = make(map[string]string)
+	}
+	f.machines[m.TS] = machine
+	return m.TS, nil
+}
+
+// Machine returns the machine PostReply named for the message at ts.
+func (f *Fake) Machine(ts string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.machines[ts]
+}
+
+// Delete deletes the message at ts in channel; deleting the first message
+// of a thread deletes the thread.
+func (f *Fake) Delete(_ context.Context, channel, ts string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.channels[channel]
+	if !ok {
+		return ErrNotFound
+	}
+	if c.threads[ts] != nil {
+		delete(c.threads, ts)
+		return nil
+	}
+	for root, ms := range c.threads {
+		for i, m := range ms {
+			if m.TS == ts {
+				c.threads[root] = append(ms[:i:i], ms[i+1:]...)
+				return nil
+			}
+		}
+	}
+	return ErrNotFound
 }
 
 func (f *Fake) Purpose(_ context.Context, channel string) (string, error) {

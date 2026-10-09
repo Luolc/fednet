@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
@@ -235,5 +236,28 @@ func TestReadHubConfig(t *testing.T) {
 	}
 	if _, err := readHubConfig(two); err == nil {
 		t.Fatal("readHubConfig accepted a second JSON value after the config")
+	}
+}
+
+func TestHubConfigAlerts(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cfg, err := readHubConfig(write("set.json", `{"alerts": {"slack_down": "90s", "offline_queued": "1h"}}`))
+	if err != nil || time.Duration(cfg.Alerts.SlackDown) != 90*time.Second || time.Duration(cfg.Alerts.OfflineQueued) != time.Hour {
+		t.Fatalf("readHubConfig = %+v, %v; want 90s and 1h", cfg.Alerts, err)
+	}
+	if cfg, err := readHubConfig(write("unset.json", `{}`)); err != nil || cfg.Alerts.SlackDown != 0 || cfg.Alerts.OfflineQueued != 0 {
+		t.Fatalf("readHubConfig without alerts = %+v, %v; want zero, the defaults", cfg.Alerts, err)
+	}
+	for _, bad := range []string{`"5"`, `"-5m"`, `300`} {
+		if _, err := readHubConfig(write("bad.json", `{"alerts": {"slack_down": `+bad+`}}`)); err == nil {
+			t.Errorf("readHubConfig accepted slack_down %s", bad)
+		}
 	}
 }

@@ -60,14 +60,17 @@ func (w *Web) call(ctx context.Context, method string, f func() error) error {
 	}
 }
 
+// notFound is the Slack errors that mean ErrNotFound.
+var notFound = map[string]bool{"channel_not_found": true, "thread_not_found": true, "message_not_found": true}
+
 // wrap names method in err, and turns Slack's errors for an unknown
-// channel or thread into ErrNotFound.
+// channel, thread or message into ErrNotFound.
 func wrap(method string, err error) error {
 	var slackErr slackgo.SlackErrorResponse
 	switch {
 	case err == nil:
 		return nil
-	case errors.As(err, &slackErr) && (slackErr.Err == "channel_not_found" || slackErr.Err == "thread_not_found"):
+	case errors.As(err, &slackErr) && notFound[slackErr.Err]:
 		return fmt.Errorf("%w: %s: %s", ErrNotFound, method, slackErr.Err)
 	default:
 		return fmt.Errorf("slack: %s: %w", method, err)
@@ -169,13 +172,28 @@ func (w *Web) Post(ctx context.Context, channel, text string) (string, error) {
 	return ts, err
 }
 
-func (w *Web) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
-	var reply string
+// PostReply puts machine in a context block, the small grey line Slack
+// shows above the text, and text in a markdown block. text is also the
+// message's plain text, which notifications and conversations.replies
+// show.
+func (w *Web) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
+	blocks := slackgo.MsgOptionBlocks(
+		slackgo.NewContextBlock("", slackgo.NewTextBlockObject(slackgo.PlainTextType, machine, false, false)),
+		slackgo.NewMarkdownBlock("", text),
+	)
+	var posted string
 	err := w.call(ctx, "chat.postMessage", func() (err error) {
-		_, reply, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionText(text, false), slackgo.MsgOptionTS(ts))
+		_, posted, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionTS(ts), slackgo.MsgOptionText(text, false), blocks)
 		return err
 	})
-	return reply, err
+	return posted, err
+}
+
+func (w *Web) Delete(ctx context.Context, channel, ts string) error {
+	return w.call(ctx, "chat.delete", func() error {
+		_, _, err := w.c.DeleteMessageContext(ctx, channel, ts)
+		return err
+	})
 }
 
 func (w *Web) Purpose(ctx context.Context, channel string) (string, error) {

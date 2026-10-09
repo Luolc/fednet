@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/slack"
@@ -206,6 +208,84 @@ func TestOpenThread(t *testing.T) {
 	// besides the first one.
 	if posts.n != 2 {
 		t.Fatalf("Slack got %d posts, want 2", posts.n)
+	}
+}
+
+// lastPost is a Slack API that remembers the ts of the last Post and can
+// fail Delete.
+type lastPost struct {
+	slack.API
+	ts         string
+	failDelete bool
+	// hangDelete makes Delete wait until its context is done.
+	hangDelete bool
+}
+
+func (l *lastPost) Post(ctx context.Context, channel, text string) (string, error) {
+	ts, err := l.API.Post(ctx, channel, text)
+	l.ts = ts
+	return ts, err
+}
+
+func (l *lastPost) Delete(ctx context.Context, channel, ts string) error {
+	if l.failDelete {
+		return errors.New("slack is down")
+	}
+	if l.hangDelete {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return l.API.Delete(ctx, channel, ts)
+}
+
+// When the owner of a new thread cannot be recorded, its message is
+// deleted and the caller gets an error.
+func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
+	s, f := testServer(t)
+	posts := &lastPost{API: f}
+	s.Slack = posts
+	s.OpenThread = map[string][]string{"C1": {"workstation"}}
+	s.Store.Close()
+	ctx := t.Context()
+
+	_, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	if err == nil || !strings.Contains(err.Error(), "deleted") {
+		t.Fatalf("open-thread with a failing store = %v, want an error saying the message was deleted", err)
+	}
+	if posts.ts == "" {
+		t.Fatal("open-thread did not post")
+	}
+	if _, err := f.Replies(ctx, "C1", posts.ts); !errors.Is(err, slack.ErrNotFound) {
+		t.Fatalf("the thread is still in Slack: %v", err)
+	}
+
+	// The caller has given up: the message is deleted all the same.
+	req := []byte(`{"cmd":"open-thread","channel":"C1","text":"nightly report"}`)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s.Answer(canceled, "workstation", req); err == nil || !strings.Contains(err.Error(), "deleted") {
+		t.Fatalf("open-thread for a caller that gave up = %v, want the message deleted", err)
+	}
+	if _, err := f.Replies(ctx, "C1", posts.ts); !errors.Is(err, slack.ErrNotFound) {
+		t.Fatalf("the thread of a caller that gave up is still in Slack: %v", err)
+	}
+
+	posts.failDelete = true
+	_, err = answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	if err == nil || !strings.Contains(err.Error(), "stays in Slack") {
+		t.Fatalf("open-thread when the delete fails too = %v, want an error saying the thread stays", err)
+	}
+
+	// A delete that hangs gives up at deleteTimeout, even for a caller that
+	// gave up.
+	posts.failDelete, posts.hangDelete = false, true
+	defer func(d time.Duration) { deleteTimeout = d }(deleteTimeout)
+	deleteTimeout = 10 * time.Millisecond
+	if _, err := s.Answer(canceled, "workstation", req); err == nil || !strings.Contains(err.Error(), "stays in Slack") {
+		t.Fatalf("open-thread when the delete hangs = %v, want an error saying the thread stays", err)
 	}
 }
 

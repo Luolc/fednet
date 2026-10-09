@@ -2,6 +2,7 @@ package slack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -146,9 +147,6 @@ func TestWeb(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(cs, []Conversation{{ID: "C1"}, {ID: "D1", IM: true}}) {
 		t.Errorf("Conversations = %+v, %v; want C1 and the IM D1", cs, err)
 	}
-	if ts2, err := w.PostReply(ctx, "C1", "1.1", "in the thread"); err != nil || ts2 != "1.3" {
-		t.Errorf("PostReply = %q, %v; want 1.3", ts2, err)
-	}
 
 	type sent struct{ method, args string }
 	var got []sent
@@ -169,7 +167,6 @@ func TestWeb(t *testing.T) {
 		{"conversations.history", "C1||page2||||2.0||"},
 		{"users.conversations", "|||||||public_channel,private_channel,im|"},
 		{"users.conversations", "||page2|||||public_channel,private_channel,im|"},
-		{"chat.postMessage", "C1|||in the thread|||||1.1"},
 	}
 	if !reflect.DeepEqual(got, wantSent) {
 		t.Errorf("requests = %v, want %v", got, wantSent)
@@ -189,7 +186,6 @@ func TestWebNotFound(t *testing.T) {
 		"SetPurpose": func() error { return w.SetPurpose(ctx, "C1", "p") },
 		"DM":         func() error { return w.DM(ctx, "U1", "hi") },
 		"History":    func() error { _, err := w.History(ctx, "C1", "1.0"); return err },
-		"PostReply":  func() error { _, err := w.PostReply(ctx, "C1", "1.1", "hi"); return err },
 	}
 	for name, call := range calls {
 		if err := call(); !errors.Is(err, ErrNotFound) {
@@ -288,5 +284,54 @@ func TestWebKeepsTokenOutOfErrors(t *testing.T) {
 		} else if strings.Contains(err.Error(), testToken) {
 			t.Errorf("error %q contains the token", err)
 		}
+	}
+}
+
+func TestWebPostReplyAndDelete(t *testing.T) {
+	ctx := context.Background()
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "chat.postMessage":
+			return 200, `{"ok":true,"channel":"C1","ts":"1.5"}`
+		case "chat.delete":
+			if r.form.Get("ts") == "9.9" {
+				return 200, `{"ok":false,"error":"message_not_found"}`
+			}
+			return 200, `{"ok":true,"channel":"C1","ts":"` + r.form.Get("ts") + `"}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	if got, err := w.PostReply(ctx, "C1", "1.1", "workstation", "the build is fixed"); err != nil || got != "1.5" {
+		t.Fatalf("PostReply = %q, %v; want 1.5", got, err)
+	}
+	if err := w.Delete(ctx, "C1", "1.5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Delete(ctx, "C1", "9.9"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete of a message Slack does not know = %v, want ErrNotFound", err)
+	}
+
+	rs, _ := ts.got()
+	post := rs[0].form
+	if rs[0].method != "chat.postMessage" || post.Get("channel") != "C1" || post.Get("thread_ts") != "1.1" || post.Get("text") != "the build is fixed" {
+		t.Fatalf("PostReply sent %s %v", rs[0].method, post)
+	}
+	var blocks []struct {
+		Type     string `json:"type"`
+		Text     any    `json:"text"`
+		Elements []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"elements"`
+	}
+	if err := json.Unmarshal([]byte(post.Get("blocks")), &blocks); err != nil {
+		t.Fatalf("blocks %q: %v", post.Get("blocks"), err)
+	}
+	if len(blocks) != 2 || blocks[0].Type != "context" || len(blocks[0].Elements) != 1 || blocks[0].Elements[0].Text != "workstation" ||
+		blocks[1].Type != "markdown" || blocks[1].Text != "the build is fixed" {
+		t.Fatalf("blocks = %s, want a context block naming the machine, then the text", post.Get("blocks"))
+	}
+	if rs[1].method != "chat.delete" || rs[1].form.Get("channel") != "C1" || rs[1].form.Get("ts") != "1.5" {
+		t.Fatalf("Delete sent %s %v", rs[1].method, rs[1].form)
 	}
 }
