@@ -127,7 +127,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-func inboxIDs(t *testing.T, in store.Inbox) []string {
+func inboxIDs(t *testing.T, in interface {
+	Undelivered(context.Context) ([]store.Message, error)
+}) []string {
 	t.Helper()
 	ms, err := in.Undelivered(t.Context())
 	if err != nil {

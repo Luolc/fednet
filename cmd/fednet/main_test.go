@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Luolc/fednet/internal/auth"
+	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -168,7 +169,8 @@ func TestHubAndClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	queued, err := hs.Outbox.Enqueue(ctx, "workstation", []byte("hello"))
+	const hello = `{"type":"test","text":"hello"}`
+	queued, err := hs.Outbox.Enqueue(ctx, "workstation", []byte(hello))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,14 +192,42 @@ func TestHubAndClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	stopClient := start(t, []string{"client", "-hub", "http://" + addr, "-db", clientDB, "-credential", credPath, "-socket", socket}, &stdout, &stderr)
-	waitFor(t, "the message in the client inbox", func() bool {
+	// The hook copies the event file and its environment next to the
+	// databases; it learns where from the one variable passed through.
+	script := filepath.Join(dir, "hook.sh")
+	body := "#!/bin/sh\ncp \"$1\" \"$FEDNET_TEST_DIR/event\" && /usr/bin/env > \"$FEDNET_TEST_DIR/env\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FEDNET_TEST_DIR", dir)
+	t.Setenv("FEDNET_TEST_LEAK", "not for the hook")
+	stopClient := start(t, []string{"client", "-hub", "http://" + addr, "-db", clientDB, "-credential", credPath, "-socket", socket,
+		"-hook-env", "FEDNET_TEST_DIR", "/bin/sh", script}, &stdout, &stderr)
+	var event hook.Event
+	waitFor(t, "the hook to run", func() bool {
+		b, err := os.ReadFile(filepath.Join(dir, "event"))
+		return err == nil && json.Unmarshal(b, &event) == nil
+	})
+	if event.MsgID != queued.MsgID || string(event.Payload) != hello {
+		t.Fatalf("hook got %+v, want %s with payload %s", event, queued.MsgID, hello)
+	}
+	waitFor(t, "the message marked delivered", func() bool {
 		ms, err := cs.Inbox.Undelivered(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return len(ms) == 1 && ms[0].MsgID == queued.MsgID && string(ms[0].Payload) == "hello"
+		return len(ms) == 0
 	})
+	env, err := os.ReadFile(filepath.Join(dir, "env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(env), "FEDNET_TEST_DIR="+dir) || !strings.Contains(string(env), "PATH=") {
+		t.Fatalf("hook environment lacks the passed variable or PATH:\n%s", env)
+	}
+	if strings.Contains(string(env), "FEDNET_TEST_LEAK") {
+		t.Fatalf("hook environment has a variable that was not passed:\n%s", env)
+	}
 	// The hub learned the client's version from the connection.
 	hs, err = store.OpenHub(ctx, hubDB)
 	if err != nil {

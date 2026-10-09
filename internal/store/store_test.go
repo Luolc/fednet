@@ -541,3 +541,145 @@ func TestRegistry(t *testing.T) {
 		t.Fatalf("Registration(a) after re-registering = %+v, %v; want %+v", got, err, want)
 	}
 }
+
+func TestClientInboxRetryAndDeadLetter(t *testing.T) {
+	ctx := t.Context()
+	in := openClient(t, filepath.Join(t.TempDir(), "client.db")).Inbox
+	for _, id := range []string{"m1", "m2"} {
+		if _, err := in.Put(ctx, Message{id, []byte(id)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	qs, err := in.Queued(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 2 || qs[0].MsgID != "m1" || qs[0].Attempts != 0 || !qs[0].NextAttempt.Equal(time.UnixMilli(0)) {
+		t.Fatalf("Queued = %+v, want m1 and m2 with no attempts, due at the epoch", qs)
+	}
+
+	// A failed attempt is counted and scheduled.
+	next := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	if err := in.Retry(ctx, "m1", next); err != nil {
+		t.Fatal(err)
+	}
+	qs, err = in.Queued(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qs[0].Attempts != 1 || !qs[0].NextAttempt.Equal(next) || qs[1].Attempts != 0 {
+		t.Fatalf("Queued after Retry(m1) = %+v, want m1 at attempt 1 due %v, m2 untouched", qs, next)
+	}
+
+	// The last attempt moves the message to the dead letters, with the
+	// attempt counted and the reason kept; it leaves the queue, and a
+	// redelivery is still a duplicate.
+	before := time.Now().Truncate(time.Millisecond)
+	if err := in.Bury(ctx, "m1", "exit status 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.Bury(ctx, "m1", "again"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Bury of a buried message: err = %v, want ErrNotFound", err)
+	}
+	qs, err = in.Queued(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 1 || qs[0].MsgID != "m2" {
+		t.Fatalf("Queued after Bury(m1) = %+v, want just m2", qs)
+	}
+	ds, err := in.DeadLetters(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ds) != 1 || ds[0].MsgID != "m1" || string(ds[0].Payload) != "m1" || ds[0].Attempts != 2 || ds[0].Reason != "exit status 1" || ds[0].At.Before(before) {
+		t.Fatalf("DeadLetters = %+v, want m1 after 2 attempts, reason \"exit status 1\", at or after %v", ds, before)
+	}
+	if isNew, err := in.Put(ctx, Message{"m1", []byte("redelivered")}); err != nil || isNew {
+		t.Fatalf("Put of a dead letter: new = %v, err = %v; want false, nil", isNew, err)
+	}
+	if qs, err := in.Queued(ctx); err != nil || len(qs) != 1 {
+		t.Fatalf("Queued after redelivering a dead letter = %+v, %v; want just m2", qs, err)
+	}
+}
+
+func TestClientInboxPrune(t *testing.T) {
+	ctx := t.Context()
+	c := openClient(t, filepath.Join(t.TempDir(), "client.db"))
+	in := c.Inbox
+	for _, id := range []string{"old", "new", "queued"} {
+		if _, err := in.Put(ctx, Message{id, []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"old", "new"} {
+		if err := in.MarkDelivered(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.db.ExecContext(ctx, "UPDATE inbox SET delivered_at = delivered_at - ? WHERE msg_id = 'old'", time.Hour.Milliseconds()); err != nil {
+		t.Fatal(err)
+	}
+	n, err := in.Prune(ctx, time.Now().Add(-30*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("Prune deleted %d rows, want 1", n)
+	}
+	// The pruned message is no longer a duplicate; the kept ones still are.
+	for id, wantNew := range map[string]bool{"old": true, "new": false, "queued": false} {
+		if isNew, err := in.Put(ctx, Message{id, []byte("again")}); err != nil || isNew != wantNew {
+			t.Fatalf("Put(%s) after Prune: new = %v, err = %v; want %v", id, isNew, err, wantNew)
+		}
+	}
+}
+
+func TestClientUpgradeKeepsData(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "client.db")
+
+	// A database written by the first schema version.
+	db, err := open(ctx, path, clientMigrations[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"INSERT INTO inbox (msg_id, payload) VALUES ('m1', 'x')",
+		"INSERT INTO inbox (msg_id, payload, delivered) VALUES ('m0', 'y', 1)",
+		"INSERT INTO outbox (msg_id, payload) VALUES ('u1', 'z')",
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	before := time.Now().Add(-time.Second)
+	c := openClient(t, path)
+	qs, err := c.Inbox.Queued(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 1 || qs[0].MsgID != "m1" || string(qs[0].Payload) != "x" || qs[0].Attempts != 0 {
+		t.Fatalf("Queued after upgrade = %+v, want m1 (x) with no attempts", qs)
+	}
+	out, err := c.Outbox.Pending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(msgIDs(out), []string{"u1"}) {
+		t.Fatalf("outbox after upgrade = %v, want [u1]", msgIDs(out))
+	}
+	// The row delivered before the upgrade is dated at the upgrade, so a
+	// prune of what was delivered before it keeps the row.
+	if n, err := c.Inbox.Prune(ctx, before); err != nil || n != 0 {
+		t.Fatalf("Prune(before the upgrade) = %d, %v; want 0, nil", n, err)
+	}
+	if isNew, err := c.Inbox.Put(ctx, Message{"m0", []byte("again")}); err != nil || isNew {
+		t.Fatalf("Put(m0) after upgrade: new = %v, err = %v; want false, nil", isNew, err)
+	}
+	if ds, err := c.Inbox.DeadLetters(ctx); err != nil || len(ds) != 0 {
+		t.Fatalf("DeadLetters after upgrade = %v, %v; want none", ds, err)
+	}
+}
