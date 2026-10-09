@@ -8,7 +8,7 @@ fednet 让用户在 Slack 线程里和各台机器上的 coding agent 打交道�
 
 计划只有一个二进制 `fednet`，分三组子命令：`fednet hub` 跑在一台固定的 hub 机器上，负责和 Slack 的连接；`fednet client` 跑在每台 agent 机器 (工作站、数据机) 上，主动连到 hub，把消息交给本机的 agent；`fednet approval` 给执行高风险操作的脚本验一份用户的批准，不连 hub。
 
-**当前状态：`fednet hub` 和 `fednet client` 都能跑起来，client 凭登记过的凭证连上 hub，hub 排队的消息送到 client 的 inbox 后，由 client 执行配置的钩子命令交给本机的 agent，交不出去的进死信，并经 hub 报警；本机的 agent 可以用 `fednet client post` 经 client 往线程发消息；agent 还可以经 client 请 hub 当场回答：读一个线程、开一个线程、列出本机的线程、读写 channel 的描述、接管一个线程、列出用户名单、给名单上的用户发私信。给了 Slack 的两个 token 文件时，hub 用 Socket Mode 收人在 Slack 里发的消息，按线程路由送给 client，再把 client 发的 post 发到线程里，给了报警 webhook 时还会报警；没给时 hub 只跑 client 用的 HTTP 服务，post 只落进 inbox，要用 Slack 的请求都失败。hub 和 client 都能不停机换成新版本的进程：新进程接过监听的端口和 socket 之后旧进程才退出，新进程起不来就还是旧的在服务；hub 不给版本过旧的 client 派消息。这些都只在测试里对着假的 Slack 跑通，还没有连真的 Slack workspace 跑过。签名审批整条走通了：agent 用 `fednet client request-approval` 交上动作，hub 在 Slack 发审批卡，审批人点「批准」hub 才签名，结果经下行送回发起的 client、交给钩子；拒绝和过期也送回，不签名；执行方用 `fednet approval verify` 验签。同样只在测试里对着假的 Slack 跑通。** 下面各节照实写，不描述还不存在的东西。
+**当前状态：`fednet hub` 和 `fednet client` 都能跑起来，client 凭登记过的凭证连上 hub，hub 排队的消息送到 client 的 inbox 后，由 client 执行配置的钩子命令交给本机的 agent，交不出去的进死信，并经 hub 报警；本机的 agent 可以用 `fednet client post` 经 client 往线程发消息；agent 还可以经 client 请 hub 当场回答：读一个线程、开一个线程、列出本机的线程、读写 channel 的描述、接管一个线程、列出用户名单、给名单上的用户发私信。给了 Slack 的两个 token 文件时，hub 用 Socket Mode 收人在 Slack 里发的消息，按线程路由送给 client，再把 client 发的 post 发到线程里，给了报警 webhook 时还会报警；没给时 hub 只跑 client 用的 HTTP 服务，post 只落进 inbox，要用 Slack 的请求都失败。hub 和 client 都能不停机换成新版本的进程：新进程接过监听的端口和 socket 之后旧进程才退出，新进程起不来就还是旧的在服务；hub 不给版本过旧的 client 派消息。这些都只在测试里对着假的 Slack 跑通，还没有连真的 Slack workspace 跑过。签名审批整条走通了：agent 用 `fednet client request-approval` 交上动作，hub 在 Slack 发审批卡，审批人点「批准」hub 才签名，结果经下行送回发起的 client、交给钩子；拒绝和过期也送回，不签名；执行方用 `fednet approval verify` 验签。同样只在测试里对着假的 Slack 跑通。推一个 `vX.Y.Z` tag 就会把 amd64、arm64 两个二进制发布成 GitHub release，部署和升级从那里下载；还没有发过版。** 下面各节照实写，不描述还不存在的东西。
 
 fednet 不是：
 
@@ -45,6 +45,8 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 本机 socket 在 [`internal/local`](../internal/local)。agent 拿不到 client 的凭证，只能经这个 socket 把请求交给常驻的 client 进程。socket 的路径由参数给出；不给组时权限是 0600，只有 client 所在的 Unix 用户能连，给了组 (`-socket-group`) 时是 0660，组里的用户也能连。socket 先建在一个只有 client 用户能进的临时目录里，权限和组设好后再改名到给定的路径。一个路径同一时间只归一个 client：启动时先对 socket 旁边的 `<socket>.lock` 加排他的 `flock`，拿不到就不启动，拿到后一直持有到进程退出 (进程死了由内核释放)。检查和改名都在持锁之后，所以路径上已有的 socket 一定是旧进程留下的，直接替换；路径上是别的文件时不启动。一个连接只承载一个请求：调用方写一个 JSON 请求，按 `cmd` 字段分派，client 回一个 JSON 回应后关闭连接。`post` 由 client 自己回答：把消息写进 outbox 就回 `msg_id`，不等 hub，hub 连不上也照样排队。其余命令由 client 经请求通道转给 hub，把 hub 的回答或拒绝的原因带回来，hub 的那一段另有一个比 socket 请求短的超时。`version` 回答答话的进程的版本和 pid；`handoff` 起新进程，等它就绪或起不来再回答，不受请求超时的限制。hub 的管理 socket 是同一套实现，只回答这两条。`fednet client` 的这几条命令只连 socket，不打开数据库；退出码是 0 成功、2 用法错误或请求不合法、3 没有权限连 socket 或 hub 不允许、4 连不上 client 或 hub，其它失败 (例如线程不存在) 是 1。client 与 hub 之间的 payload 是一个 JSON 对象，`type` 字段说明它是什么，格式在 [`internal/payload`](../internal/payload)，两端共用；post 的 payload 带线程 key 和正文。
 
 交接在 [`internal/handoff`](../internal/handoff)，用 `github.com/cloudflare/tableflip`。旧进程收到 `handoff` 就用自己的命令行起一个新进程 (二进制取路径上现在的那个)，把监听的 fd 传过去：hub 是 TCP 端口和管理 socket，client 是本机 socket，socket 连同它的锁文件一起传，锁跟着打开的文件走，两个进程都持有时不会松开。新进程打开数据库、接过 fd、开始回答之后报就绪：先经 `$NOTIFY_SOCKET` 告诉 systemd `MAINPID` 换了并且 `READY=1`，再告诉旧进程；新 hub 在这之前就开自己的 Socket Mode 连接，连上了才算就绪，Slack 拒绝 token 就退出、交接失败，两条连接并存期间两边收到同一个事件，靠库里的记录去重；补拉的起点也只在库里定：每条连接连上时在库里把连接的代数加一并定下起点，一次补拉做完时只有代数还是它开始时那个才推进最后看到的消息、清掉起点，所以旧进程晚做完的补拉动不了新进程的起点。旧进程这时停止接新连接，把手上的事做完才退出：socket 上的请求 (包括这次 `handoff`) 回答完，正在执行的钩子等它退出并记下结果 (库暂时写不进就等到写进)，正在发的 post 发到 Slack 不再收为止、已发的段数和交付都记进库，再断开全部下行 WebSocket、关掉自己的 Socket Mode 连接，退出码 0；client 按退避重连到新进程，没 ack 的消息按 `seq` 续传。出站、报警检查、审批扫描和钩子只在一个进程里跑：新进程等旧进程退出后才起它们。新进程在一个超时 (`-handoff-timeout`，默认一分钟) 内没就绪、或者退出了，就被杀掉，旧进程照常服务，`handoff` 回答失败的原因，新进程启动时的错误经一条传过去的管道带回来。两个进程短时同时写同一个 SQLite 库，所以只有旧二进制也能写的迁移才能走交接。版本的规矩在 [`internal/release`](../internal/release)：版本是 `vMAJOR.MINOR.PATCH`；hub 服务和自己同版本的 client，以及不低于它写死的最低版本的发布版，其它的 (包括 `dev` 对发布版) 不派消息。升级先 client 后 hub：新 client 要能连旧 hub。
+
+发版在 [`.github/workflows/release.yml`](../.github/workflows/release.yml)，推 `v*` tag 时触发：先调用 PR 用的 `ci.yml` 跑同一套检查，再确认 tag 指向的 commit 在 `origin/main` 的历史里，然后 amd64、arm64 各在同架构的 runner 上构建 (`CGO_ENABLED=0`、`-trimpath`，版本经 `-ldflags` 注入)，每个二进制跑一次 `fednet version`，打出的必须正好是 tag，都通过了才生成 `SHA256SUMS`、建 release、传资产。两道守卫是 [`.github/scripts`](../.github/scripts) 里的两个脚本，读不出来的一律不放行。手动触发 (`workflow_dispatch`) 只跑到构建和守卫，不发布。
 
 ## 3. 不变量
 
@@ -151,11 +153,14 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 仓库层面：
 
 52. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
+70. 发布的二进制打出的版本正好是 tag：tag 不是 `vMAJOR.MINOR.PATCH` (数字不带前导零) 或者版本不同就不发布 (退 1)，二进制跑不起来、什么都没打出也不发布 (退 4)。[`release-version.test.sh`](../.github/scripts/release-version.test.sh)
+71. 只发布已经在 `main` 上的 commit：不在 main 的历史里退 1，commit 或 main 解析不出来退 4，都不发布。[`release-on-main.test.sh`](../.github/scripts/release-on-main.test.sh)
 
 ## 4. 接口
 
 - 命令行：`fednet hub`、`fednet hub register`、`fednet hub revoke`、`fednet hub reassign`、`fednet hub handoff`、`fednet client`、`fednet client init`、`fednet client handoff`、`fednet client post`、`fednet client read-thread`、`fednet client open-thread`、`fednet client threads`、`fednet client adopt`、`fednet client channel-context`、`fednet client users`、`fednet client dm`、`fednet client request-approval`、`fednet approval verify`、`fednet version`，参数以 `fednet` 不带参数时打印的用法为准 ([`cmd/fednet/main.go`](../cmd/fednet/main.go))。
 - hub 配置文件 (每个 channel 的默认机器和开线程的权限、私信的默认机器、用户名单、报警阈值、审批卡的 channel 与审批人名单)：格式在 [`cmd/fednet/main.go`](../cmd/fednet/main.go) 的 `hubConfig`，例子在 [`deploy/hub.example.json`](../deploy/hub.example.json)。
+- 发版：release 的 tag、资产名和 `SHA256SUMS` 的格式见 [`deploy/README.md`](../deploy/README.md) 的「下载二进制」一节，部署和自己升级都按它下载；流水线在 [`.github/workflows/release.yml`](../.github/workflows/release.yml)。
 - 部署：hub 要的文件和参数见 [`deploy/README.md`](../deploy/README.md)，systemd 单元模板是 [`deploy/fednet-hub.service`](../deploy/fednet-hub.service)。
 - 入站：收事件、补拉和连接状态的查询在 [`internal/inbound/inbound.go`](../internal/inbound/inbound.go)，报警要的 `SlackLink` 由 `Receiver.DownFor` 实现，处理完一条消息后的通知是 `Receiver.Stored`；接 Socket Mode 的入口在 [`internal/inbound/socket.go`](../internal/inbound/socket.go)。
 - HTTP：只给 client 用，路径和帧格式在 [`internal/link/link.go`](../internal/link/link.go)；唤醒下行连接的 `Hub.WakeAll` 在 [`internal/link/wake.go`](../internal/link/wake.go)。

@@ -7,6 +7,28 @@
 
 机器本身怎么建、文件怎么装上去，不在这个仓里。
 
+## 下载二进制
+
+每个版本是 GitHub 上的一个 release，tag 是 `vX.Y.Z`，由推这个 tag 触发 [`release.yml`](../.github/workflows/release.yml) 发布。release 里有三个文件，部署和自己升级都按这几个名字下载：
+
+- `fednet_vX.Y.Z_linux_amd64`、`fednet_vX.Y.Z_linux_arm64`：静态链接的裸二进制 (`CGO_ENABLED=0`)，`fednet version` 打印的就是 `vX.Y.Z`。
+- `SHA256SUMS`：`sha256sum` 的标准格式，每行是哈希、两个空格、文件名。
+
+发布之前流水线先跑和 PR 相同的检查，再确认 tag 指向的 commit 已经在 `main` 上，每个架构的二进制在同架构的 runner 上构建，跑一遍 `fednet version`，打出的版本不等于 tag 就不发布。
+
+在要装的机器上下载、校验，再放到单元模板用的 `/usr/local/bin/fednet`：
+
+```sh
+v=vX.Y.Z arch=amd64   # arm64 machines: arch=arm64
+base=https://github.com/Luolc/fednet/releases/download/$v
+curl -fsSLO "$base/fednet_${v}_linux_${arch}"
+curl -fsSLO "$base/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
+```
+
+`sha256sum -c` 要打出 `fednet_vX.Y.Z_linux_<arch>: OK` 并退出 0；不是这样就不装。
+
 ## hub 要的文件
 
 | 文件 | 参数 | 说明 |
@@ -39,7 +61,7 @@ client 那边不需要 webhook：钩子放弃的消息由 client 经上行告诉
 
 先升 client，再升 hub：新版本的 client 要能连旧版本的 hub，反过来不保证。hub 不给版本过旧的 client 派消息，消息留在它的 outbox 里，报警里会说明是哪台、跑的什么版本。
 
-在 hub 机器上，把新的二进制放到 `/usr/local/bin/fednet`，然后：
+在 hub 机器上，按上面「下载二进制」一节把新的二进制放到 `/usr/local/bin/fednet`，然后：
 
 ```sh
 sudo systemctl reload fednet-hub
