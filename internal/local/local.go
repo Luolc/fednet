@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Luolc/fednet/internal/link"
@@ -54,7 +56,9 @@ const Timeout = 10 * time.Second
 // when escaped as a JSON string.
 const maxRequestBytes = 6*link.MaxPayload + 1024
 
-// Listen creates the socket at path, replacing a stale one. Without group
+// Listen creates the socket at path. A socket there that no one listens on
+// is left over from a client that stopped, and is replaced; a client still
+// listening on it keeps it, and Listen fails. Without group
 // only this Unix user can connect (mode 0600); with group, members of that
 // group can too (mode 0660), and this user must be a member of it.
 func Listen(path, group string) (net.Listener, error) {
@@ -68,6 +72,9 @@ func Listen(path, group string) (net.Listener, error) {
 			return nil, err
 		}
 		mode = 0o660
+	}
+	if err := checkFree(path); err != nil {
+		return nil, err
 	}
 	// The socket is created in a private directory and moved into place
 	// once its mode and group are set, so no one else can ever connect to
@@ -87,6 +94,30 @@ func Listen(path, group string) (net.Listener, error) {
 		return nil, err
 	}
 	return ln, nil
+}
+
+// checkFree returns nil if path does not exist or is a socket no one
+// listens on.
+func checkFree(path string) error {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Type() != os.ModeSocket {
+		return fmt.Errorf("local: %s exists and is not a socket", path)
+	}
+	conn, err := net.Dial("unix", path)
+	if err == nil {
+		conn.Close()
+		return fmt.Errorf("local: another client is listening on %s", path)
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return nil
+	}
+	return err
 }
 
 func setup(tmp, path string, mode os.FileMode, gid int) error {

@@ -181,6 +181,28 @@ func TestListen(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkMode(t, path, 0o600, os.Getgid())
+	// A second client on the same path is refused, and the first one keeps
+	// the socket.
+	if ln2, err := Listen(path, ""); err == nil {
+		ln2.Close()
+		t.Fatal("Listen on a path a client is listening on succeeded")
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("the first listener did not get the connection: %v", err)
+	}
 	ln.Close()
 
 	// With a group this user belongs to, other than its primary group if it
@@ -217,5 +239,19 @@ func checkMode(t *testing.T, path string, mode os.FileMode, gid int) {
 	}
 	if fi.Mode().Type() != os.ModeSocket || fi.Mode().Perm() != mode || int(fi.Sys().(*syscall.Stat_t).Gid) != gid {
 		t.Fatalf("%s: mode %v, gid %d; want a socket with mode %v, gid %d", path, fi.Mode(), fi.Sys().(*syscall.Stat_t).Gid, mode, gid)
+	}
+}
+
+func TestListenRefusesAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fednet.sock")
+	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ln, err := Listen(path, ""); err == nil {
+		ln.Close()
+		t.Fatal("Listen replaced a regular file")
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "not a socket" {
+		t.Fatalf("file now holds %q, %v", b, err)
 	}
 }
