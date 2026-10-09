@@ -452,10 +452,11 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	ctx, cancel := timeout(ctx, req)
 	defer cancel()
 	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", path)
+	c, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
 		return Response{}, err
 	}
+	conn := c.(*net.UnixConn)
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 	defer stop()
@@ -470,11 +471,19 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	// The daemon may answer before it has read all the content, with a
 	// refusal; that answer is what the caller needs, not the write error
 	// that follows it. So the content is sent while the answer is awaited,
-	// and the sending is given up once an answer is in.
+	// and the sending is given up once an answer is in. A source that
+	// ends short is the caller's error: the sending side is closed so
+	// that the daemon stops waiting for the rest, and that error is
+	// returned whatever the daemon then says.
 	sent := make(chan error, 1)
 	go func() {
 		for i, f := range files {
 			if _, err := io.CopyN(conn, f, req.Files[i].Size); err != nil {
+				if errors.Is(err, io.EOF) {
+					conn.CloseWrite()
+					sent <- fmt.Errorf("local: sending %s: %w", req.Files[i].Name, io.ErrUnexpectedEOF)
+					return
+				}
 				sent <- fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)
 				return
 			}
@@ -486,10 +495,13 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	// Whether the decode succeeded or not, the sender is ended: with an
 	// answer in, nothing more is read on the other side.
 	conn.Close()
-	if serr := <-sent; err != nil {
-		if serr != nil {
-			return Response{}, serr
-		}
+	serr := <-sent
+	switch {
+	case errors.Is(serr, io.ErrUnexpectedEOF):
+		return Response{}, serr
+	case err != nil && serr != nil:
+		return Response{}, serr
+	case err != nil:
 		return Response{}, err
 	}
 	return res, nil

@@ -506,9 +506,14 @@ func TestPostWithFiles(t *testing.T) {
 	if err != nil || res.Kind != BadRequest {
 		t.Fatalf("Do(refused post) = %+v, %v; want kind %q", res, err, BadRequest)
 	}
-	// A file shorter than declared is an error on the caller's side.
-	if _, err := Do(t.Context(), path, req, strings.NewReader("PN"), strings.NewReader("er")); err == nil || !strings.Contains(err.Error(), "sending a.png") {
+	// A file shorter than declared is an error on the caller's side,
+	// reported at once: the daemon is not left waiting for the rest.
+	start := time.Now()
+	if _, err := Do(t.Context(), path, req, strings.NewReader("PN"), strings.NewReader("er")); err == nil || !strings.Contains(err.Error(), "sending a.png") || !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("Do with a short file = %v, want an error naming it", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Do with a short file took %v, want it to return at once", d)
 	}
 	if _, err := Do(t.Context(), path, req, strings.NewReader("PNG")); err == nil {
 		t.Fatal("Do with fewer readers than files did not fail")
