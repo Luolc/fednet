@@ -8,7 +8,7 @@ fednet 让用户在 Slack 线程里和各台机器上的 coding agent 打交道�
 
 计划只有一个二进制 `fednet`，分两个子命令：`fednet hub` 跑在一台固定的 hub 机器上，负责和 Slack 的连接；`fednet client` 跑在每台 agent 机器 (工作站、数据机) 上，主动连到 hub，把消息交给本机的 agent。
 
-**当前状态：只有一个空的二进制骨架，子命令尚未实现。** 下面各节照实写，不描述还不存在的东西。
+**当前状态：有一个二进制骨架和两端的存储层，子命令尚未实现，存储层还没有被任何子命令用到。** 下面各节照实写，不描述还不存在的东西。
 
 fednet 不是：
 
@@ -20,11 +20,19 @@ fednet 不是：
 
 目前只有一个 Go 写的二进制 `fednet` ([`cmd/fednet`](../cmd/fednet))，用标准库 `flag` 分派三个子命令：`hub` 和 `client` 还是空壳，只报「尚未实现」并以 2 退出；`version` 打印构建时注入的版本号，未注入时打印 `dev`。
 
+存储层在 [`internal/store`](../internal/store)，用纯 Go 的 SQLite 驱动 `modernc.org/sqlite`，hub 和 client 各一个库文件、各一套表。hub 端有发给每台 client 的 outbox (按 `seq` 续传、按 ack 清理)、收上行消息的 inbox 和线程归属表；client 端有收下行消息的 inbox 和上行的 outbox。两端的 inbox 都按 `msg_id` 去重。
+
 ## 3. 不变量
 
-fednet 本身还只有空壳，也就还没有不变量。仓库层面目前只有一条：
+存储层：
 
-1. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
+1. hub outbox 的 `seq` 只增不减，outbox 删空、库重开之后也不回退。[`TestHubOutboxSeqNeverGoesBack`](../internal/store/store_test.go)
+2. inbox 按 `msg_id` 去重：同一条消息重复送达只入库一次，已交付的也不会再变回未交付。[`TestInboxDedup`](../internal/store/store_test.go)
+3. 迁移按库里记的版本号只跑一次，重复打开不重复执行。[`TestMigrate`](../internal/store/store_test.go)
+
+仓库层面：
+
+4. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
 
 ## 4. 接口
 
