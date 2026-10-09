@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,20 +186,25 @@ func writePKCS8(t *testing.T, path string, key any, mode os.FileMode) {
 	if err := os.WriteFile(path, b, mode); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReadPrivateKey(t *testing.T) {
 	dir := t.TempDir()
 	pub, priv := keyPair(t)
 	path := filepath.Join(dir, "key.pem")
-	writePKCS8(t, path, priv, 0o600)
-	got, err := ReadPrivateKey(path)
-	if err != nil {
-		t.Fatal(err)
-	}
 	c := sample()
-	if err := Verify(pub, c, Sign(got, c), c.ApprovedAt); err != nil {
-		t.Errorf("a signature by the key read back does not verify: %v", err)
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o440} {
+		writePKCS8(t, path, priv, mode)
+		got, err := ReadPrivateKey(path)
+		if err != nil {
+			t.Fatalf("mode %04o: %v", mode, err)
+		}
+		if err := Verify(pub, c, Sign(got, c), c.ApprovedAt); err != nil {
+			t.Errorf("mode %04o: a signature by the key read back does not verify: %v", mode, err)
+		}
 	}
 
 	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -207,15 +213,21 @@ func TestReadPrivateKey(t *testing.T) {
 	}
 	ecPath := filepath.Join(dir, "ec.pem")
 	writePKCS8(t, ecPath, ec, 0o600)
-	loose := filepath.Join(dir, "loose.pem")
-	writePKCS8(t, loose, priv, 0o644)
+	var loose []string
+	for _, mode := range []os.FileMode{0o604, 0o644, 0o444} {
+		p := filepath.Join(dir, fmt.Sprintf("loose%04o.pem", mode))
+		writePKCS8(t, p, priv, mode)
+		loose = append(loose, p)
+	}
 	openssh := filepath.Join(dir, "openssh.pem")
 	os.WriteFile(openssh, pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("x")}), 0o600)
 	plain := filepath.Join(dir, "plain")
 	os.WriteFile(plain, []byte("not a key\n"), 0o600)
 	for _, tt := range []struct{ path, want string }{
 		{ecPath, "want an Ed25519 key"},
-		{loose, "readable by group or others"},
+		{loose[0], "accessible to others (mode 0604)"},
+		{loose[1], "accessible to others (mode 0644)"},
+		{loose[2], "accessible to others (mode 0444)"},
 		{openssh, `want PRIVATE KEY (PKCS#8)`},
 		{plain, "is not PEM"},
 		{filepath.Join(dir, "missing"), "no such file"},

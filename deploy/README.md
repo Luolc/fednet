@@ -39,7 +39,7 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 | Slack app-level token | `-slack-app-token-file` | Socket Mode 用。 |
 | Slack bot token | `-slack-bot-token-file` | Web API 用。 |
 | 报警的 incoming webhook URL | `-alert-webhook-file` | 只放在 hub 上。 |
-| 审批签名的私钥 | `-approval-key-file` | Ed25519，PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`)，只有所有者能读。只放在 hub 上；公钥分发到各台 agent 机器给 `fednet approval verify` 用。 |
+| 审批签名的私钥 | `-approval-key-file` | Ed25519，PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`)，其他用户 (others) 不能有任何权限，属组可读 (`LoadCredential=` 交来的是 0440)。只放在 hub 上；公钥分发到各台 agent 机器给 `fednet approval verify -pubkey` 用，格式是 OpenSSH 的一行 `ssh-ed25519 <base64> [注释]`。 |
 | 管理 socket | `-admin-socket` | 收 `fednet hub handoff`。单元模板放在 `RuntimeDirectory` 下。 |
 | 升级请求 | `-upgrade-request` | hub 要升级时写的文件，由 root 的升级单元监视，见「升级」一节。单元模板放在 `RuntimeDirectory` 下。 |
 

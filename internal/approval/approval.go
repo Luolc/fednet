@@ -140,14 +140,17 @@ func Verify(pub ed25519.PublicKey, c Content, sig []byte, now time.Time) error {
 
 // ReadPrivateKey reads the hub's Ed25519 private key from the PKCS#8 PEM
 // file at path, the format 1Password's `op read` gives for an SSH key. A
-// file that group or others can read is refused. No error quotes the file.
+// file that others have any access to is refused; group read is allowed
+// because systemd's LoadCredential= hands the file over as 0440 in
+// $CREDENTIALS_DIRECTORY, a mount private to the service whose group is the
+// service's own. No error quotes the file.
 func ReadPrivateKey(path string) (ed25519.PrivateKey, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	if fi.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("approval: %s is readable by group or others (mode %04o), want 0600", path, fi.Mode().Perm())
+	if fi.Mode().Perm()&0o007 != 0 {
+		return nil, fmt.Errorf("approval: %s is accessible to others (mode %04o), want no access for others", path, fi.Mode().Perm())
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
