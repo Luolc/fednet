@@ -52,6 +52,10 @@ type Hub struct {
 	// and the client only learns that the request failed. Nil means every
 	// file GET fails.
 	Fetch func(ctx context.Context, client, id string) (File, io.ReadCloser, error)
+	// Upload posts the files of an upload from client: it reads each
+	// file's content from body, in order, Size bytes each. Errors are
+	// reported as Fetch's are. Nil means every upload fails.
+	Upload func(ctx context.Context, client string, u Upload, body io.Reader) error
 	// UpgradeTo, if set, is asked at each downlink handshake, accepted or
 	// refused, with the version in VersionHeader, and answers the release
 	// the client should upgrade to, or "": that goes to the client in
@@ -121,7 +125,33 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("POST "+UplinkPath, h.serveUplink)
 	mux.HandleFunc("POST "+RequestPath, h.serveRequest)
 	mux.HandleFunc("GET "+FilePath, h.serveFile)
+	mux.HandleFunc("POST "+UploadPath, h.serveUpload)
 	return mux
+}
+
+// serveUpload reads the header, hands it and the rest of the body to
+// Upload, and replies 204 when that returns nil.
+func (h *Hub) serveUpload(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.authorize(w, r)
+	if !ok {
+		return
+	}
+	if h.Upload == nil {
+		http.Error(w, "the hub takes no uploads", http.StatusInternalServerError)
+		return
+	}
+	// The header is bounded; the content after it is bounded by the
+	// sizes the header declares, which Upload checks before reading any.
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxFrameBytes))
+	var u Upload
+	if err := dec.Decode(&u); err != nil {
+		http.Error(w, "bad upload header", http.StatusBadRequest)
+		return
+	}
+	if h.fail(w, client, "upload", h.Upload(r.Context(), client, u, io.MultiReader(dec.Buffered(), r.Body))) {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Send queues payload for client and pushes it if client is connected.

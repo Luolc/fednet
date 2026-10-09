@@ -61,6 +61,11 @@ type Request struct {
 	Action    []byte `json:"action,omitempty"`
 	// File is the Slack file id FetchFile takes.
 	File string `json:"file,omitempty"`
+	// Files are the files a Post uploads: their content follows the
+	// request's JSON value on the connection, right after it, in order,
+	// each Size bytes. A post with files is not queued: the daemon hands
+	// it to the hub and replies once the hub has posted it in Slack.
+	Files []link.FileHeader `json:"files,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -94,19 +99,20 @@ const (
 
 // Timeout bounds one request on either side, except a Handoff, which is
 // bounded by how long the daemon gives the new process to become ready,
-// and a FetchFile, which gets FetchTimeout: a download takes longer.
+// and a FetchFile or a Post with files, which get FileTimeout: a transfer
+// takes longer.
 const (
-	Timeout      = 10 * time.Second
-	FetchTimeout = 5 * time.Minute
+	Timeout     = 10 * time.Second
+	FileTimeout = 5 * time.Minute
 )
 
-// timeout returns ctx bounded for a request of cmd.
-func timeout(ctx context.Context, cmd string) (context.Context, context.CancelFunc) {
-	switch cmd {
-	case Handoff:
+// timeout returns ctx bounded for req.
+func timeout(ctx context.Context, req Request) (context.Context, context.CancelFunc) {
+	switch {
+	case req.Cmd == Handoff:
 		return context.WithCancel(ctx)
-	case FetchFile:
-		return context.WithTimeout(ctx, FetchTimeout)
+	case req.Cmd == FetchFile || len(req.Files) > 0:
+		return context.WithTimeout(ctx, FileTimeout)
 	}
 	return context.WithTimeout(ctx, Timeout)
 }
@@ -244,6 +250,10 @@ type Server struct {
 	// Fetch fetches the file with the given Slack id into the files
 	// directory and returns its path; nil means FetchFile is not served.
 	Fetch func(ctx context.Context, id string) (string, error)
+	// Upload hands a post with files to the hub, reading their content
+	// from body; it is link.Client.Upload. Nil means such a post is not
+	// served.
+	Upload func(ctx context.Context, u link.Upload, body io.Reader) error
 }
 
 // Serve answers connections on ln until ctx is done. When it returns it has
@@ -272,14 +282,17 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(Timeout))
 	var req Request
 	var res Response
-	if err := json.NewDecoder(io.LimitReader(conn, maxRequestBytes)).Decode(&req); err != nil {
+	// The request is bounded; the files' content after it is bounded by
+	// the sizes the request declares.
+	dec := json.NewDecoder(io.LimitReader(conn, maxRequestBytes))
+	if err := dec.Decode(&req); err != nil {
 		res = badRequest("unreadable request: " + err.Error())
 	} else {
-		ctx, cancel := timeout(ctx, req.Cmd)
+		ctx, cancel := timeout(ctx, req)
 		defer cancel()
 		stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 		defer stop()
-		res = s.handle(ctx, req)
+		res = s.handle(ctx, req, io.MultiReader(dec.Buffered(), conn))
 	}
 	conn.SetWriteDeadline(time.Now().Add(Timeout))
 	if err := json.NewEncoder(conn).Encode(res); err != nil {
@@ -289,10 +302,17 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 
 func badRequest(msg string) Response { return Response{Error: msg, Kind: BadRequest} }
 
-// handle runs one request. A new command is a new case here.
-func (s *Server) handle(ctx context.Context, req Request) Response {
+// handle runs one request; body is what follows it on the connection, the
+// content of a post's files. A new command is a new case here.
+func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Response {
 	switch req.Cmd {
 	case Post:
+		if len(req.Files) > 0 {
+			if s.Upload == nil {
+				return badRequest("post with files is not served on this socket")
+			}
+			return s.upload(ctx, req, body)
+		}
 		if s.Post == nil {
 			return badRequest("post is not served on this socket")
 		}
@@ -342,6 +362,19 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 		return Response{Error: "post: " + err.Error()}
 	}
 	return Response{MsgID: id}
+}
+
+// upload hands a post with files to the hub and waits for it; the hub's
+// refusals come back with their kind, as a request's do.
+func (s *Server) upload(ctx context.Context, req Request, body io.Reader) Response {
+	if req.Thread == "" {
+		return badRequest("post needs a thread")
+	}
+	u := link.Upload{Thread: req.Thread, Text: req.Text, Files: req.Files}
+	if err := s.Upload(ctx, u, io.LimitReader(body, u.Total())); err != nil {
+		return failed(req.Cmd, err)
+	}
+	return Response{}
 }
 
 func (s *Server) fetchFile(ctx context.Context, req Request) Response {
@@ -401,9 +434,14 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 
 // Do sends req to the socket at path and returns the daemon's response. An
 // error means the daemon could not be reached or did not reply; a failed
-// request is a Response with Error set.
-func Do(ctx context.Context, path string, req Request) (Response, error) {
-	ctx, cancel := timeout(ctx, req.Cmd)
+// request is a Response with Error set. files is the content of
+// req.Files, one reader each, which Do sends after the request, each its
+// Size bytes; a reader that ends before that is an error.
+func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Response, error) {
+	if len(files) != len(req.Files) {
+		return Response{}, fmt.Errorf("local: %d files declared, %d given", len(req.Files), len(files))
+	}
+	ctx, cancel := timeout(ctx, req)
 	defer cancel()
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", path)
@@ -413,8 +451,18 @@ func Do(ctx context.Context, path string, req Request) (Response, error) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
 	defer stop()
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
+	// The content starts right after the JSON value: no newline between.
+	b, err := json.Marshal(req)
+	if err != nil {
 		return Response{}, err
+	}
+	if _, err := conn.Write(b); err != nil {
+		return Response{}, err
+	}
+	for i, f := range files {
+		if _, err := io.CopyN(conn, f, req.Files[i].Size); err != nil {
+			return Response{}, fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)
+		}
 	}
 	var res Response
 	if err := json.NewDecoder(conn).Decode(&res); err != nil {

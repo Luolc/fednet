@@ -84,8 +84,11 @@ commands:
         defaults are shown), says which uploaded files a client fetches
         before it hands a message to its hook (the types, "image/*" for
         all images, the largest file, the most one message's files add up
-        to) and the largest file a client may fetch at all, in bytes (the
-        defaults are shown: 20 MiB, 50 MiB, 200 MiB), and names the users,
+        to), the largest file a client may fetch at all, the largest file
+        and how many files a post may upload, in bytes (the defaults are
+        shown: 20 MiB, 50 MiB, 200 MiB, 50 MiB, 10), whether an upload
+        names the machine in its comment rather than in a block (for a
+        Slack that takes no blocks with an upload), and names the users,
         from that list, who may upgrade with /fednet upgrade and whether
         the hub upgrades on its own when it finds a new release (default
         yes):
@@ -95,7 +98,8 @@ commands:
          "approvals": {"channel": "C456", "approvers": ["U123"]},
          "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
          "files": {"prefetch_types": ["image/*", "application/pdf"], "prefetch_max_bytes": 20971520,
-                   "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200},
+                   "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200,
+                   "upload_max_bytes": 52428800, "upload_max_files": 10, "upload_comment": false},
          "upgrade": {"admins": ["U123"], "auto": true}}
         the admin socket takes hub handoff; D is how long a new process may
         take to become ready at a handoff; the upgrade request is the file
@@ -133,9 +137,12 @@ commands:
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
-  client post -socket PATH -thread KEY [-json] [--] TEXT
+  client post -socket PATH -thread KEY [-file PATH]... [-json] [--] [TEXT]
         post TEXT to a thread; prints the msg_id once the client has queued it;
-        put -- before a TEXT that starts with -
+        put -- before a TEXT that starts with -; with -file (repeatable) the
+        files are uploaded to the thread with TEXT, which may then be left
+        out, through the hub, which must be reachable: such a post is not
+        queued, and returns once Slack has it
   client read-thread -socket PATH [-json] THREAD-KEY
         print the messages of a thread, read by the hub
   client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
@@ -347,6 +354,13 @@ type hubConfig struct {
 		PrefetchMaxTotalBytes int64    `json:"prefetch_max_total_bytes"`
 		// FetchMaxBytes is the largest file the hub serves to a client.
 		FetchMaxBytes int64 `json:"fetch_max_bytes"`
+		// UploadMaxBytes is the largest file a post may upload, and
+		// UploadMaxFiles how many files one post may upload.
+		UploadMaxBytes int64 `json:"upload_max_bytes"`
+		UploadMaxFiles int   `json:"upload_max_files"`
+		// UploadComment makes an upload name the machine in the
+		// message's comment rather than in a block.
+		UploadComment bool `json:"upload_comment"`
 	} `json:"files"`
 	// Upgrade is about upgrades.
 	Upgrade struct {
@@ -413,7 +427,7 @@ func readHubConfig(path string) (hubConfig, error) {
 	if h := cfg.History; h.MaxMessages < 0 || h.MaxChars < 0 || h.MaxMessageChars < 0 {
 		return hubConfig{}, fmt.Errorf("%s: history limits must not be negative", path)
 	}
-	if f := cfg.Files; f.PrefetchMaxBytes < 0 || f.PrefetchMaxTotalBytes < 0 || f.FetchMaxBytes < 0 {
+	if f := cfg.Files; f.PrefetchMaxBytes < 0 || f.PrefetchMaxTotalBytes < 0 || f.FetchMaxBytes < 0 || f.UploadMaxBytes < 0 || f.UploadMaxFiles < 0 {
 		return hubConfig{}, fmt.Errorf("%s: files limits must not be negative", path)
 	}
 	return cfg, nil
@@ -455,7 +469,11 @@ func (c hubConfig) openThread() map[string][]string {
 // How the hub reaches Slack once it has the tokens; tests replace them
 // with fakes.
 var (
-	newSlack   = func(botToken string) slack.API { return slack.New(botToken) }
+	newSlack = func(botToken string, commentUpload bool) slack.API {
+		w := slack.New(botToken)
+		w.CommentUpload = commentUpload
+		return w
+	}
 	runInbound = inbound.Run
 )
 
@@ -552,7 +570,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	var sl slack.API
 	var bot string
 	if botToken != "" {
-		sl = newSlack(botToken)
+		sl = newSlack(botToken, cfg.Files.UploadComment)
 		// Which user the bot is decides which messages mention it; a
 		// hub that cannot find out serves no channel.
 		if bot, err = sl.Self(ctx); err != nil {
@@ -591,8 +609,9 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 			TTL: approvalTTL, Interval: approvalInterval, Stored: hub.WakeAll,
 		}
 	}
-	api := &hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals, MaxFetchBytes: cfg.Files.FetchMaxBytes}
-	hub.Answer, hub.Fetch = api.Answer, api.Fetch
+	api := &hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals,
+		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles}
+	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Request: *upgradeRequest, HandedOff: proc.Exit(),
 		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Auto: cfg.auto(),
@@ -934,7 +953,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	defer cancel()
 	served := make(chan error, 1)
 	go func() {
-		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get}).Serve(ctx, ln)
+		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get, Upload: c.Upload}).Serve(ctx, ln)
 	}()
 	// Ready before the predecessor is told to go: a failure here means
 	// this process exits and the predecessor stays.
@@ -1148,23 +1167,49 @@ func uplinkAlert(c *link.Client) func(ctx context.Context, text string) error {
 
 // clientPost hands a post to the client daemon through its socket and
 // prints the msg_id. It does not wait for the hub, and does not open the
-// database: only the daemon does.
+// database: only the daemon does. With -file it reads the files itself
+// and streams their content to the daemon after the request, so the
+// daemon never opens a path on a caller's behalf; such a post waits for
+// the hub to post it in Slack, and prints nothing.
 func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet client post", flag.ContinueOnError)
 	socket, asJSON := socketFlags(fs)
 	thread := fs.String("thread", "", "key of the thread to post to (required)")
-	if err := parseFlags(fs, args, 1); err != nil {
+	var paths []string
+	fs.Func("file", "file to upload with the post (repeatable)", func(path string) error {
+		paths = append(paths, path)
+		return nil
+	})
+	if err := parseFlags(fs, args, -1); err != nil {
 		return err
 	}
-	if *socket == "" || *thread == "" || fs.Arg(0) == "" {
-		return usageError("fednet client post: -socket, -thread and a non-empty TEXT are required")
+	if *socket == "" || *thread == "" || fs.NArg() > 1 || (fs.Arg(0) == "" && len(paths) == 0) {
+		return usageError("fednet client post: -socket, -thread and a non-empty TEXT or a -file are required")
 	}
-	res, err := do(ctx, *socket, local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0)})
+	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0)}
+	var files []io.Reader
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		req.Files = append(req.Files, link.FileHeader{Name: filepath.Base(path), Size: fi.Size()})
+		files = append(files, f)
+	}
+	res, err := do(ctx, *socket, req, files...)
 	if err != nil {
 		return err
 	}
 	if *asJSON {
 		return json.NewEncoder(stdout).Encode(res)
+	}
+	if len(paths) > 0 {
+		return nil
 	}
 	_, err = fmt.Fprintln(stdout, res.MsgID)
 	return err
@@ -1184,8 +1229,8 @@ func passEnv(names []string) []string {
 
 // do sends req to the client daemon's socket. A request that could not be
 // sent, or that failed, is an error with the exit code for why.
-func do(ctx context.Context, socket string, req local.Request) (local.Response, error) {
-	res, err := local.Do(ctx, socket, req)
+func do(ctx context.Context, socket string, req local.Request, files ...io.Reader) (local.Response, error) {
+	res, err := local.Do(ctx, socket, req, files...)
 	switch {
 	case errors.Is(err, iofs.ErrPermission):
 		return res, exitError{exitDenied, err}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -61,7 +62,7 @@ func TestHubRequests(t *testing.T) {
 	// on the user list.
 	f.AddChannel("C2", "")
 	config := filepath.Join(dir, "hub.json")
-	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}, "files": {"upload_max_bytes": 20}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stopHub := start(t, append([]string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, slackFlags...), &stdout, &stderr)
@@ -217,6 +218,56 @@ func TestHubRequests(t *testing.T) {
 		t.Fatalf("fetch-file of a malformed id: exit %d, want 2", code)
 	}
 
+	// post -file uploads the files to the thread through the hub, as a
+	// message from this machine with the text; the command reads the files
+	// itself. The uploaded file can then be read back by anyone the bot
+	// serves, fetch-file included. An upload over the hub's limits is
+	// refused.
+	shot := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(shot, []byte("PNG..."), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(dir, "build.log")
+	if err := os.WriteFile(log, []byte("error: ..."), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := fednet("client", "post", "-socket", socket, "-thread", thread, "-file", shot, "-file", log, "see these"); code != 0 || out != "" {
+		t.Fatalf("post -file: exit %d, stdout %q; want 0 and nothing printed", code, out)
+	}
+	replies, err := f.Replies(ctx, "C1", ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := replies[len(replies)-1]
+	if last.Text != "see these" || last.Machine != "workstation" || len(last.Files) != 2 || last.Files[0].Name != "shot.png" || last.Files[1].Name != "build.log" {
+		t.Fatalf("thread ends with %+v, want the upload from workstation with both files", last)
+	}
+	if uploaded, err := f.Download(ctx, last.Files[1]); err != nil {
+		t.Fatal(err)
+	} else if b, _ := io.ReadAll(uploaded); string(b) != "error: ..." {
+		t.Fatalf("the uploaded log holds %q", b)
+	}
+	code, out = fednet("client", "fetch-file", "-socket", socket, last.Files[0].ID)
+	if code != 0 || strings.TrimSpace(out) != filepath.Join(dir, "files", last.Files[0].ID, "shot.png") {
+		t.Fatalf("fetch-file of the uploaded file: exit %d, stdout %q", code, out)
+	}
+	if code, _ := fednet("client", "post", "-socket", socket, "-thread", thread, "-file", shot); code != 0 {
+		t.Fatalf("post -file without a text: exit %d", code)
+	}
+	if code, _ := fednet("client", "post", "-socket", socket, "-thread", thread, "-file", filepath.Join(dir, "empty")); code != 1 {
+		t.Fatalf("post -file of a missing file: exit %d, want 1", code)
+	}
+	big := filepath.Join(dir, "big.bin")
+	if err := os.WriteFile(big, make([]byte, 21), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := fednet("client", "post", "-socket", socket, "-thread", thread, "-file", big); code != 2 || !strings.Contains(stderr.String(), "over the hub's limit of 20") {
+		t.Fatalf("post -file over the limit: exit %d, want 2 and the hub's refusal", code)
+	}
+	if code, _ := fednet("client", "post", "-socket", socket, "-thread", "C1/1600000000.000001", "-file", shot); code != 1 {
+		t.Fatalf("post -file to a thread that does not exist: exit %d, want 1", code)
+	}
+
 	// A revoked client is denied; with the hub down a request fails at once.
 	if code, _ := fednet("hub", "revoke", "-db", hubDB, "workstation"); code != 0 {
 		t.Fatalf("hub revoke: exit %d", code)
@@ -232,6 +283,9 @@ func TestHubRequests(t *testing.T) {
 	}
 	if code, _ := fednet("client", "fetch-file", "-socket", socket, "F3"); code != 4 {
 		t.Fatalf("fetch-file with the hub down: exit %d, want 4", code)
+	}
+	if code, _ := fednet("client", "post", "-socket", socket, "-thread", thread, "-file", shot); code != 4 {
+		t.Fatalf("post -file with the hub down: exit %d, want 4", code)
 	}
 	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", "while the hub is down"); code != 4 || len(f.DMs("U1")) != 1 {
 		t.Fatalf("dm with the hub down: exit %d, DMs to U1 %q; want 4 and only the first", code, f.DMs("U1"))
@@ -356,9 +410,9 @@ func TestHubConfigFiles(t *testing.T) {
 		}
 		return p
 	}
-	cfg, err := readHubConfig(write("set.json", `{"files": {"prefetch_types": ["image/png"], "prefetch_max_bytes": 1000, "prefetch_max_total_bytes": 3000, "fetch_max_bytes": 5000}}`))
-	if err != nil || !reflect.DeepEqual(cfg.prefetch(), inbound.Prefetch{Types: []string{"image/png"}, MaxBytes: 1000, MaxTotal: 3000}) || cfg.Files.FetchMaxBytes != 5000 {
-		t.Fatalf("readHubConfig = %+v, %v; want the four values", cfg.Files, err)
+	cfg, err := readHubConfig(write("set.json", `{"files": {"prefetch_types": ["image/png"], "prefetch_max_bytes": 1000, "prefetch_max_total_bytes": 3000, "fetch_max_bytes": 5000, "upload_max_bytes": 7000, "upload_max_files": 3, "upload_comment": true}}`))
+	if err != nil || !reflect.DeepEqual(cfg.prefetch(), inbound.Prefetch{Types: []string{"image/png"}, MaxBytes: 1000, MaxTotal: 3000}) || cfg.Files.FetchMaxBytes != 5000 || cfg.Files.UploadMaxBytes != 7000 || cfg.Files.UploadMaxFiles != 3 || !cfg.Files.UploadComment {
+		t.Fatalf("readHubConfig = %+v, %v; want the seven values", cfg.Files, err)
 	}
 	// Left out, the types are nil (the default list), not an empty list
 	// (nothing fetched).
@@ -368,7 +422,7 @@ func TestHubConfigFiles(t *testing.T) {
 	if cfg, err := readHubConfig(write("none.json", `{"files": {"prefetch_types": []}}`)); err != nil || cfg.prefetch().Types == nil {
 		t.Fatalf("readHubConfig with an empty type list = %+v, %v; want an empty list, nothing fetched", cfg.Files, err)
 	}
-	if _, err := readHubConfig(write("bad.json", `{"files": {"fetch_max_bytes": -1}}`)); err == nil || !strings.Contains(err.Error(), "files limits must not be negative") {
+	if _, err := readHubConfig(write("bad.json", `{"files": {"upload_max_files": -1}}`)); err == nil || !strings.Contains(err.Error(), "files limits must not be negative") {
 		t.Fatalf("readHubConfig with a negative limit = %v, want it refused", err)
 	}
 }
@@ -382,7 +436,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if cfg.history() != (inbound.Limits{MaxMessages: inbound.DefaultMaxMessages, MaxChars: inbound.DefaultMaxChars, MaxMessageChars: inbound.DefaultMaxMessageChars}) {
 		t.Fatalf("the example's history limits are %+v, want the defaults", cfg.History)
 	}
-	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes {
+	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles || cfg.Files.UploadComment {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
 	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 {

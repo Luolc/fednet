@@ -427,3 +427,66 @@ func TestFetch(t *testing.T) {
 		t.Fatalf("Fetch without Slack = %v, want errNoSlack", err)
 	}
 }
+
+// Upload posts the files in the thread as a message from the client,
+// within the limits, which are checked before any content is read; a
+// file short of its size fails the upload.
+func TestUpload(t *testing.T) {
+	s, f := testServer(t)
+	s.MaxUploadBytes, s.MaxUploadFiles = 10, 2
+	ctx := t.Context()
+	ts, err := f.Start("C1", "U1", "please fix the build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread := slack.ThreadKey("C1", ts)
+	u := link.Upload{Thread: thread, Text: "see these", Files: []link.FileHeader{{Name: "shot.png", Size: 6}, {Name: "build.log", Size: 5}}}
+	if err := s.Upload(ctx, "workstation", u, strings.NewReader("PNG...error")); err != nil {
+		t.Fatal(err)
+	}
+	ms, err := f.Replies(ctx, "C1", ts)
+	if err != nil || len(ms) != 2 || ms[1].Text != "see these" || ms[1].Machine != "workstation" || len(ms[1].Files) != 2 || ms[1].Files[0].Name != "shot.png" || ms[1].Files[1].Size != 5 {
+		t.Fatalf("thread = %+v, %v; want the upload as a message from workstation with both files", ms, err)
+	}
+	if body, err := f.Download(ctx, ms[1].Files[0]); err != nil {
+		t.Fatal(err)
+	} else if b, _ := io.ReadAll(body); string(b) != "PNG..." {
+		t.Fatalf("the uploaded file holds %q", b)
+	}
+	refused := []struct {
+		name string
+		u    link.Upload
+		kind error
+		msg  string
+	}{
+		{"no files", link.Upload{Thread: thread}, link.ErrBadRequest, "at least one file"},
+		{"too many files", link.Upload{Thread: thread, Files: []link.FileHeader{{Name: "a", Size: 1}, {Name: "b", Size: 1}, {Name: "c", Size: 1}}}, link.ErrBadRequest, "at most 2 files, got 3"},
+		{"too big a file", link.Upload{Thread: thread, Files: []link.FileHeader{{Name: "a", Size: 11}}}, link.ErrBadRequest, "11 bytes, over the hub's limit of 10"},
+		{"an empty file", link.Upload{Thread: thread, Files: []link.FileHeader{{Name: "a", Size: 0}}}, link.ErrBadRequest, "file a is empty"},
+		{"a path for a name", link.Upload{Thread: thread, Files: []link.FileHeader{{Name: "../a", Size: 1}}}, link.ErrBadRequest, "is not a file name"},
+		{"a malformed thread", link.Upload{Thread: "C1", Files: []link.FileHeader{{Name: "a", Size: 1}}}, link.ErrBadRequest, "not a thread key"},
+		{"a thread that does not exist", link.Upload{Thread: "C1/1600000000.000001", Files: []link.FileHeader{{Name: "a", Size: 1}}}, link.ErrNotFound, "no thread"},
+	}
+	for _, tt := range refused {
+		r := strings.NewReader("abcdefghijklmnop")
+		err := s.Upload(ctx, "workstation", tt.u, r)
+		if !errors.Is(err, tt.kind) || !strings.Contains(err.Error(), tt.msg) {
+			t.Errorf("%s: Upload = %v, want %v saying %q", tt.name, err, tt.kind, tt.msg)
+		}
+		if tt.kind == link.ErrBadRequest && r.Len() != 16 {
+			t.Errorf("%s: %d bytes of content were read before the refusal", tt.name, 16-r.Len())
+		}
+	}
+	// Content short of the declared size fails, and posts nothing.
+	short := link.Upload{Thread: thread, Files: []link.FileHeader{{Name: "a.txt", Size: 5}}}
+	if err := s.Upload(ctx, "workstation", short, strings.NewReader("abc")); err == nil || !strings.Contains(err.Error(), "file a.txt ended 2 bytes short") {
+		t.Fatalf("Upload of a short file = %v, want an error saying so", err)
+	}
+	if ms, _ := f.Replies(ctx, "C1", ts); len(ms) != 2 {
+		t.Fatalf("thread has %d messages after a failed upload, want 2", len(ms))
+	}
+	s.Slack = nil
+	if err := s.Upload(ctx, "workstation", u, strings.NewReader("PNG...error")); !errors.Is(err, errNoSlack) {
+		t.Fatalf("Upload without Slack = %v, want errNoSlack", err)
+	}
+}

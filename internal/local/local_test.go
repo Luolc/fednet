@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -451,5 +452,64 @@ func TestFetchFile(t *testing.T) {
 	s.Fetch = nil
 	if res, err := Do(t.Context(), path, Request{Cmd: FetchFile, File: "F1"}); err != nil || res.Kind != BadRequest {
 		t.Fatalf("Do(fetch-file) without Fetch = %+v, %v; want a bad request", res, err)
+	}
+}
+
+// A post with files goes to the daemon's Upload with the content that
+// follows the request, and waits for it; one without files is queued as
+// before.
+func TestPostWithFiles(t *testing.T) {
+	st := openClientStore(t)
+	path := filepath.Join(t.TempDir(), "fednet.sock")
+	ln, err := Listen(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	var got []string
+	c := &link.Client{Store: st, ID: "workstation", Hub: "http://127.0.0.1:1"}
+	s := &Server{Post: c.Post, Upload: func(_ context.Context, u link.Upload, body io.Reader) error {
+		if u.Thread == "C1/bad" {
+			return link.Refuse(link.ErrBadRequest, "too big")
+		}
+		b, err := io.ReadAll(body)
+		if err != nil {
+			return err
+		}
+		got = append(got, u.Thread, u.Text, string(b))
+		for _, f := range u.Files {
+			got = append(got, f.Name)
+		}
+		return nil
+	}}
+	go func() { done <- s.Serve(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	})
+	req := Request{Cmd: Post, Thread: "C1/1.1", Text: "see", Files: []link.FileHeader{{Name: "a.png", Size: 3}, {Name: "b.log", Size: 2}}}
+	res, err := Do(t.Context(), path, req, strings.NewReader("PNG"), strings.NewReader("er"))
+	if err != nil || res.Error != "" || res.MsgID != "" {
+		t.Fatalf("Do(post with files) = %+v, %v; want nothing but success", res, err)
+	}
+	if want := []string{"C1/1.1", "see", "PNGer", "a.png", "b.log"}; !slices.Equal(got, want) {
+		t.Fatalf("Upload got %q, want %q", got, want)
+	}
+	if ms, _ := st.Outbox.Pending(t.Context()); len(ms) != 0 {
+		t.Fatal("a post with files was queued")
+	}
+	res, err = Do(t.Context(), path, Request{Cmd: Post, Thread: "C1/bad", Files: req.Files}, strings.NewReader("PNG"), strings.NewReader("er"))
+	if err != nil || res.Kind != BadRequest {
+		t.Fatalf("Do(refused post) = %+v, %v; want kind %q", res, err, BadRequest)
+	}
+	// A file shorter than declared is an error on the caller's side.
+	if _, err := Do(t.Context(), path, req, strings.NewReader("PN"), strings.NewReader("er")); err == nil || !strings.Contains(err.Error(), "sending a.png") {
+		t.Fatalf("Do with a short file = %v, want an error naming it", err)
+	}
+	if _, err := Do(t.Context(), path, req, strings.NewReader("PNG")); err == nil {
+		t.Fatal("Do with fewer readers than files did not fail")
 	}
 }

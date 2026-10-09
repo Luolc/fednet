@@ -943,3 +943,45 @@ func TestFetch(t *testing.T) {
 		t.Fatalf("Fetch with the hub down = %v, want ErrUnreachable", err)
 	}
 }
+
+// An upload: the header goes first, then each file's content; the hub's
+// Upload gets them in order and the refusals come back as a request's do.
+func TestUpload(t *testing.T) {
+	h, srv := testHub(t, nil)
+	var got []string
+	h.Upload = func(_ context.Context, client string, u Upload, body io.Reader) error {
+		if u.Thread == "C1/bad" {
+			return Refuse(ErrBadRequest, "not for %s", client)
+		}
+		for _, f := range u.Files {
+			b := make([]byte, f.Size)
+			if _, err := io.ReadFull(body, b); err != nil {
+				return err
+			}
+			got = append(got, f.Name+"="+string(b))
+		}
+		// Nothing follows the declared content.
+		if n, _ := io.Copy(io.Discard, body); n != 0 {
+			return errors.New("extra bytes")
+		}
+		got = append(got, "text="+u.Text)
+		return nil
+	}
+	c := &Client{ID: "a", Hub: srv.URL, Timeout: testTimeout}
+	u := Upload{Thread: "C1/1.1", Text: "see", Files: []FileHeader{{Name: "a.png", Size: 3}, {Name: "b.log", Size: 2}}}
+	// More than the declared sizes is not sent.
+	if err := c.Upload(t.Context(), u, strings.NewReader("PNGerextra")); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a.png=PNG", "b.log=er", "text=see"}; !slices.Equal(got, want) {
+		t.Fatalf("the hub got %q, want %q", got, want)
+	}
+	err := c.Upload(t.Context(), Upload{Thread: "C1/bad", Files: []FileHeader{{Name: "a", Size: 1}}}, strings.NewReader("x"))
+	if !errors.Is(err, ErrBadRequest) || !strings.Contains(err.Error(), "not for a") {
+		t.Fatalf("Upload refused = %v, want the refusal", err)
+	}
+	srv.Close()
+	if err := c.Upload(t.Context(), u, strings.NewReader("PNGer")); !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("Upload with the hub down = %v, want ErrUnreachable", err)
+	}
+}
