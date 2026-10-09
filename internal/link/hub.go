@@ -44,11 +44,12 @@ type Hub struct {
 	// Uplinked, if set, is called after an uplink message is stored in the
 	// inbox, before the client is told. It must not block.
 	Uplinked func()
-	// Connected, if set, is called with the client's id and the version
-	// in VersionHeader each time a downlink connection is up, once the
-	// client's session is registered: a message queued for the client
-	// from inside it is pushed on this connection.
-	Connected func(client, version string)
+	// UpgradeTo, if set, is asked at each downlink handshake, accepted or
+	// refused, with the version in VersionHeader, and answers the release
+	// the client should upgrade to, or "": that goes to the client in
+	// UpgradeHeader on the handshake's response, so a client the hub no
+	// longer serves is told too.
+	UpgradeTo func(version string) string
 
 	mu       sync.Mutex
 	seen     map[string]time.Time
@@ -198,6 +199,11 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if h.UpgradeTo != nil {
+		if to := h.UpgradeTo(r.Header.Get(VersionHeader)); to != "" {
+			w.Header().Set(UpgradeHeader, to)
+		}
+	}
 	if h.AcceptVersion != nil {
 		if err := h.AcceptVersion(r.Header.Get(VersionHeader)); err != nil {
 			slog.Warn("link: downlink refused, messages wait", "client", client, "err", err)
@@ -222,9 +228,6 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.unregister(client, s)
 	h.heartbeat(client)
-	if h.Connected != nil {
-		h.Connected(client, r.Header.Get(VersionHeader))
-	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

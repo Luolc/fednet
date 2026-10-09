@@ -80,7 +80,7 @@ hub 和 client 都不改自己的二进制。要升级时它们只写一个升�
 - Slack 里的 slash command `/fednet`。正式 app 的 manifest 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
 - hub 每小时查一次最新的 release，有新的就自己开始升级；配置里 `upgrade.auto` 设成 `false` 就只留手动。hub 跑的不是发布版 (`fednet version` 打出 `dev`) 时不查，也不能从 Slack 升级。
 
-一次升级的顺序：hub 先给每台在线、版本不是目标版本的 client 发升级通知，client 程序自己写请求文件 (不经过 agent)；hub 等它们都重连并报上新版本 (默认最多等十分钟)，全部到齐才写自己的请求文件、换成新进程。有一台失败或超时，hub 不升，汇总里列出是哪台，处理好了再发一次 `/fednet upgrade`；hub 自己到时没换成新进程，汇总里带上升级器写的结局 (回退到了哪个版本)。离线的 client 不等，它每次连上来时 hub 发现版本比自己旧，就再补发一次通知。开始、hub 开始升级、最后的汇总都作为普通消息发到报警 webhook 对应的 channel，没配 webhook 就只进日志。
+一次升级的顺序：hub 先给每台在线、版本不是目标版本的 client 发升级通知，client 程序自己写请求文件 (不经过 agent)；hub 等它们都重连并报上新版本 (默认最多等十分钟)，全部到齐才写自己的请求文件、换成新进程。有一台失败或超时，hub 不升，汇总里列出是哪台，处理好了再发一次 `/fednet upgrade`；hub 自己到时没换成新进程，汇总里带上升级器写的结局 (回退到了哪个版本)。离线的 client 不等，它每次连 hub 时 hub 发现版本比自己旧，就在握手的回应里再告诉它一次，hub 因版本过旧拒绝的 client 也一样能收到。开始、hub 开始升级、最后的汇总都作为普通消息发到报警 webhook 对应的 channel，没配 webhook 就只进日志。
 
 ### 手工升级
 

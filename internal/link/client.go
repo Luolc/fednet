@@ -50,6 +50,9 @@ type Client struct {
 	// with the message it does before returning, so a message it took is
 	// acted on before it is acked.
 	Divert func(ctx context.Context, payload []byte) (taken bool)
+	// Upgrade, if set, is called with the release named in UpgradeHeader
+	// on the hub's response to a dial, accepted or refused.
+	Upgrade func(ctx context.Context, version string)
 
 	// nudge has a buffer of one, so a Post is noticed even while the uplink
 	// loop is busy.
@@ -165,6 +168,11 @@ func (c *Client) downlink(ctx context.Context) error {
 	dctx, cancelDial := context.WithTimeout(ctx, c.timeout())
 	conn, res, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: c.httpClient(), HTTPHeader: c.header()})
 	cancelDial()
+	if res != nil && c.Upgrade != nil {
+		if to := res.Header.Get(UpgradeHeader); to != "" {
+			c.Upgrade(ctx, to)
+		}
+	}
 	if err != nil {
 		if res != nil && res.StatusCode == http.StatusUpgradeRequired {
 			// Dial keeps the first part of the body: the hub's reason.

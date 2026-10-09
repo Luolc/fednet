@@ -31,9 +31,9 @@ const (
 	DefaultFetch = 2500 * time.Millisecond
 	// cardTTL is how long an upgrade card waits for its click.
 	cardTTL = 10 * time.Minute
-	// tellTimeout bounds the queuing of a notice from Connected, which
-	// runs on the connection's own goroutine.
-	tellTimeout = 10 * time.Second
+	// respondTimeout bounds the answer to a click, which goes out after
+	// the click is acked.
+	respondTimeout = 10 * time.Second
 )
 
 // Hub decides the upgrades on the hub. Its Command and Click answer the
@@ -237,11 +237,18 @@ func (h *Hub) upgrade(ctx context.Context, c slack.Command) (slack.CommandReply,
 	for _, c := range clients {
 		shown.Clients = append(shown.Clients, c.line())
 	}
+	now := h.now()
 	h.mu.Lock()
 	if h.cards == nil {
 		h.cards = make(map[string]card)
 	}
-	h.cards[shown.ID] = card{user: c.User, from: h.Version, to: latest, at: h.now()}
+	// Cards nobody clicked are forgotten here, so they do not pile up.
+	for id, old := range h.cards {
+		if now.Sub(old.at) > cardTTL {
+			delete(h.cards, id)
+		}
+	}
+	h.cards[shown.ID] = card{user: c.User, from: h.Version, to: latest, at: now}
 	h.mu.Unlock()
 	return slack.CommandReply{Card: shown}, nil
 }
@@ -249,9 +256,10 @@ func (h *Hub) upgrade(ctx context.Context, c slack.Command) (slack.CommandReply,
 // Click applies a press on an upgrade card's button: the confirm button,
 // pressed by the admin the card was shown to while the card is still
 // good, starts the upgrade; the cancel button, or any press that does not
-// count, only tells the clicker.
-func (h *Hub) Click(ctx context.Context, c slack.Click) error {
-	h.respond(ctx, c, h.click(c))
+// count, only tells the clicker. The clicker is told after Click returns,
+// so the press is acked in time whatever Slack's response URL does.
+func (h *Hub) Click(_ context.Context, c slack.Click) error {
+	go h.respond(c, h.click(c))
 	return nil
 }
 
@@ -285,30 +293,28 @@ func (h *Hub) click(c slack.Click) string {
 }
 
 // respond tells the clicker text through the click's response URL,
-// which replaces the card; a response that fails is logged.
-func (h *Hub) respond(ctx context.Context, c slack.Click, text string) {
+// which replaces the card, within respondTimeout; a response that fails
+// is logged.
+func (h *Hub) respond(c slack.Click, text string) {
 	if h.Slack == nil || c.ResponseURL == "" {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), respondTimeout)
+	defer cancel()
 	if err := h.Slack.Respond(ctx, c.ResponseURL, text); err != nil {
 		slog.Warn("upgrade: answering the click", "user", c.User, "err", err)
 	}
 }
 
-// Connected tells client, which has just connected running version, to
-// upgrade to the hub's release when that is newer: on every connection
-// it makes while it is behind.
-func (h *Hub) Connected(client, version string) {
+// UpgradeTo answers, for a client dialing with version, the release it
+// should upgrade to: the hub's when that is newer, "" otherwise. It is
+// link.Hub.UpgradeTo, so a client behind the hub is told on every dial,
+// one the hub refuses to serve included.
+func (h *Hub) UpgradeTo(version string) string {
 	if !release.Newer(h.Version, version) {
-		return
+		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), tellTimeout)
-	defer cancel()
-	if err := h.tell(ctx, client, h.Version); err != nil {
-		slog.Warn("upgrade: telling a client that connected with an old release", "client", client, "err", err)
-		return
-	}
-	slog.Info("upgrade: told a client that connected with an old release to upgrade", "client", client, "from", version, "to", h.Version)
+	return h.Version
 }
 
 // tell queues the notice to upgrade to version for client.

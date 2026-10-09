@@ -587,4 +587,20 @@ func TestRespond(t *testing.T) {
 	if got["text"] != "已取消" || got["response_type"] != "ephemeral" || got["replace_original"] != true {
 		t.Fatalf("the response URL got %+v", got)
 	}
+	// A failure's error carries neither the URL nor its path: the URL
+	// lets whoever has it post in the sender's place.
+	srv.Close()
+	responseURL := srv.URL + "/actions/T0/secret-response-3f9a1c"
+	err := w.Respond(t.Context(), responseURL, "已取消")
+	if err == nil {
+		t.Fatal("Respond to a closed server did not fail")
+	}
+	for _, s := range []string{responseURL, "secret-response-3f9a1c", srv.URL} {
+		if strings.Contains(err.Error(), s) {
+			t.Fatalf("the error %q carries %q", err, s)
+		}
+	}
+	if !strings.Contains(err.Error(), "response_url") {
+		t.Fatalf("the error %q does not say what failed", err)
+	}
 }

@@ -532,7 +532,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if webhook != nil {
 		upgrades.Alert = webhook.Send
 	}
-	hub.Connected = upgrades.Connected
+	hub.UpgradeTo = upgrades.UpgradeTo
 	ln, err := proc.ListenTCP(*listen)
 	if err != nil {
 		return err
@@ -832,7 +832,8 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	}
 	defer st.Close()
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
-	c.Divert = (&upgrade.Client{Version: version, Request: *upgradeRequest, Alert: uplinkAlert(c)}).Divert
+	u := &upgrade.Client{Version: version, Request: *upgradeRequest, Alert: uplinkAlert(c)}
+	c.Divert, c.Upgrade = u.Divert, u.Notice
 	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err

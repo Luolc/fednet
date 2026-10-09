@@ -744,68 +744,106 @@ func TestOutdatedClientGetsNoDownlink(t *testing.T) {
 }
 
 // A message Divert takes is acked without going in the inbox, and acted
-// on before the ack; the others go in as usual. The hub's Connected is
-// told the client and its version once the connection is up, and a
-// message it queues then is pushed on that connection.
-func TestDivertAndConnected(t *testing.T) {
-	connected := make(chan string, 1)
-	var h *Hub
+// on before the ack; the others go in as usual. The release UpgradeTo
+// names for the client's version goes to the client on the response to
+// each dial, and the client's Upgrade gets it: on a dial the hub accepts
+// and, so that a client the hub no longer serves is told too, on one it
+// refuses, every time the client dials.
+func TestUpgradeHeader(t *testing.T) {
 	h, srv := testHubWith(t, func(hub *Hub) {
-		hub.Connected = func(client, version string) {
-			if _, err := hub.Send(t.Context(), client, []byte("upgrade")); err != nil {
-				t.Error(err)
+		hub.AcceptVersion = func(v string) error {
+			if v == "v0.1.0" {
+				return errors.New("too old")
 			}
-			connected <- client + " " + version
+			return nil
+		}
+		hub.UpgradeTo = func(v string) string {
+			if v == "v0.3.0" {
+				return ""
+			}
+			return "v0.3.0"
 		}
 	}, nil)
-	cs := openClientStore(t)
-	var taken []string
 	var mu sync.Mutex
-	cut := &cutter{}
-	c := &Client{
-		Store: cs, ID: "a", Hub: srv.URL, Header: http.Header{VersionHeader: {"v0.1.0"}},
-		Heartbeat: testHeartbeat, Backoff: testBackoff, Timeout: testTimeout,
-		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: cut.dial}},
-		Divert: func(_ context.Context, p []byte) bool {
-			if string(p) != "upgrade" {
-				return false
-			}
-			mu.Lock()
-			taken = append(taken, string(p))
-			mu.Unlock()
-			return true
-		},
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		c.Run(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-		c.HTTPClient.CloseIdleConnections()
-	})
-	select {
-	case got := <-connected:
-		if got != "a v0.1.0" {
-			t.Fatalf("Connected got %q, want the client and its version", got)
+	taken := make(map[string][]string)
+	told := make(map[string][]string)
+	start := func(id, version string) *Client {
+		cut := &cutter{}
+		c := &Client{
+			Store: openClientStore(t), ID: id, Hub: srv.URL, Header: http.Header{VersionHeader: {version}},
+			Heartbeat: testHeartbeat, Backoff: testBackoff, Timeout: testTimeout,
+			HTTPClient: &http.Client{Transport: &http.Transport{DialContext: cut.dial}},
+			Divert: func(_ context.Context, p []byte) bool {
+				if string(p) != "upgrade" {
+					return false
+				}
+				mu.Lock()
+				taken[id] = append(taken[id], string(p))
+				mu.Unlock()
+				return true
+			},
+			Upgrade: func(_ context.Context, to string) {
+				mu.Lock()
+				told[id] = append(told[id], to)
+				mu.Unlock()
+			},
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connected was not called")
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.Run(ctx)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+			c.HTTPClient.CloseIdleConnections()
+		})
+		return c
 	}
-	kept, err := h.Send(t.Context(), "a", []byte("for the hook"))
+	old := start("old", "v0.1.0")
+	behind := start("behind", "v0.2.0")
+	current := start("current", "v0.3.0")
+	count := func(id string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(told[id])
+	}
+	// The refused client is told on every dial it makes.
+	waitFor(t, "the refused client to be told twice", func() bool { return count("old") >= 2 })
+	waitFor(t, "the accepted clients to connect", func() bool { return h.Online("behind") && h.Online("current") })
+	if n := count("behind"); n != 1 {
+		t.Fatalf("the client behind was told %d times, want once for its one dial", n)
+	}
+	if n := count("current"); n != 0 {
+		t.Fatalf("the current client was told %d times, want never", n)
+	}
+	mu.Lock()
+	for _, id := range []string{"old", "behind"} {
+		for _, to := range told[id] {
+			if to != "v0.3.0" {
+				t.Fatalf("%s was told %q, want v0.3.0", id, told[id])
+			}
+		}
+	}
+	mu.Unlock()
+	// Divert on the accepted client: the diverted message is acked and
+	// not stored, the other stored.
+	if _, err := h.Send(t.Context(), "behind", []byte("upgrade")); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := h.Send(t.Context(), "behind", []byte("for the hook"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the hub outbox to be acked", func() bool { return outboxEmpty(t, h, "a") })
+	waitFor(t, "the hub outbox to be acked", func() bool { return outboxEmpty(t, h, "behind") })
 	mu.Lock()
 	defer mu.Unlock()
-	if !slices.Equal(taken, []string{"upgrade"}) {
-		t.Fatalf("Divert took %q, want the upgrade once", taken)
+	if !slices.Equal(taken["behind"], []string{"upgrade"}) {
+		t.Fatalf("Divert took %q, want the upgrade once", taken["behind"])
 	}
-	if got := inboxIDs(t, cs.Inbox); !slices.Equal(got, []string{kept.MsgID}) {
+	if got := inboxIDs(t, behind.Store.Inbox); !slices.Equal(got, []string{kept.MsgID}) {
 		t.Fatalf("inbox = %v, want only the message Divert left", got)
 	}
+	_, _ = old, current
 }

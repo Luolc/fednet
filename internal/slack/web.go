@@ -10,6 +10,8 @@ import (
 	"time"
 
 	slackgo "github.com/slack-go/slack"
+
+	"github.com/Luolc/fednet/internal/alert"
 )
 
 // maxRetries is how many times a call that Slack rate-limits is retried,
@@ -249,12 +251,18 @@ func (w *Web) Whisper(ctx context.Context, channel, user, text string) error {
 
 // Respond posts text through responseURL, replacing the message there,
 // as an ephemeral message.
+// The URL lets whoever has it post in the sender's place for a while,
+// so the error never carries it.
 func (w *Web) Respond(ctx context.Context, responseURL, text string) error {
-	return w.call(ctx, "response_url", func() error {
+	err := w.call(ctx, "response_url", func() error {
 		return slackgo.PostWebhookCustomHTTPContext(ctx, responseURL, w.http, &slackgo.WebhookMessage{
 			Text: text, ResponseType: "ephemeral", ReplaceOriginal: true,
 		})
 	})
+	if err != nil {
+		return errors.New(alert.Redact(responseURL, err.Error()))
+	}
+	return nil
 }
 
 // CommandAck is the payload a slash command is acked with: r, as an

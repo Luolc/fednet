@@ -152,7 +152,14 @@ func (b *bench) click(t *testing.T, user, id string, confirm bool) string {
 	if err := b.h.Click(t.Context(), slack.Click{ID: id, Approve: confirm, User: user, ResponseURL: url}); err != nil {
 		t.Fatal(err)
 	}
-	rs := b.sl.Responses(url)
+	// The answer goes out after Click returns.
+	var rs []string
+	for i := 0; i < 500; i++ {
+		if rs = b.sl.Responses(url); len(rs) > n {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if len(rs) != n+1 {
 		t.Fatalf("the clicker was told %q, want one more reply", rs)
 	}
@@ -230,7 +237,12 @@ func TestClickStartsTheUpgrade(t *testing.T) {
 	if err := b.h.Click(t.Context(), slack.Click{ID: card.ID, Approve: true, User: "U1", Bot: true, ResponseURL: "https://example.invalid/bot"}); err != nil {
 		t.Fatal(err)
 	}
-	if rs := b.sl.Responses("https://example.invalid/bot"); len(rs) != 1 || !strings.Contains(rs[0], "bot") {
+	var rs []string
+	for i := 0; i < 500 && len(rs) == 0; i++ {
+		rs = b.sl.Responses("https://example.invalid/bot")
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(rs) != 1 || !strings.Contains(rs[0], "bot") {
 		t.Fatalf("the bot was told %q", rs)
 	}
 	if s := b.click(t, "U1", "nonsense", true); !strings.Contains(s, "失效") {
@@ -406,30 +418,73 @@ func TestRolloutStopsWhenAClientFails(t *testing.T) {
 	}
 }
 
-// A client that connects with an older release than the hub's is told to
-// upgrade, each time it connects; one with the hub's release, or a newer
-// one, is not.
-func TestConnectedTellsOldClients(t *testing.T) {
+// A client dialing with an older release than the hub's is told the
+// hub's; one with the hub's release, a newer one, or no release is not.
+func TestUpgradeTo(t *testing.T) {
 	b := newBench(t)
 	b.h.Version = "v0.2.0"
-	b.h.Connected("workstation", "v0.1.0")
-	b.h.Connected("workstation", "v0.1.0")
-	b.h.Connected("datamachine", "v0.2.0")
-	b.h.Connected("idle", "v0.3.0")
-	b.h.Connected("odd", "dev")
-	if got := b.told("workstation"); len(got) != 2 || got[0] != "v0.2.0" || got[1] != "v0.2.0" {
-		t.Fatalf("workstation was told %q, want v0.2.0 at each connection", got)
-	}
-	for _, c := range []string{"datamachine", "idle", "odd"} {
-		if got := b.told(c); len(got) != 0 {
-			t.Fatalf("%s was told %q, want nothing", c, got)
+	for v, want := range map[string]string{"v0.1.0": "v0.2.0", "v0.1.9": "v0.2.0", "v0.2.0": "", "v0.3.0": "", "dev": "", "": ""} {
+		if got := b.h.UpgradeTo(v); got != want {
+			t.Errorf("UpgradeTo(%q) = %q, want %q", v, got, want)
 		}
 	}
-	// A hub that is not a release tells no one.
 	b.h.Version = "dev"
-	b.h.Connected("datamachine", "v0.1.0")
-	if got := b.told("datamachine"); len(got) != 0 {
-		t.Fatalf("a dev hub told datamachine %q", got)
+	if got := b.h.UpgradeTo("v0.1.0"); got != "" {
+		t.Fatalf("a dev hub tells clients to upgrade to %q", got)
+	}
+}
+
+// slowRespond is a Fake whose Respond returns only when its context is
+// done.
+type slowRespond struct{ *slack.Fake }
+
+func (slowRespond) Respond(ctx context.Context, _, _ string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// Click returns, so that the press can be acked, without waiting for the
+// answer to the clicker to go out.
+func TestClickDoesNotWaitForTheResponse(t *testing.T) {
+	b := newBench(t)
+	b.h.Slack = slowRespond{b.sl}
+	b.run(t)
+	card := b.cmd(t, "U1", "upgrade").Card
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.h.Click(t.Context(), slack.Click{ID: card.ID, Approve: true, User: "U1", ResponseURL: "https://example.invalid/slow"})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Click waited for the response")
+	}
+	if s := b.next(t); !strings.Contains(s, "开始升级到 v0.2.0") {
+		t.Fatalf("the hub said %q", s)
+	}
+}
+
+// Cards nobody clicked are forgotten when the next card is shown, once
+// past their TTL.
+func TestExpiredCardsAreForgotten(t *testing.T) {
+	b := newBench(t)
+	now := time.Unix(1_760_000_000, 0)
+	b.h.Now = func() time.Time { return now }
+	first := b.cmd(t, "U1", "upgrade").Card
+	now = now.Add(cardTTL + time.Second)
+	b.cmd(t, "U1", "upgrade")
+	now = now.Add(cardTTL + time.Second)
+	third := b.cmd(t, "U1", "upgrade").Card
+	b.h.mu.Lock()
+	n := len(b.h.cards)
+	_, keptThird := b.h.cards[third.ID]
+	b.h.mu.Unlock()
+	if n != 1 || !keptThird {
+		t.Fatalf("%d cards kept, want only the latest", n)
+	}
+	if s := b.click(t, "U1", first.ID, true); !strings.Contains(s, "失效") {
+		t.Fatalf("a press on a forgotten card was told %q", s)
 	}
 }
 
