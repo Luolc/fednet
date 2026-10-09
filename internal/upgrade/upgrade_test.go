@@ -121,6 +121,9 @@ func TestInstall(t *testing.T) {
 		if left, _ := filepath.Glob(filepath.Join(dir, ".fednet.upgrade-*")); len(left) != 0 {
 			t.Fatalf("a failed Install left %v behind", left)
 		}
+		if _, err := os.Stat(Previous(path)); err == nil {
+			t.Fatal("a failed Install kept a previous binary")
+		}
 	}
 	old(t, f.releases().Install(ctx, "v0.2.0", "riscv64", path))
 	old(t, f.releases().Install(ctx, "v0.3.0", "amd64", path))
@@ -140,6 +143,25 @@ func TestInstall(t *testing.T) {
 	}
 	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o755 {
 		t.Fatalf("the binary's mode is %04o, want 0755", fi.Mode().Perm())
+	}
+	// The old binary is kept, and Restore puts it back.
+	if b, err := os.ReadFile(Previous(path)); err != nil || string(b) != "old binary" {
+		t.Fatalf("the previous binary is %q, %v; want the old one", b, err)
+	}
+	if err := Restore(path); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "old binary" {
+		t.Fatalf("after Restore the binary is %q, want the old one", b)
+	}
+	if _, err := os.Stat(Previous(path)); err == nil {
+		t.Fatal("Restore left the previous binary behind")
+	}
+	if err := Restore(path); err == nil {
+		t.Fatal("Restore without a previous binary did not fail")
+	}
+	if err := f.releases().Install(ctx, "v0.2.0", "amd64", path); err != nil {
+		t.Fatal(err)
 	}
 	// A sums file written with sha256sum -b names the file with a star.
 	f.set("v0.2.0", Sums, []byte(fmt.Sprintf("%x *%s\n", sha256.Sum256([]byte("binary for amd64")), Asset("v0.2.0", "amd64"))))
@@ -219,5 +241,17 @@ func TestRequestFile(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".upgrade-*")); len(left) != 0 {
 		t.Fatalf("WriteRequest left %v behind", left)
+	}
+	if got := ReadResult(path); got != "" {
+		t.Fatalf("ReadResult without a result = %q", got)
+	}
+	if err := WriteResult(path, "ok v0.3.0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadResult(path); got != "ok v0.3.0" {
+		t.Fatalf("ReadResult = %q, want ok v0.3.0", got)
+	}
+	if got := ReadResult(path); got != "" {
+		t.Fatalf("ReadResult reads the result twice: %q", got)
 	}
 }

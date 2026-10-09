@@ -317,9 +317,16 @@ func TestRolloutClientsThenHub(t *testing.T) {
 	if v, ok := b.request(t); !ok || v != "v0.2.0" {
 		t.Fatalf("the hub's request is %q, %v; want v0.2.0", v, ok)
 	}
-	// The hub does not hand off within the wait.
-	if s := b.next(t); !strings.Contains(s, "没有换成新进程") {
+	// The hub does not hand off within the wait; the upgrader's result,
+	// left next to the request, goes into the summary and is consumed.
+	if err := WriteResult(b.h.Request, "failed v0.2.0: rolled back to v0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	if s := b.next(t); !strings.Contains(s, "没有换成新进程") || !strings.Contains(s, "升级器说：failed v0.2.0: rolled back to v0.1.0") {
 		t.Fatalf("the hub said %q", s)
+	}
+	if got := ReadResult(b.h.Request); got != "" {
+		t.Fatalf("the result %q is still there after the summary", got)
 	}
 	b.quiet(t)
 	b.h.mu.Lock()
@@ -400,7 +407,8 @@ func TestRolloutStopsWhenAClientFails(t *testing.T) {
 }
 
 // A client that connects with an older release than the hub's is told to
-// upgrade, once; one with the hub's release, or a newer one, is not.
+// upgrade, each time it connects; one with the hub's release, or a newer
+// one, is not.
 func TestConnectedTellsOldClients(t *testing.T) {
 	b := newBench(t)
 	b.h.Version = "v0.2.0"
@@ -409,8 +417,8 @@ func TestConnectedTellsOldClients(t *testing.T) {
 	b.h.Connected("datamachine", "v0.2.0")
 	b.h.Connected("idle", "v0.3.0")
 	b.h.Connected("odd", "dev")
-	if got := b.told("workstation"); len(got) != 1 || got[0] != "v0.2.0" {
-		t.Fatalf("workstation was told %q, want v0.2.0 once", got)
+	if got := b.told("workstation"); len(got) != 2 || got[0] != "v0.2.0" || got[1] != "v0.2.0" {
+		t.Fatalf("workstation was told %q, want v0.2.0 at each connection", got)
 	}
 	for _, c := range []string{"datamachine", "idle", "odd"} {
 		if got := b.told(c); len(got) != 0 {

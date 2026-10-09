@@ -831,8 +831,8 @@ func clientServe(ctx context.Context, args []string) (err error) {
 		return err
 	}
 	defer st.Close()
-	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version),
-		Divert: (&upgrade.Client{Version: version, Request: *upgradeRequest}).Divert}
+	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
+	c.Divert = (&upgrade.Client{Version: version, Request: *upgradeRequest, Alert: uplinkAlert(c)}).Divert
 	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err
@@ -971,9 +971,12 @@ func handOff(ctx context.Context, socket string) (old, now local.Response, err e
 // the unit watching it is not started again whatever happens next; asks
 // the daemon on -socket what it runs and refuses a release that is not
 // newer; downloads and checks the release's binary for this machine and
-// puts it at -binary in one rename; then hands the daemon off to it and
-// prints the versions handed off from and to.
-func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) error {
+// puts it at -binary in one rename, keeping the old one; then hands the
+// daemon off to it and prints the versions handed off from and to. A
+// handoff that fails puts the old binary back, so that the next start of
+// the service runs what is known to work. What became of the request is
+// written next to it, for the hub to read.
+func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	fs := flag.NewFlagSet("fednet upgrade", flag.ContinueOnError)
 	request := fs.String("request", "", "the upgrade request file (required)")
 	binary := fs.String("binary", "", "the binary to replace, which the daemon runs (required)")
@@ -995,6 +998,15 @@ func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) error 
 	if err != nil {
 		return err
 	}
+	defer func() {
+		text := "ok " + target
+		if err != nil {
+			text = "failed " + target + ": " + err.Error()
+		}
+		if werr := upgrade.WriteResult(*request, text); werr != nil {
+			slog.Warn("upgrade: writing the result", "err", werr)
+		}
+	}()
 	running, err := do(ctx, *socket, local.Request{Cmd: local.Version})
 	if err != nil {
 		return fmt.Errorf("asking what runs on %s: %w", *socket, err)
@@ -1008,7 +1020,13 @@ func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) error 
 	slog.Info("upgrade: installed", "version", target, "binary", *binary)
 	old, now, err := handOff(ctx, *socket)
 	if err != nil {
-		return fmt.Errorf("%s is in place, but the handoff to it failed, so the old process keeps serving: %w", target, err)
+		if rerr := upgrade.Restore(*binary); rerr != nil {
+			return fmt.Errorf("the handoff to %s failed: %w; and %v, so %s is at %s while the running %s keeps serving", target, err, rerr, target, *binary, running.Version)
+		}
+		return fmt.Errorf("the handoff to %s failed, rolled back to %s, which keeps serving: %w", target, running.Version, err)
+	}
+	if err := os.Remove(upgrade.Previous(*binary)); err != nil {
+		slog.Warn("upgrade: removing the old binary", "err", err)
 	}
 	_, err = fmt.Fprintf(stdout, "upgraded from %s (pid %d) to %s (pid %d)\n", old.Version, old.PID, now.Version, now.PID)
 	return err

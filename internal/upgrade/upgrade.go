@@ -139,12 +139,16 @@ func (r Releases) sum(ctx context.Context, version, asset string) ([]byte, error
 	return nil, fmt.Errorf("%s of %s does not list %s", Sums, version, asset)
 }
 
+// Previous is the path the binary Install replaced is kept at, a hard
+// link to it next to path, for Restore.
+func Previous(path string) string { return path + ".prev" }
+
 // Install downloads the binary of version for arch and puts it at path,
 // in place of what is there, once its SHA-256 matches the release's sums
-// file. The file at path is replaced in one rename, so a reader sees the
-// old binary or the new one, never a part; nothing is replaced when the
-// sum does not match, when the release has no binary for arch, or when
-// the download fails.
+// file. The binary there before is kept at Previous(path). The file at
+// path is replaced in one rename, so a reader sees the old binary or the
+// new one, never a part; nothing is replaced when the sum does not match,
+// when the release has no binary for arch, or when the download fails.
 func (r Releases) Install(ctx context.Context, version, arch, path string) error {
 	if !release.IsRelease(version) {
 		return fmt.Errorf("upgrade: %q is not a release", version)
@@ -186,10 +190,50 @@ func (r Releases) Install(ctx context.Context, version, arch, path string) error
 	if err := os.Chmod(f.Name(), 0o755); err != nil {
 		return fmt.Errorf("upgrade: %w", err)
 	}
+	// The old binary stays reachable as a second name of the same file,
+	// so path always names a whole binary: the old one until the rename,
+	// the new one after.
+	prev := Previous(path)
+	if err := os.Remove(prev); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("upgrade: %w", err)
+	}
+	if err := os.Link(path, prev); err != nil {
+		return fmt.Errorf("upgrade: keeping the old binary: %w", err)
+	}
 	if err := os.Rename(f.Name(), path); err != nil {
 		return fmt.Errorf("upgrade: %w", err)
 	}
 	return nil
+}
+
+// Restore puts the binary Install kept at Previous(path) back at path, in
+// one rename.
+func Restore(path string) error {
+	if err := os.Rename(Previous(path), path); err != nil {
+		return fmt.Errorf("upgrade: restoring the old binary: %w", err)
+	}
+	return nil
+}
+
+// WriteResult writes what became of the request at path, for whoever
+// wrote the request to read: the text, in the file Result names.
+func WriteResult(path, text string) error {
+	return os.WriteFile(Result(path), []byte(text+"\n"), 0o644)
+}
+
+// Result is the path the upgrader writes the outcome of the request at
+// path to.
+func Result(path string) string { return path + ".result" }
+
+// ReadResult returns the outcome written for the request at path, and
+// deletes it; "" when there is none.
+func ReadResult(path string) string {
+	b, err := os.ReadFile(Result(path))
+	if err != nil {
+		return ""
+	}
+	os.Remove(Result(path))
+	return strings.TrimSpace(string(b))
 }
 
 // ErrNoRequest is returned by ReadRequest when there is no request file.
@@ -204,7 +248,7 @@ func WriteRequest(path, version string) error {
 	}
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("upgrade: writing the request: %w", err)
 	}
 	_, err = f.WriteString(version + "\n")
 	if cerr := f.Close(); err == nil {

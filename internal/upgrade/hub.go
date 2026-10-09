@@ -88,9 +88,6 @@ type Hub struct {
 	// target is the release an upgrade in progress goes to; empty when
 	// none is.
 	target string
-	// notified maps each client to the release Connected last told it
-	// to upgrade to.
-	notified map[string]string
 	// start carries the upgrades Click begins to Run.
 	start     chan rollout
 	startOnce sync.Once
@@ -299,28 +296,16 @@ func (h *Hub) respond(ctx context.Context, c slack.Click, text string) {
 }
 
 // Connected tells client, which has just connected running version, to
-// upgrade to the hub's release when that is newer, once per release.
+// upgrade to the hub's release when that is newer: on every connection
+// it makes while it is behind.
 func (h *Hub) Connected(client, version string) {
 	if !release.Newer(h.Version, version) {
-		return
-	}
-	h.mu.Lock()
-	if h.notified == nil {
-		h.notified = make(map[string]string)
-	}
-	told := h.notified[client] == h.Version
-	h.notified[client] = h.Version
-	h.mu.Unlock()
-	if told {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), tellTimeout)
 	defer cancel()
 	if err := h.tell(ctx, client, h.Version); err != nil {
 		slog.Warn("upgrade: telling a client that connected with an old release", "client", client, "err", err)
-		h.mu.Lock()
-		delete(h.notified, client)
-		h.mu.Unlock()
 		return
 	}
 	slog.Info("upgrade: told a client that connected with an old release to upgrade", "client", client, "from", version, "to", h.Version)
@@ -417,16 +402,6 @@ func (h *Hub) rollout(ctx context.Context, r rollout) {
 	}
 	h.say(ctx, fmt.Sprintf("开始升级到 %s (%s 发起)：先升 client %s，离线不等 %s，已是 %s 的 %s；client 都升好了再升 hub (%s)",
 		r.to, r.by, list(todo), list(offline), r.to, list(there), h.Version))
-	h.mu.Lock()
-	if h.notified == nil {
-		h.notified = make(map[string]string)
-	}
-	for _, c := range todo {
-		if failed[c] == "" {
-			h.notified[c] = r.to
-		}
-	}
-	h.mu.Unlock()
 	left := h.await(ctx, todo, failed, r.to)
 	if left == nil {
 		// Stopped or handed off while waiting: nothing to report.
@@ -460,7 +435,13 @@ func (h *Hub) rollout(ctx context.Context, r rollout) {
 	case <-h.HandedOff:
 		h.say(ctx, "hub 已换成新进程，升级到 "+r.to+" 完成")
 	case <-t.C:
-		h.say(ctx, fmt.Sprintf("hub 在 %v 内没有换成新进程，还是 %s；原因在 hub 机器上升级器的日志里", or(h.Wait, DefaultWait), h.Version))
+		// The upgrader leaves what became of the request next to it: a
+		// failed handoff says it rolled back.
+		result := ReadResult(h.Request)
+		if result == "" {
+			result = "升级器没有留下结果，原因在 hub 机器上它的日志里"
+		}
+		h.say(ctx, fmt.Sprintf("hub 在 %v 内没有换成新进程，还是 %s；升级器说：%s", or(h.Wait, DefaultWait), h.Version, result))
 	case <-ctx.Done():
 	}
 }

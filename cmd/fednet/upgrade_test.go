@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -120,7 +121,7 @@ func TestUpgradeCommand(t *testing.T) {
 		releases = upgrade.Releases{Latest: "http://127.0.0.1:9/latest", Download: "http://127.0.0.1:9/download"}
 	})
 	before := fileSum(t, bin)
-	unchanged := func(t *testing.T, what string) {
+	unchanged := func(t *testing.T, what, result string) {
 		t.Helper()
 		if _, err := os.Stat(request); err == nil {
 			t.Fatalf("after %s the request is still there", what)
@@ -128,8 +129,14 @@ func TestUpgradeCommand(t *testing.T) {
 		if got := fileSum(t, bin); string(got) != string(before) {
 			t.Fatalf("after %s the binary changed", what)
 		}
+		if _, err := os.Stat(upgrade.Previous(bin)); err == nil {
+			t.Fatalf("after %s a previous binary is left behind", what)
+		}
 		if got := versionThrough(t, socket); got.PID != old.cmd.Process.Pid {
 			t.Fatalf("after %s the socket is answered by pid %d, want the old process %d", what, got.PID, old.cmd.Process.Pid)
+		}
+		if got := upgrade.ReadResult(request); !strings.Contains(got, result) {
+			t.Fatalf("after %s the result is %q, want %q in it", what, got, result)
 		}
 	}
 	args := []string{"upgrade", "-request", request, "-binary", bin, "-socket", socket}
@@ -158,7 +165,7 @@ func TestUpgradeCommand(t *testing.T) {
 	if code := run(ctx, args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "not newer than the running v0.1.0") {
 		t.Fatalf("upgrade to the running release: exit %d, stderr %q", code, stderr.String())
 	}
-	unchanged(t, "a refused request")
+	unchanged(t, "a refused request", "failed v0.1.0: refusing")
 
 	// The hub tells the client to upgrade: the client writes the request.
 	if _, err := hub.Send(ctx, "workstation", []byte(`{"type":"upgrade","version":"v0.2.0"}`)); err != nil {
@@ -174,7 +181,28 @@ func TestUpgradeCommand(t *testing.T) {
 	if code := run(ctx, args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "does not match its sum") {
 		t.Fatalf("upgrade with a bad sum: exit %d, stderr %q", code, stderr.String())
 	}
-	unchanged(t, "a download that does not match")
+	unchanged(t, "a download that does not match", "failed v0.2.0: upgrade: "+upgrade.Asset("v0.2.0", runtime.GOARCH)+" does not match")
+
+	// The release's binary cannot start: the handoff fails, the old binary
+	// is put back, and it still starts.
+	if err := upgrade.WriteRequest(request, "v0.2.0"); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(dir, "broken")
+	if err := os.WriteFile(broken, []byte("#!/bin/sh\necho 'cannot start' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rel.publish(t, "v0.2.0", broken, fileSum(t, broken))
+	stderr = syncBuffer{}
+	if code := run(ctx, args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "rolled back to v0.1.0") {
+		t.Fatalf("upgrade to a binary that cannot start: exit %d, stderr %q", code, stderr.String())
+	}
+	unchanged(t, "a handoff that failed", "rolled back to v0.1.0")
+	check := exec.Command(bin, "version")
+	check.Env = append(os.Environ(), asFednet+"=1")
+	if out, err := check.Output(); err != nil || strings.TrimSpace(string(out)) != version {
+		t.Fatalf("the restored binary printed %q, %v; want %q", out, err, version)
+	}
 
 	// The release is good: the binary is replaced and the client handed
 	// off to a process of it.
@@ -188,6 +216,12 @@ func TestUpgradeCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(request); err == nil {
 		t.Fatal("the request is still there after the upgrade")
+	}
+	if got := upgrade.ReadResult(request); got != "ok v0.2.0" {
+		t.Fatalf("the result is %q, want ok v0.2.0", got)
+	}
+	if _, err := os.Stat(upgrade.Previous(bin)); err == nil {
+		t.Fatal("the previous binary is left behind after the upgrade")
 	}
 	if got, want := fileSum(t, bin), fileSum(t, fednetBinary(t)); string(got) != string(want) {
 		t.Fatal("the binary is not the release's")
