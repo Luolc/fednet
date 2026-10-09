@@ -71,7 +71,7 @@ func TestCredentialFile(t *testing.T) {
 }
 
 // testRecheck is how often the test hub checks open downlinks again.
-const testRecheck = 20 * time.Millisecond
+const testRecheck = 200 * time.Millisecond
 
 // testHub is a link.Hub authenticating against a fresh registry, served by
 // an httptest server.
@@ -227,11 +227,12 @@ func TestIdentifyErrors(t *testing.T) {
 }
 
 // connect opens a downlink with hdr, failing the test if it is refused,
-// and returns the frames read from it; the channel is closed when the
-// connection is. One reader for the connection's life: a Read whose
-// context ends closes the connection.
-func connect(t *testing.T, srv *httptest.Server, hdr http.Header) <-chan []byte {
+// and returns the frames read from it and when the dial started; the
+// channel is closed when the connection is. One reader for the
+// connection's life: a Read whose context ends closes the connection.
+func connect(t *testing.T, srv *httptest.Server, hdr http.Header) (<-chan []byte, time.Time) {
 	t.Helper()
+	start := time.Now()
 	conn, _, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http")+link.DownlinkPath,
 		&websocket.DialOptions{HTTPHeader: hdr})
 	if err != nil {
@@ -249,13 +250,13 @@ func connect(t *testing.T, srv *httptest.Server, hdr http.Header) <-chan []byte 
 			frames <- b
 		}
 	}()
-	return frames
+	return frames, start
 }
 
-// dropped reports whether the connection behind frames is closed within a
-// few rechecks.
-func dropped(frames <-chan []byte) bool {
-	timeout := time.After(10 * testRecheck)
+// closedBy reports whether the connection behind frames is closed by
+// deadline.
+func closedBy(frames <-chan []byte, deadline time.Time) bool {
+	timeout := time.After(time.Until(deadline))
 	for {
 		select {
 		case _, ok := <-frames:
@@ -266,6 +267,13 @@ func dropped(frames <-chan []byte) bool {
 			return false
 		}
 	}
+}
+
+// withinRecheck is the deadline for a connection dialed at start to be
+// dropped: its first recheck plus room for scheduling. A recheck twice as
+// long misses it whatever the timing.
+func withinRecheck(start time.Time) time.Time {
+	return start.Add(testRecheck + testRecheck/2)
 }
 
 // receives reports whether frames gets the next message queued for client.
@@ -284,6 +292,8 @@ func receives(t *testing.T, h *link.Hub, client string, frames <-chan []byte) bo
 
 // An open downlink is dropped within a recheck once its client is revoked
 // or re-registered with another credential; other clients stay connected.
+// Each changed connection is dialed just before the change, so its first
+// recheck is the one that must drop it.
 func TestRegistryChangeDropsConnection(t *testing.T) {
 	ctx := t.Context()
 	st, h, srv := testHub(t)
@@ -298,43 +308,45 @@ func TestRegistryChangeDropsConnection(t *testing.T) {
 		}
 		creds[id] = c
 	}
-	ws := connect(t, srv, header("workstation", creds["workstation"], "1"))
-	dm := connect(t, srv, header("datamachine", creds["datamachine"], "1"))
 
 	// Unchanged registry: the connection outlives several rechecks.
-	if dropped(ws) {
+	dm, start := connect(t, srv, header("datamachine", creds["datamachine"], "1"))
+	if closedBy(dm, start.Add(3*testRecheck)) {
 		t.Fatal("connection of a registered client was dropped")
 	}
 
+	ws, start := connect(t, srv, header("workstation", creds["workstation"], "1"))
 	if err := st.Revoke(ctx, "workstation"); err != nil {
 		t.Fatal(err)
 	}
-	if !dropped(ws) {
-		t.Fatal("connection still open after Revoke")
+	if !closedBy(ws, withinRecheck(start)) {
+		t.Fatal("connection still open a recheck after Revoke")
 	}
 	if down, up, _ := dial(t, srv, header("workstation", creds["workstation"], "1")); down != http.StatusUnauthorized || up != http.StatusUnauthorized {
 		t.Fatalf("after Revoke: downlink %d, uplink %d; want 401, 401", down, up)
 	}
+	if !receives(t, h, "datamachine", dm) {
+		t.Fatal("datamachine stopped receiving after another client was revoked")
+	}
 
 	// Re-registering with a new credential drops the old one's connection.
+	// The new dial replaces the connection above as datamachine's session.
 	old := creds["datamachine"]
 	fresh, err := New("datamachine")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !receives(t, h, "datamachine", dm) {
-		t.Fatal("datamachine stopped receiving after another client was revoked")
-	}
+	dm, start = connect(t, srv, header("datamachine", old, "1"))
 	if err := st.Register(ctx, "datamachine", fresh.Hash()); err != nil {
 		t.Fatal(err)
 	}
-	if !dropped(dm) {
-		t.Fatal("connection with the replaced credential still open after Register")
+	if !closedBy(dm, withinRecheck(start)) {
+		t.Fatal("connection with the replaced credential still open a recheck after Register")
 	}
 	if down, up, _ := dial(t, srv, header("datamachine", old, "1")); down != http.StatusUnauthorized || up != http.StatusUnauthorized {
 		t.Fatalf("replaced credential: downlink %d, uplink %d; want 401, 401", down, up)
 	}
-	dm = connect(t, srv, header("datamachine", fresh, "1"))
+	dm, _ = connect(t, srv, header("datamachine", fresh, "1"))
 	if !receives(t, h, "datamachine", dm) {
 		t.Fatal("the new credential's connection does not receive")
 	}
