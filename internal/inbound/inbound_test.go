@@ -522,6 +522,73 @@ func TestBackfillRetriesFromWhereItFailed(t *testing.T) {
 	}
 }
 
+// gatedHistory is a Slack whose History of C1 waits, once entered, until
+// released or its context is done.
+type gatedHistory struct {
+	slack.API
+	entered, release chan struct{}
+}
+
+func (g *gatedHistory) History(ctx context.Context, channel, from string) ([]slack.Message, error) {
+	ms, err := g.API.History(ctx, channel, from)
+	if channel == "C1" {
+		close(g.entered)
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return ms, err
+}
+
+// A backfill still running when the connection drops and comes back must
+// not clear the start the new connection fixed, whether it then finishes
+// or is cancelled: the new connection's backfill reads the gap.
+func TestBackfillOfOldConnectionKeepsNewStart(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "old backfill finishes", true: "old backfill is cancelled"}[cancelled], func(t *testing.T) {
+			ctx := t.Context()
+			r, f := newReceiver(t)
+			handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: "first"}))
+			connected(t, r)
+			gate := &gatedHistory{API: f, entered: make(chan struct{}), release: make(chan struct{})}
+			r.Slack = gate
+			octx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- r.Backfill(octx) }()
+			select {
+			case <-gate.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the old backfill did not get to C1's history")
+			}
+			// The old backfill has read C1; the connection drops, a reply
+			// is posted, the connection comes back and fixes its start.
+			r.Disconnected()
+			post(t, f, "C1", slack.Message{User: "U1", Text: "gap"})
+			connected(t, r)
+			if cancelled {
+				cancel()
+			} else {
+				close(gate.release)
+			}
+			if err := <-done; (err == nil) == cancelled {
+				t.Fatalf("the old backfill returned %v, cancelled %v", err, cancelled)
+			}
+			r.Slack = f
+			handle(t, r, post(t, f, "C2", slack.Message{User: "U1", Text: "new live"}))
+			runBackfill(t, r)
+			if got, want := all(t, r.Store), []string{"first", "gap", "new live"}; !slices.Equal(got, want) {
+				t.Fatalf("queued = %q, want %q", got, want)
+			}
+			if from, _ := r.Store.SlackState(ctx, store.BackfillFrom); from != "" {
+				t.Fatalf("BackfillFrom after the new backfill = %q, want empty", from)
+			}
+		})
+	}
+}
+
 // The Receiver is the watch's view of the Slack connection.
 var _ watch.SlackLink = (*Receiver)(nil)
 

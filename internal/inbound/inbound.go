@@ -77,9 +77,16 @@ type Receiver struct {
 	// Now returns the current time; nil means time.Now.
 	Now func() time.Time
 
+	// mu guards the fields below, and serializes Connected's fixing of
+	// the backfill's start with a backfill's clearing of it.
 	mu        sync.Mutex
 	connected bool
 	since     time.Time
+	// generation counts the connections: a backfill clears the start it
+	// read only if no connection has come up since, so that a backfill of
+	// the connection before cannot clear what Connected fixed for this
+	// one.
+	generation int
 }
 
 // Handle takes in ev: if it is a message to hand on, Handle records it and
@@ -216,10 +223,11 @@ func (r *Receiver) tell(ctx context.Context, tx *store.Hub, thread, text string)
 // seen on.
 func (r *Receiver) Connected(ctx context.Context) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.connected {
 		r.connected, r.since = true, r.now()
 	}
-	r.mu.Unlock()
+	r.generation++
 	st := r.Store
 	from, err := st.SlackState(ctx, store.LastSeen)
 	if err != nil {
@@ -240,12 +248,17 @@ func (r *Receiver) Connected(ctx context.Context) error {
 // conversation the bot is in, the messages after the point Connected
 // fixed, at most Window back, and the replies in that conversation's
 // owned threads after it. There is nothing to read before the hub has seen
-// any message. The start is cleared only when all of it has been read, so
-// that a backfill that failed partway starts from the same place next
-// time, and so does a hub that restarted.
+// any message. The start is cleared only when all of it has been read, and
+// only if no connection has come up meanwhile, so that a backfill that
+// failed partway starts from the same place next time, and so does a hub
+// that restarted, and so does the connection after one whose backfill was
+// still running.
 func (r *Receiver) Backfill(ctx context.Context) error {
 	st := r.Store
+	r.mu.Lock()
+	generation := r.generation
 	from, err := st.SlackState(ctx, store.BackfillFrom)
+	r.mu.Unlock()
 	if err != nil || from == "" {
 		return err
 	}
@@ -262,7 +275,13 @@ func (r *Receiver) Backfill(ctx context.Context) error {
 			return fmt.Errorf("inbound: backfill %s: %w", c.ID, err)
 		}
 	}
-	// Everything up to now has been read.
+	// Everything up to now has been read, unless a newer connection has
+	// fixed a start of its own, which is its backfill's to clear.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.generation != generation {
+		return nil
+	}
 	if err := st.AdvanceLastSeen(ctx, slackTS(now)); err != nil {
 		return err
 	}

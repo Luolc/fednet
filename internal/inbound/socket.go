@@ -67,9 +67,12 @@ func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) err
 		case ev := <-t.Events():
 			switch ev.Type {
 			case socketmode.EventTypeConnected:
-				// Connected must have fixed the backfill's start before
-				// the connection's first message is handled; without
-				// the database nothing can be handled anyway.
+				// The backfill of the connection before has no more to
+				// do: what it had not read, this one's reads. Connected
+				// must have fixed the backfill's start before the
+				// connection's first message is handled; without the
+				// database nothing can be handled anyway.
+				backfill.stop()
 				for r.Connected(ctx) != nil {
 					if err := wait(ctx, retry); err != nil {
 						return err
