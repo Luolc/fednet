@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Luolc/fednet/internal/link"
@@ -205,6 +206,55 @@ func TestOpenThread(t *testing.T) {
 	// besides the first one.
 	if posts.n != 2 {
 		t.Fatalf("Slack got %d posts, want 2", posts.n)
+	}
+}
+
+// lastPost is a Slack API that remembers the ts of the last Post and can
+// fail Delete.
+type lastPost struct {
+	slack.API
+	ts         string
+	failDelete bool
+}
+
+func (l *lastPost) Post(ctx context.Context, channel, text string) (string, error) {
+	ts, err := l.API.Post(ctx, channel, text)
+	l.ts = ts
+	return ts, err
+}
+
+func (l *lastPost) Delete(ctx context.Context, channel, ts string) error {
+	if l.failDelete {
+		return errors.New("slack is down")
+	}
+	return l.API.Delete(ctx, channel, ts)
+}
+
+// When the owner of a new thread cannot be recorded, its message is
+// deleted and the caller gets an error.
+func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
+	s, f := testServer(t)
+	posts := &lastPost{API: f}
+	s.Slack = posts
+	s.OpenThread = map[string][]string{"C1": {"workstation"}}
+	s.Store.Close()
+	ctx := t.Context()
+
+	_, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	if err == nil || !strings.Contains(err.Error(), "deleted") {
+		t.Fatalf("open-thread with a failing store = %v, want an error saying the message was deleted", err)
+	}
+	if posts.ts == "" {
+		t.Fatal("open-thread did not post")
+	}
+	if _, err := f.Replies(ctx, "C1", posts.ts); !errors.Is(err, slack.ErrNotFound) {
+		t.Fatalf("the thread is still in Slack: %v", err)
+	}
+
+	posts.failDelete = true
+	_, err = answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	if err == nil || !strings.Contains(err.Error(), "stays in Slack") {
+		t.Fatalf("open-thread when the delete fails too = %v, want an error saying the thread stays", err)
 	}
 }
 

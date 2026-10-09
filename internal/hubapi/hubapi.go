@@ -148,8 +148,8 @@ func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {
 }
 
 // openThread posts the thread, then records its owner. If recording fails
-// the thread stays in Slack without an owner, as a thread from before
-// fednet does.
+// it deletes the message it posted, so no thread is left in Slack without
+// an owner, and fails.
 func (s *Server) openThread(ctx context.Context, client string, r Request) (Reply, error) {
 	if r.Channel == "" || r.Text == "" {
 		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
@@ -169,7 +169,11 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	}
 	key := slack.ThreadKey(r.Channel, ts)
 	if err := s.Store.Claim(ctx, key, client); err != nil {
-		return Reply{}, fmt.Errorf("thread %s is open, but recording its owner failed: %w", key, err)
+		// The caller may have given up already; the message goes anyway.
+		if derr := s.Slack.Delete(context.WithoutCancel(ctx), r.Channel, ts); derr != nil {
+			return Reply{}, fmt.Errorf("recording the owner of thread %s failed: %w; deleting its message failed too, so it stays in Slack without an owner: %v", key, err, derr)
+		}
+		return Reply{}, fmt.Errorf("recording the owner of thread %s failed, so its message was deleted: %w", key, err)
 	}
 	return Reply{Thread: key}, nil
 }
