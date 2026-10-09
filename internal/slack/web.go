@@ -110,16 +110,48 @@ func (w *Web) Replies(ctx context.Context, channel, ts string) ([]Message, error
 }
 
 // message converts a message as Slack returns it. A thread's first message
-// carries its own ts as thread_ts, which here means "not a reply".
+// carries its own ts as thread_ts, which here means "not a reply". A
+// message a machine posted (see PostReply) has the machine's name in a
+// context block before the text; that is read back as Machine.
 func message(m slackgo.Message) Message {
-	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType}
+	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType, LatestReply: m.LatestReply, Machine: machine(m)}
 	if m.ThreadTimestamp != m.Timestamp {
 		out.ThreadTS = m.ThreadTimestamp
 	}
 	for _, f := range m.Files {
-		out.Files = append(out.Files, File{Name: f.Name, URL: f.Permalink})
+		out.Files = append(out.Files, File{Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.Permalink})
 	}
 	return out
+}
+
+// machine returns the machine named in m's first block when that is a
+// context block holding one plain text, the layout PostReply posts with,
+// and "" otherwise.
+func machine(m slackgo.Message) string {
+	if len(m.Blocks.BlockSet) < 2 {
+		return ""
+	}
+	c, ok := m.Blocks.BlockSet[0].(*slackgo.ContextBlock)
+	if !ok || len(c.ContextElements.Elements) != 1 {
+		return ""
+	}
+	if t, ok := c.ContextElements.Elements[0].(*slackgo.TextBlockObject); ok && t.Type == slackgo.PlainTextType {
+		return t.Text
+	}
+	return ""
+}
+
+// Self asks auth.test which user the token belongs to.
+func (w *Web) Self(ctx context.Context) (string, error) {
+	var res *slackgo.AuthTestResponse
+	err := w.call(ctx, "auth.test", func() (err error) {
+		res, err = w.c.AuthTestContext(ctx)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return res.UserID, nil
 }
 
 // History pages through conversations.history, which Slack returns newest

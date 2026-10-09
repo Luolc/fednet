@@ -87,7 +87,9 @@ func TestWeb(t *testing.T) {
 			if r.form.Get("cursor") == "" {
 				return 200, `{"ok":true,"messages":[{"ts":"1.1","user":"U1","text":"first"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
 			}
-			return 200, `{"ok":true,"messages":[{"ts":"1.2","user":"U2","text":"second"}],"has_more":false}`
+			return 200, `{"ok":true,"messages":[{"ts":"1.2","user":"U2","text":"second"},{"ts":"1.3","user":"UBOT","bot_id":"B2","text":"fixed","blocks":[{"type":"context","elements":[{"type":"plain_text","text":"workstation"}]},{"type":"markdown","text":"fixed"}]},{"ts":"1.4","user":"U1","text":"a heading","blocks":[{"type":"header","text":{"type":"plain_text","text":"a heading"}},{"type":"section","text":{"type":"plain_text","text":"x"}}]}],"has_more":false}`
+		case "auth.test":
+			return 200, `{"ok":true,"user":"fednet","user_id":"UBOT","bot_id":"B2"}`
 		case "chat.postMessage":
 			return 200, `{"ok":true,"channel":"` + r.form.Get("channel") + `","ts":"1.3"}`
 		case "conversations.info":
@@ -98,9 +100,9 @@ func TestWeb(t *testing.T) {
 			return 200, `{"ok":true,"channel":{"id":"D1"}}`
 		case "conversations.history":
 			if r.form.Get("cursor") == "" {
-				return 200, `{"ok":true,"messages":[{"ts":"2.3","user":"U2","text":"newest","thread_ts":"2.3","reply_count":1},{"ts":"2.2","bot_id":"B1","subtype":"bot_message","text":"from a bot"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
+				return 200, `{"ok":true,"messages":[{"ts":"2.3","user":"U2","text":"newest","thread_ts":"2.3","reply_count":1,"latest_reply":"2.4"},{"ts":"2.2","bot_id":"B1","subtype":"bot_message","text":"from a bot"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
 			}
-			return 200, `{"ok":true,"messages":[{"ts":"2.1","user":"U1","text":"oldest","subtype":"file_share","files":[{"name":"a.txt","permalink":"https://example.invalid/a"}]}],"has_more":false}`
+			return 200, `{"ok":true,"messages":[{"ts":"2.1","user":"U1","text":"oldest","subtype":"file_share","files":[{"name":"a.txt","mimetype":"text/plain","size":12,"permalink":"https://example.invalid/a"}]}],"has_more":false}`
 		case "users.conversations":
 			if r.form.Get("cursor") == "" {
 				return 200, `{"ok":true,"channels":[{"id":"C1","is_channel":true}],"response_metadata":{"next_cursor":"page2"}}`
@@ -110,11 +112,17 @@ func TestWeb(t *testing.T) {
 		return 200, `{"ok":false,"error":"unknown_method"}`
 	})
 
+	if self, err := w.Self(ctx); err != nil || self != "UBOT" {
+		t.Errorf("Self = %q, %v; want UBOT", self, err)
+	}
+	// A reply a machine posted carries the machine's name, read back from
+	// the context block PostReply puts before the text; a message whose
+	// first block is something else names no machine.
 	ms, err := w.Replies(ctx, "C1", "1.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Message{{TS: "1.1", User: "U1", Text: "first"}, {TS: "1.2", User: "U2", Text: "second"}}
+	want := []Message{{TS: "1.1", User: "U1", Text: "first"}, {TS: "1.2", User: "U2", Text: "second"}, {TS: "1.3", User: "UBOT", Text: "fixed", BotID: "B2", Machine: "workstation"}, {TS: "1.4", User: "U1", Text: "a heading"}}
 	if !reflect.DeepEqual(ms, want) {
 		t.Errorf("Replies = %v, want %v", ms, want)
 	}
@@ -140,9 +148,9 @@ func TestWeb(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantHistory := []Message{
-		{TS: "2.1", User: "U1", Text: "oldest", SubType: "file_share", Files: []File{{Name: "a.txt", URL: "https://example.invalid/a"}}},
+		{TS: "2.1", User: "U1", Text: "oldest", SubType: "file_share", Files: []File{{Name: "a.txt", Mimetype: "text/plain", Size: 12, URL: "https://example.invalid/a"}}},
 		{TS: "2.2", Text: "from a bot", BotID: "B1", SubType: "bot_message"},
-		{TS: "2.3", User: "U2", Text: "newest"},
+		{TS: "2.3", User: "U2", Text: "newest", LatestReply: "2.4"},
 	}
 	if !reflect.DeepEqual(hs, wantHistory) {
 		t.Errorf("History = %+v, want %+v", hs, wantHistory)
@@ -160,6 +168,7 @@ func TestWeb(t *testing.T) {
 		got = append(got, sent{r.method, strings.Join([]string{f.Get("channel"), f.Get("ts"), f.Get("cursor"), f.Get("text"), f.Get("purpose"), f.Get("users"), f.Get("oldest"), f.Get("types"), f.Get("thread_ts")}, "|")})
 	}
 	wantSent := []sent{
+		{"auth.test", "||||||||"},
 		{"conversations.replies", "C1|1.1|||||||"},
 		{"conversations.replies", "C1|1.1|page2||||||"},
 		{"chat.postMessage", "C1|||hello|||||"},
@@ -602,5 +611,22 @@ func TestRespond(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "response_url") {
 		t.Fatalf("the error %q does not say what failed", err)
+	}
+}
+
+func TestMentions(t *testing.T) {
+	for _, tt := range []struct {
+		text, user string
+		want       bool
+	}{
+		{"<@UBOT> look at this", "UBOT", true},
+		{"look at this <@UBOT|fednet>", "UBOT", true},
+		{"<@UBOTX> is someone else", "UBOT", false},
+		{"@fednet typed, not picked", "UBOT", false},
+		{"<@UBOT>", "", false},
+	} {
+		if got := Mentions(tt.text, tt.user); got != tt.want {
+			t.Errorf("Mentions(%q, %q) = %v, want %v", tt.text, tt.user, got, tt.want)
+		}
 	}
 }

@@ -211,13 +211,18 @@ func TestHubWithSlack(t *testing.T) {
 		t.Fatalf("/fednet upgrade on a dev hub = %q", reply.Text)
 	}
 
-	// Someone posts in C1: the message reaches the connected client.
-	ts, err := f.Start("C1", "U1", "please fix the build")
+	// The hub asked Slack which user its bot is, so that it knows a
+	// mention. Someone mentions it in C1: the message reaches the
+	// connected client, as a mention from the person's name.
+	if sr.r.Bot != slack.FakeBot {
+		t.Fatalf("the receiver's bot is %q, want %q from auth.test", sr.r.Bot, slack.FakeBot)
+	}
+	ts, err := f.Start("C1", "U1", "<@"+slack.FakeBot+"> please fix the build")
 	if err != nil {
 		t.Fatal(err)
 	}
 	thread := slack.ThreadKey("C1", ts)
-	ev := inbound.Event{ID: "Ev1", Channel: "C1", Message: slack.Message{TS: ts, User: "U1", Text: "please fix the build"}}
+	ev := inbound.Event{ID: "Ev1", Channel: "C1", Message: slack.Message{TS: ts, User: "U1", Text: "<@" + slack.FakeBot + "> please fix the build"}}
 	if err := sr.r.Handle(ctx, ev); err != nil {
 		t.Fatal(err)
 	}
@@ -229,8 +234,10 @@ func TestHubWithSlack(t *testing.T) {
 		}
 		return json.NewDecoder(strings.NewReader(string(b))).Decode(&event) == nil
 	})
-	if !strings.Contains(string(event.Payload), `"thread":"`+thread+`"`) || !strings.Contains(string(event.Payload), "please fix the build") {
-		t.Fatalf("hook got %s, want the message in %s", event.Payload, thread)
+	for _, want := range []string{`"thread":"` + thread + `"`, "please fix the build", `"trigger":"mention"`, `"user_name":"maintainer"`} {
+		if !strings.Contains(string(event.Payload), want) {
+			t.Fatalf("hook got %s, want %s", event.Payload, want)
+		}
 	}
 
 	// The hook gives up on it; the client tells the hub, whose first try
@@ -282,6 +289,26 @@ func TestHubStopsWhenSlackRejectsToken(t *testing.T) {
 	var stdout, stderr syncBuffer
 	code := run(t.Context(), append([]string{"hub", "-listen", "127.0.0.1:0", "-db", filepath.Join(dir, "hub.db")}, slackFlags...), &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "slack socket mode: invalid_auth") {
+		t.Fatalf("exit %d, stderr %q; want 1 and the reason", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), testAppToken) || strings.Contains(stderr.String(), testBotToken) {
+		t.Fatal("stderr contains a token")
+	}
+}
+
+// noSelf is a Slack that cannot say which user the bot is.
+type noSelf struct{ slack.API }
+
+func (noSelf) Self(context.Context) (string, error) { return "", errors.New("auth.test: not_authed") }
+
+// With Slack, a hub that cannot learn which user its bot is does not
+// start: it could not tell a mention.
+func TestHubNeedsItsBotUser(t *testing.T) {
+	dir := t.TempDir()
+	slackFlags, _ := fakeSlack(t, dir, noSelf{&slack.Fake{}}, nil)
+	var stdout, stderr syncBuffer
+	code := run(t.Context(), append([]string{"hub", "-listen", "127.0.0.1:0", "-db", filepath.Join(dir, "hub.db")}, slackFlags...), &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "which user the bot is: auth.test: not_authed") {
 		t.Fatalf("exit %d, stderr %q; want 1 and the reason", code, stderr.String())
 	}
 	if strings.Contains(stderr.String(), testAppToken) || strings.Contains(stderr.String(), testBotToken) {
