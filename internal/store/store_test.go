@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 )
 
 func openHub(t *testing.T, path string) *Hub {
@@ -169,6 +171,27 @@ func TestInboxDedup(t *testing.T) {
 	}
 }
 
+func TestHubInboxPutFrom(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+
+	for _, put := range []struct{ client, msgID string }{{"a", "m1"}, {"b", "m2"}, {"b", "m1"}} {
+		if _, err := h.Inbox.PutFrom(ctx, put.client, Message{put.msgID, []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The redelivered m1 keeps the source it was first stored with.
+	for msgID, want := range map[string]string{"m1": "a", "m2": "b"} {
+		var got string
+		if err := h.db.QueryRowContext(ctx, "SELECT client_id FROM inbox WHERE msg_id = ?", msgID).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("source of %s = %q, want %q", msgID, got, want)
+		}
+	}
+}
+
 func TestClientOutbox(t *testing.T) {
 	ctx := t.Context()
 	o := openClient(t, filepath.Join(t.TempDir(), "client.db")).Outbox
@@ -210,17 +233,202 @@ func TestOwner(t *testing.T) {
 	if _, err := h.Owner(ctx, "t1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Owner of a new thread: err = %v, want ErrNotFound", err)
 	}
-	for _, client := range []string{"a", "b"} {
-		if err := h.SetOwner(ctx, "t1", client); err != nil {
-			t.Fatal(err)
-		}
-		got, err := h.Owner(ctx, "t1")
+	if err := h.Reassign(ctx, "t1", "a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Reassign of a thread with no owner: err = %v, want ErrNotFound", err)
+	}
+	// The first claim wins; a later claim gets the existing owner back, and
+	// its message is queued for that owner.
+	for _, claim := range []string{"a", "b"} {
+		got, d, err := h.ClaimAndEnqueue(ctx, "t1", claim, []byte(claim))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != client {
-			t.Fatalf("Owner(t1) = %q, want %q", got, client)
+		if got != "a" {
+			t.Fatalf("ClaimAndEnqueue(t1, %s) = %q, want a", claim, got)
 		}
+		queued, err := h.Outbox.After(ctx, "a", d.Seq-1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(queued) != 1 || string(queued[0].Payload) != claim {
+			t.Fatalf("message of claim %s not queued for a: %v", claim, queued)
+		}
+	}
+	if err := h.Reassign(ctx, "t1", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.Owner(ctx, "t1"); err != nil || got != "b" {
+		t.Fatalf("Owner(t1) after Reassign = %q, %v; want b", got, err)
+	}
+
+	// ReassignClient moves only the threads of the given client.
+	for thread, client := range map[string]string{"t2": "b", "t3": "c"} {
+		if _, _, err := h.ClaimAndEnqueue(ctx, thread, client, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := h.ReassignClient(ctx, "b", "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("ReassignClient(b, d) moved %d threads, want 2", n)
+	}
+	for thread, want := range map[string]string{"t1": "d", "t2": "d", "t3": "c"} {
+		if got, err := h.Owner(ctx, thread); err != nil || got != want {
+			t.Fatalf("Owner(%s) = %q, %v; want %s", thread, got, err, want)
+		}
+	}
+}
+
+func TestClaimAndEnqueueConcurrent(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+
+	clients := []string{"a", "b", "c", "d"}
+	got := make([]string, len(clients))
+	var wg sync.WaitGroup
+	for i, c := range clients {
+		wg.Go(func() {
+			owner, _, err := h.ClaimAndEnqueue(ctx, "t1", c, []byte(c))
+			if err != nil {
+				t.Error(err)
+			}
+			got[i] = owner
+		})
+	}
+	wg.Wait()
+	for _, owner := range got {
+		if owner != got[0] {
+			t.Fatalf("concurrent claims returned owners %v, want one owner", got)
+		}
+	}
+	if owner, err := h.Owner(ctx, "t1"); err != nil || owner != got[0] {
+		t.Fatalf("Owner(t1) = %q, %v; want %q", owner, err, got[0])
+	}
+	queued, err := h.Outbox.After(ctx, got[0], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != len(clients) {
+		t.Fatalf("owner %s has %d queued, want %d", got[0], len(queued), len(clients))
+	}
+}
+
+func TestClaimAndEnqueueAtomic(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	if _, err := h.db.ExecContext(ctx,
+		"CREATE TRIGGER fail BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'outbox write fails'); END"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.ClaimAndEnqueue(ctx, "t1", "a", []byte("x")); err == nil {
+		t.Fatal("ClaimAndEnqueue with a failing outbox: err = nil")
+	}
+	// The failed enqueue leaves the thread unowned.
+	if _, err := h.Owner(ctx, "t1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Owner(t1) after a failed enqueue: err = %v, want ErrNotFound", err)
+	}
+}
+
+// age moves every message queued for client back by d.
+func age(t *testing.T, h *Hub, client string, d time.Duration) {
+	t.Helper()
+	if _, err := h.db.ExecContext(t.Context(),
+		"UPDATE outbox SET enqueued_at = enqueued_at - ? WHERE client_id = ?", d.Milliseconds(), client); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQueuedFor(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	o := h.Outbox
+
+	queuedFor := func(client string, d time.Duration) bool {
+		t.Helper()
+		ok, err := o.QueuedFor(ctx, client, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+
+	d, err := o.Enqueue(ctx, "a", []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.Enqueue(ctx, "b", []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	if queuedFor("a", time.Minute) {
+		t.Fatal("a fresh message counts as queued for a minute")
+	}
+	age(t, h, "a", time.Hour)
+	if !queuedFor("a", 30*time.Minute) {
+		t.Fatal("a message queued an hour ago does not count as queued for 30m")
+	}
+	if queuedFor("a", 2*time.Hour) {
+		t.Fatal("a message queued an hour ago counts as queued for 2h")
+	}
+	if queuedFor("b", 30*time.Minute) {
+		t.Fatal("aging client a's queue changed client b's")
+	}
+	// Once acked, the message no longer counts.
+	if err := o.Ack(ctx, "a", d.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if queuedFor("a", 30*time.Minute) {
+		t.Fatal("an acked message still counts as queued")
+	}
+}
+
+func TestHubUpgradeKeepsData(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "hub.db")
+
+	// A database written by the first schema version.
+	db, err := open(ctx, path, hubMigrations[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"INSERT INTO outbox (client_id, msg_id, payload) VALUES ('a', 'm1', 'x')",
+		"INSERT INTO inbox (msg_id, payload) VALUES ('u1', 'y')",
+		"INSERT INTO owner (thread, client_id) VALUES ('t1', 'a')",
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	before := time.Now().UnixMilli()
+	h := openHub(t, path)
+	got, err := h.Outbox.After(ctx, "a", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].MsgID != "m1" || string(got[0].Payload) != "x" {
+		t.Fatalf("outbox after upgrade = %v, want m1 (x)", got)
+	}
+	in, err := h.Inbox.Undelivered(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(msgIDs(in), []string{"u1"}) {
+		t.Fatalf("inbox after upgrade = %v, want [u1]", msgIDs(in))
+	}
+	if owner, err := h.Owner(ctx, "t1"); err != nil || owner != "a" {
+		t.Fatalf("Owner(t1) after upgrade = %q, %v; want a", owner, err)
+	}
+	// The old row is dated at the upgrade, not at the epoch.
+	var at int64
+	if err := h.db.QueryRowContext(ctx, "SELECT enqueued_at FROM outbox WHERE msg_id = 'm1'").Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	if at < before {
+		t.Fatalf("enqueued_at of an old row = %d, want >= %d", at, before)
 	}
 }
 
