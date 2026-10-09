@@ -472,21 +472,28 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	// refusal; that answer is what the caller needs, not the write error
 	// that follows it. So the content is sent while the answer is awaited,
 	// and the sending is given up once an answer is in. A source that
-	// ends short is the caller's error: the sending side is closed so
-	// that the daemon stops waiting for the rest, and that error is
-	// returned whatever the daemon then says.
+	// ends short or fails to read is the caller's error: the sending side
+	// is closed so that the daemon stops waiting for the rest, and that
+	// error is returned whatever the daemon then says.
 	sent := make(chan error, 1)
 	go func() {
 		for i, f := range files {
-			if _, err := io.CopyN(conn, f, req.Files[i].Size); err != nil {
-				if errors.Is(err, io.EOF) {
-					conn.CloseWrite()
-					sent <- fmt.Errorf("local: sending %s: %w", req.Files[i].Name, io.ErrUnexpectedEOF)
-					return
-				}
-				sent <- fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)
-				return
+			_, err := io.CopyN(conn, &source{r: f}, req.Files[i].Size)
+			if err == nil {
+				continue
 			}
+			var se *sourceError
+			switch {
+			case errors.Is(err, io.EOF):
+				err = io.ErrUnexpectedEOF
+				fallthrough
+			case errors.As(err, &se):
+				conn.CloseWrite()
+				sent <- &sourceError{fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)}
+			default:
+				sent <- fmt.Errorf("local: sending %s: %w", req.Files[i].Name, err)
+			}
+			return
 		}
 		sent <- nil
 	}()
@@ -496,8 +503,9 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	// answer in, nothing more is read on the other side.
 	conn.Close()
 	serr := <-sent
+	var se *sourceError
 	switch {
-	case errors.Is(serr, io.ErrUnexpectedEOF):
+	case errors.As(serr, &se):
 		return Response{}, serr
 	case err != nil && serr != nil:
 		return Response{}, serr
@@ -506,3 +514,19 @@ func Do(ctx context.Context, path string, req Request, files ...io.Reader) (Resp
 	}
 	return res, nil
 }
+
+// source tells a failure of the caller's reader apart from a failure of
+// the connection it is copied to.
+type source struct{ r io.Reader }
+
+func (s *source) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && err != io.EOF {
+		err = &sourceError{err}
+	}
+	return n, err
+}
+
+type sourceError struct{ error }
+
+func (e *sourceError) Unwrap() error { return e.error }

@@ -515,6 +515,15 @@ func TestPostWithFiles(t *testing.T) {
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("Do with a short file took %v, want it to return at once", d)
 	}
+	// So is a file that fails to read part way through.
+	broken := errors.New("disk fell out")
+	start = time.Now()
+	if _, err := Do(t.Context(), path, req, io.MultiReader(strings.NewReader("PN"), &failing{broken}), strings.NewReader("er")); !errors.Is(err, broken) || !strings.Contains(err.Error(), "sending a.png") {
+		t.Fatalf("Do with a failing file = %v, want an error naming it and wrapping %v", err, broken)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Do with a failing file took %v, want it to return at once", d)
+	}
 	if _, err := Do(t.Context(), path, req, strings.NewReader("PNG")); err == nil {
 		t.Fatal("Do with fewer readers than files did not fail")
 	}
@@ -573,3 +582,8 @@ func (r *delayed) Read(p []byte) (int, error) {
 	}
 	return r.Reader.Read(p)
 }
+
+// failing is a reader that fails on the first read.
+type failing struct{ err error }
+
+func (f *failing) Read([]byte) (int, error) { return 0, f.err }
