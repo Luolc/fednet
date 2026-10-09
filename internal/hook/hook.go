@@ -40,8 +40,9 @@ type Event struct {
 }
 
 // errNotRun means the hook was not started: the event file could not be
-// written. That is the client's trouble, not the hook's, so it is not an
-// attempt.
+// written, or the process could not be started. That is the client's
+// trouble, not the hook's, so it is not an attempt; the message waits for
+// the next pass.
 var errNotRun = errors.New("hook not run")
 
 // Retry paces the attempts at one message: after attempt n fails (n from
@@ -269,31 +270,29 @@ const stderrTail = 4 << 10
 
 // exec writes m to an event file, runs the hook on it and returns nil if
 // the hook exited 0 and left nothing behind. The error says why it did
-// not, with the end of the hook's stderr. Whatever the outcome, the hook's
-// process group is killed once the hook itself has exited.
+// not, with the end of the hook's stderr; it wraps errNotRun when the hook
+// never started. Whatever the outcome, the hook's process group is killed
+// once the hook itself has exited.
 func (r *Runner) exec(ctx context.Context, m store.Message) error {
-	f, err := os.CreateTemp(r.dir(), "fednet-event-*.json")
-	if err != nil {
-		return fmt.Errorf("%w: %v", errNotRun, err)
-	}
-	defer func() {
-		if err := os.Remove(f.Name()); err != nil {
-			slog.Warn("hook: remove event file", "err", err)
-		}
-	}()
 	// A payload that is not JSON cannot be put in the event; that is the
 	// hub's fault, and the error, counted as an attempt, says so.
-	err = json.NewEncoder(f).Encode(Event{MsgID: m.MsgID, Payload: m.Payload})
-	if cerr := f.Close(); err == nil && cerr != nil {
-		err = fmt.Errorf("%w: %v", errNotRun, cerr)
+	event, err := json.Marshal(Event{MsgID: m.MsgID, Payload: m.Payload})
+	if err != nil {
+		return fmt.Errorf("payload is not JSON: %v", err)
 	}
+	name, err := r.writeEvent(append(event, '\n'))
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := os.Remove(name); err != nil {
+			slog.Warn("hook: remove event file", "err", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(ctx, r.timeout())
 	defer cancel()
-	args := append(append([]string{}, r.Command[1:]...), f.Name())
+	args := append(append([]string{}, r.Command[1:]...), name)
 	cmd := exec.CommandContext(ctx, r.Command[0], args...)
 	// An explicit, possibly empty, Env: nil would pass the client's own.
 	cmd.Env = append([]string{}, r.Env...)
@@ -308,14 +307,21 @@ func (r *Runner) exec(ctx context.Context, m store.Message) error {
 	// behind may hold; this bounds that wait.
 	cmd.WaitDelay = time.Second
 
-	err = cmd.Run()
-	if cmd.Process != nil {
-		// Whatever the hook left running in its group dies with it; the
-		// group is a pid of a process the hook reaped or never waited
-		// for, so it cannot have been reused by now.
-		if kerr := killGroup(cmd.Process.Pid); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
-			slog.Warn("hook: kill process group", "pid", cmd.Process.Pid, "err", kerr)
-		}
+	// Start fails on the client's side of the fence: the program is not
+	// found or not executable, the working directory is gone, the fork,
+	// the process group or the stderr pipe cannot be set up, or ctx is
+	// already done. None of that is the hook's doing.
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%w: start %s: %v", errNotRun, r.Command[0], err)
+	}
+	err = cmd.Wait()
+	// Whatever the hook left running in its group dies with it. The group
+	// id is the pid of the process just waited for; the kernel does not
+	// reuse a pid while it is still a group's id, so this cannot hit a
+	// stranger. What is killed is reaped by init: the client is not a
+	// subreaper.
+	if kerr := killGroup(cmd.Process.Pid); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
+		slog.Warn("hook: kill process group", "pid", cmd.Process.Pid, "err", kerr)
 	}
 	switch {
 	case err == nil:
@@ -329,6 +335,24 @@ func (r *Runner) exec(ctx context.Context, m store.Message) error {
 		err = fmt.Errorf("%v; stderr: %s", err, s)
 	}
 	return err
+}
+
+// writeEvent writes event to a new file in the event directory and returns
+// its path. Every error wraps errNotRun: the file is the client's to write.
+func (r *Runner) writeEvent(event []byte) (string, error) {
+	f, err := os.CreateTemp(r.dir(), "fednet-event-*.json")
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", errNotRun, err)
+	}
+	_, err = f.Write(event)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("%w: write %s: %v", errNotRun, f.Name(), err)
+	}
+	return f.Name(), nil
 }
 
 // killGroup sends SIGKILL to the process group whose id is pid. It returns

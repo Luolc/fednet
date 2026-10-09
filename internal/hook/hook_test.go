@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -274,11 +275,6 @@ func TestDeadLetterAtLimit(t *testing.T) {
 	}
 }
 
-// alive reports whether a process with pid exists.
-func alive(pid int) bool {
-	return syscall.Kill(pid, 0) == nil
-}
-
 // pid reads a pid the hook script wrote.
 func (f *fixture) pid(name string) (int, bool) {
 	f.t.Helper()
@@ -308,33 +304,29 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 		return ok1 && ok2
 	})
 	// The control arm: both processes exist while the hook runs.
-	if !alive(self) || !alive(child) {
-		t.Fatalf("hook %d alive %v, its child %d alive %v; want both alive", self, alive(self), child, alive(child))
+	if !left(self) || !left(child) {
+		t.Fatalf("hook %d left %v, its child %d left %v; want both", self, left(self), child, left(child))
 	}
 	waitFor(t, "the attempt to be recorded", func() bool {
 		qs := f.queued()
 		return len(qs) == 1 && qs[0].Attempts == 1
 	})
 	// The kill is delivered asynchronously and the child is reaped by
-	// its new parent, so the count settles to 0 rather than being 0 at
-	// once; it is read once more after that.
+	// init, so the count settles to 0 rather than being 0 at once; it is
+	// read once more after that. A zombie counts as remaining.
 	remaining := func() int {
 		n := 0
 		for _, pid := range []int{self, child} {
-			if alive(pid) {
+			if left(pid) {
 				n++
 			}
 		}
 		return n
 	}
-	waitFor(t, "the hook and its child to be gone", func() bool { return remaining() == 0 })
+	waitFor(t, "the hook and its child to be reaped", func() bool { return remaining() == 0 })
 	time.Sleep(10 * time.Millisecond)
 	if n := remaining(); n != 0 {
-		t.Fatalf("remaining = %d, want 0 (hook %d alive %v, child %d alive %v)", n, self, alive(self), child, alive(child))
-	}
-	// The hook was waited for, so it is not a zombie either.
-	if _, err := os.Stat("/proc/" + strconv.Itoa(self)); err == nil {
-		t.Fatalf("hook %d still has a /proc entry", self)
+		t.Fatalf("remaining = %d, want 0 (hook %d state %q, child %d state %q)", n, self, state(t, self), child, state(t, child))
 	}
 	waitFor(t, "the dead letter", func() bool { return len(f.deadLetters()) == 1 })
 	if reason := f.deadLetters()[0].Reason; !strings.Contains(reason, "timed out") {
@@ -425,8 +417,8 @@ func TestShutdownDoesNotCountAsAttempt(t *testing.T) {
 		return ok
 	})
 	stop()
-	if alive(self) {
-		t.Fatalf("hook %d is still running after Run returned", self)
+	if left(self) {
+		t.Fatalf("hook %d is left (state %q) after Run returned", self, state(t, self))
 	}
 	qs := f.queued()
 	if len(qs) != 1 || qs[0].Attempts != 0 || qs[0].NextAttempt.After(time.Now()) {
@@ -443,17 +435,27 @@ func TestRetryDelay(t *testing.T) {
 	}
 }
 
-// running reports whether pid is a live process: it exists and is not a
-// zombie waiting for its parent.
-func running(t *testing.T, pid int) bool {
+// left reports whether pid still has a process entry: running, or killed
+// but not yet reaped (a zombie). Only a reaped process counts as gone.
+func left(pid int) bool {
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+	return err == nil
+}
+
+// state returns the one-letter state of pid from /proc, or "" if it has no
+// entry.
+func state(t *testing.T, pid int) string {
 	t.Helper()
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
-		return false
+		return ""
 	}
 	// The state follows the parenthesised command name.
 	i := bytes.LastIndexByte(b, ')')
-	return i > 0 && len(b) > i+2 && b[i+2] != 'Z'
+	if i < 0 || len(b) < i+3 {
+		t.Fatalf("cannot read the state of %d from %q", pid, b)
+	}
+	return string(b[i+2])
 }
 
 // When the hook exits on its own, what it left running in its process
@@ -484,8 +486,8 @@ func TestLeftoverProcessesAreKilled(t *testing.T) {
 				return ok
 			})
 			// The control arm: the child is running while the hook is.
-			if !running(t, child) {
-				t.Fatalf("child %d is not running", child)
+			if st := state(t, child); st == "" || st == "Z" {
+				t.Fatalf("child %d is in state %q, want a live one", child, st)
 			}
 			if err := os.WriteFile(filepath.Join(f.dir, "go"), nil, 0o600); err != nil {
 				t.Fatal(err)
@@ -497,10 +499,12 @@ func TestLeftoverProcessesAreKilled(t *testing.T) {
 				qs := f.queued()
 				return len(qs) == 1 && qs[0].Attempts == 1
 			})
-			waitFor(t, "the child to be gone", func() bool { return !running(t, child) })
+			// Gone means reaped by init, not just killed: a zombie still
+			// has its entry. The count settles to 0 and is read once more.
+			waitFor(t, "the child to be reaped", func() bool { return !left(child) })
 			time.Sleep(10 * time.Millisecond)
-			if running(t, child) {
-				t.Fatalf("child %d is running after the hook exited", child)
+			if left(child) {
+				t.Fatalf("child %d is left (state %q) after the hook exited", child, state(t, child))
 			}
 			if !tt.delivered && !strings.Contains(f.logs.String(), "holding its stderr") {
 				t.Fatalf("log does not say the hook left a process holding stderr:\n%s", f.logs.String())
@@ -579,5 +583,117 @@ func TestBadPayloadIsAFailure(t *testing.T) {
 	}
 	if f.lines("runs") != nil {
 		t.Fatal("the hook ran for a payload that could not be written")
+	}
+}
+
+// prSetChildSubreaper is the Linux prctl option that makes this process
+// the parent of its orphaned descendants.
+const prSetChildSubreaper = 36
+
+// The residue judge used above tells a reaped process from a killed one
+// nobody has waited for: with the test process as subreaper and not
+// waiting, the hook's child stays a zombie and still counts as left. The
+// earlier judge, which took a zombie for gone, reads 0 here.
+func TestResidueCountsZombies(t *testing.T) {
+	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0, 0, 0, 0); errno != 0 {
+		t.Fatal(errno)
+	}
+	t.Cleanup(func() { syscall.Syscall6(syscall.SYS_PRCTL, prSetChildSubreaper, 0, 0, 0, 0, 0) })
+	f := newFixture(t, `sleep 60 >/dev/null 2>&1 & echo $! > "$DIR/child"; exit 0`)
+	if err := f.r.exec(t.Context(), store.Message{MsgID: "m1", Payload: []byte(`{"t":"x"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	child, ok := f.pid("child")
+	if !ok {
+		t.Fatal("the hook did not write its child's pid")
+	}
+	// Killed, reparented to this process, and nobody has waited: a zombie.
+	waitFor(t, "the child to be killed", func() bool { return state(t, child) == "Z" })
+	time.Sleep(10 * time.Millisecond)
+	if !left(child) {
+		t.Fatalf("child %d is a zombie but counts as gone", child)
+	}
+	// Reaped by its parent: now it is gone.
+	var ws syscall.WaitStatus
+	if _, err := syscall.Wait4(child, &ws, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if left(child) {
+		t.Fatalf("child %d is left after being reaped", child)
+	}
+}
+
+// Failures before the hook starts are the client's, not the hook's: they
+// are not attempts, the message waits, and once the cause is gone the hook
+// runs. The attempt limit is 1, so a miscounted failure would show as a
+// dead letter.
+func TestNotRunIsNotAnAttempt(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		fault func(t *testing.T, f *fixture) (undo func())
+	}{
+		{"command not found", func(t *testing.T, f *fixture) func() {
+			command := f.r.Command
+			f.r.Command = []string{filepath.Join(f.dir, "missing-hook")}
+			return func() { f.r.Command = command }
+		}},
+		{"event directory missing", func(t *testing.T, f *fixture) func() {
+			dir := f.r.Dir
+			f.r.Dir = filepath.Join(f.dir, "missing")
+			return func() { f.r.Dir = dir }
+		}},
+		{"event file write fails", func(t *testing.T, f *fixture) func() {
+			// The event file is created, then its write fails: this
+			// process may not write files longer than a few bytes.
+			var before syscall.Rlimit
+			if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &before); err != nil {
+				t.Fatal(err)
+			}
+			signal.Ignore(syscall.SIGXFSZ)
+			limited := before
+			limited.Cur = 8
+			if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &limited); err != nil {
+				t.Fatal(err)
+			}
+			return func() {
+				if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &before); err != nil {
+					t.Fatal(err)
+				}
+				signal.Reset(syscall.SIGXFSZ)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, `echo run >> "$DIR/runs"; exit 0`)
+			f.r.Retry = Retry{Min: time.Hour, Max: time.Hour, Attempts: 1}
+			f.put("m1", `{"t":"x"}`)
+			undo := tt.fault(t, f)
+			t.Cleanup(undo)
+			for i := range 2 {
+				wait, err := f.r.pass(t.Context())
+				if !errors.Is(err, errNotRun) {
+					t.Fatalf("pass %d: err = %v, want errNotRun", i, err)
+				}
+				if wait != 0 {
+					t.Fatalf("pass %d: wait = %v, want 0", i, wait)
+				}
+			}
+			if qs := f.queued(); len(qs) != 1 || qs[0].Attempts != 0 {
+				t.Fatalf("queued = %+v, want m1 with 0 attempts", qs)
+			}
+			if ds := f.deadLetters(); len(ds) != 0 {
+				t.Fatalf("dead letters = %+v, want none", ds)
+			}
+			if f.lines("runs") != nil {
+				t.Fatal("the hook ran")
+			}
+			undo()
+			if _, err := f.r.pass(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !f.delivered("m1") || len(f.lines("runs")) != 1 {
+				t.Fatalf("after the cause is gone: delivered %v, runs %d; want true, 1", f.delivered("m1"), len(f.lines("runs")))
+			}
+		})
 	}
 }
