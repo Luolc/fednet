@@ -264,11 +264,18 @@ func TestOnlineFollowsHeartbeat(t *testing.T) {
 	}
 	// A connection that never pings: online on connect, offline once the
 	// lease runs out with the connection still open, online again on a ping.
+	// The hub records the first heartbeat only after the handshake reply has
+	// gone out, so Dial can return before it. Holding h.mu keeps the handler
+	// from getting that far, which pins the window.
+	h.mu.Lock()
 	conn := dialHub(t, srv, "a")
 	conn.CloseRead(t.Context())
-	if !h.Online("a") {
-		t.Fatal("not online right after connecting")
+	_, beat := h.seen["a"]
+	h.mu.Unlock()
+	if beat {
+		t.Fatal("heartbeat recorded before the handler could take the lock")
 	}
+	waitFor(t, "online after connecting", func() bool { return h.Online("a") })
 	waitFor(t, "offline after the lease", func() bool { return !h.Online("a") })
 	if err := conn.Ping(t.Context()); err != nil {
 		t.Fatalf("ping on the idle connection: %v", err)
