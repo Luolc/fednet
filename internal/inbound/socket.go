@@ -147,7 +147,7 @@ func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 	ev.BotID, ev.SubType = m.BotID, m.SubType
 	if m.Message != nil {
 		for _, f := range m.Message.Files {
-			ev.Files = append(ev.Files, slack.File{Name: f.Name, URL: f.Permalink})
+			ev.Files = append(ev.Files, slack.File{ID: f.ID, Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.Permalink})
 		}
 	}
 	return r.Handle(ctx, ev)

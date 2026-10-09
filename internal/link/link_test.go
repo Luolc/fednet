@@ -3,6 +3,7 @@ package link
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -875,4 +876,70 @@ func TestUpgradeHeader(t *testing.T) {
 		t.Fatalf("inbox = %v, want only the message Divert left", got)
 	}
 	_, _ = old, current
+}
+
+// A file GET streams what Fetch returns, with the file's name, type and
+// size in the headers; a refusal comes back as a request's does; a
+// download the hub breaks off ends short, which the reader sees.
+func TestFetch(t *testing.T) {
+	h, srv := testHub(t, nil)
+	h.Fetch = func(_ context.Context, client, id string) (File, io.ReadCloser, error) {
+		switch id {
+		case "F1":
+			return File{Name: "截图 1.png", Mimetype: "image/png", Size: 6}, io.NopCloser(strings.NewReader("PNG...")), nil
+		case "short":
+			return File{Name: "short.png", Mimetype: "image/png", Size: 100}, io.NopCloser(strings.NewReader("PNG")), nil
+		case "big":
+			return File{}, nil, Refuse(ErrDenied, "file big is too big for %s", client)
+		case "gone":
+			return File{}, nil, Refuse(ErrNotFound, "file gone no longer exists")
+		}
+		return File{}, nil, errors.New("disk on fire")
+	}
+	c := &Client{ID: "a", Hub: srv.URL, Timeout: testTimeout}
+	f, body, err := c.Fetch(t.Context(), "F1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(body)
+	body.Close()
+	if err != nil || string(b) != "PNG..." || f != (File{Name: "截图 1.png", Mimetype: "image/png", Size: 6}) {
+		t.Fatalf("Fetch(F1) = %+v, %q, %v; want the file and its content", f, b, err)
+	}
+	_, body, err = c.Fetch(t.Context(), "short")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err = io.ReadAll(body)
+	body.Close()
+	if !errors.Is(err, io.ErrUnexpectedEOF) || len(b) >= 100 {
+		t.Fatalf("Fetch(short) read %d bytes, %v; want fewer than the size and io.ErrUnexpectedEOF", len(b), err)
+	}
+	tests := []struct {
+		id      string
+		wantErr error
+		wantMsg string
+	}{
+		{"big", ErrDenied, "file big is too big for a"},
+		{"gone", ErrNotFound, "file gone no longer exists"},
+		{"broken", nil, "the hub failed to answer"},
+	}
+	for _, tt := range tests {
+		_, _, err := c.Fetch(t.Context(), tt.id)
+		if err == nil || !strings.Contains(err.Error(), tt.wantMsg) || strings.Contains(err.Error(), "fire") {
+			t.Errorf("Fetch(%s) = %v, want an error saying %q", tt.id, err, tt.wantMsg)
+		}
+		if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+			t.Errorf("Fetch(%s) = %v, want it to wrap %v", tt.id, err, tt.wantErr)
+		}
+	}
+	// An unknown client is denied; a hub that is down is unreachable.
+	h.Identify = func(r *http.Request) (string, error) { return "", errors.New("who?") }
+	if _, _, err := c.Fetch(t.Context(), "F1"); !errors.Is(err, ErrDenied) {
+		t.Fatalf("Fetch by an unknown client = %v, want ErrDenied", err)
+	}
+	srv.Close()
+	if _, _, err := c.Fetch(t.Context(), "F1"); !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("Fetch with the hub down = %v, want ErrUnreachable", err)
+	}
 }

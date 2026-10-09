@@ -52,6 +52,8 @@ func TestRun(t *testing.T) {
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
 		{"approval without verify", []string{"approval"}, 2, "", "want verify"},
 		{"request-approval without flags", []string{"client", "request-approval", "-socket", "x", "do it"}, 2, "", "-socket, -agent, -action and a non-empty TEXT are required"},
+		{"fetch-file without an id", []string{"client", "fetch-file", "-socket", "x"}, 2, "", "want 1 arguments"},
+		{"client with a zero retention", []string{"client", "-hub", "h", "-db", "x", "-credential", "c", "-socket", "s", "-files-retention", "0"}, 2, "", "must be positive"},
 		{"request-approval with a missing action file", []string{"client", "request-approval", "-socket", "x", "-agent", "a", "-action", "/nonexistent/action.json", "do it"}, 1, "", "no such file"},
 		{"hub with a missing approval key", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-approval-key-file", "/nonexistent/key"}, 1, "", "no such file"},
 		{"approval verify without flags", []string{"approval", "verify", "-pubkey", "x"}, 2, "", "-pubkey, -approval, -action, -machine, -agent and -used are required"},

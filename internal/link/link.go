@@ -25,6 +25,11 @@ const (
 	// RequestPath takes a POST with one request and replies with the
 	// answer. Requests are not queued: they are answered or fail.
 	RequestPath = "/request"
+	// FilePath takes a GET with the Slack file id in the "id" query
+	// parameter and replies with the file's content, streamed from Slack:
+	// Content-Type and Content-Length are the file's, FileNameHeader its
+	// name. A file the hub does not serve is refused like a request.
+	FilePath = "/file"
 )
 
 // Headers on every request to the hub.
@@ -36,7 +41,17 @@ const (
 	// UpgradeHeader, on the hub's response to a downlink handshake, names
 	// the release the client should upgrade to.
 	UpgradeHeader = "Fednet-Upgrade"
+	// FileNameHeader, on the hub's response to a file GET, carries the
+	// file's name, percent-encoded as a URL path segment is.
+	FileNameHeader = "Fednet-File-Name"
 )
+
+// File is what the hub says of a file it serves, before the content.
+type File struct {
+	Name     string
+	Mimetype string
+	Size     int64
+}
 
 // MaxPayload is the largest payload either link carries. Send and Post
 // refuse anything larger, so a queued message always fits the frame and

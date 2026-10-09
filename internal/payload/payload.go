@@ -43,13 +43,22 @@ const (
 	DM = "dm"
 )
 
-// File is the metadata of a file uploaded with a message. URL is the
-// file's permalink, which needs a Slack login; the content is not fetched.
+// File is a file uploaded with a message. ID is Slack's id of the file,
+// which `fednet client fetch-file` takes; URL is the file's permalink,
+// which needs a Slack login. The hub sets Fetch on the files the client
+// fetches before it runs the hook, by the hub's limits on type and size;
+// the client then sets Path, where the content is on the agent's
+// machine, or Error, why it could not be fetched. Neither is set on a
+// file of a History, which the agent fetches itself if it wants it.
 type File struct {
+	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Mimetype string `json:"mimetype"`
 	Size     int    `json:"size"`
 	URL      string `json:"url"`
+	Fetch    bool   `json:"fetch,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // History is what a thread held before the message that handed it to the

@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"regexp"
 	"slices"
 	"time"
 
@@ -101,6 +103,53 @@ type Server struct {
 	// Approvals runs the approvals; nil means the hub cannot give any, and
 	// RequestApproval is refused.
 	Approvals *approval.Flow
+	// MaxFetchBytes is the largest file Fetch serves. Zero means
+	// DefaultMaxFetchBytes.
+	MaxFetchBytes int64
+}
+
+// DefaultMaxFetchBytes is the largest file served when Server.MaxFetchBytes
+// is zero: 200 MiB.
+const DefaultMaxFetchBytes = 200 << 20
+
+// fileID matches a Slack file id: letters and digits, nothing a path
+// could be made of.
+var fileID = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
+// Fetch serves a file to client, for link.Hub.Fetch: it asks Slack what
+// the file is, refuses one the hub does not serve (no such file, or one
+// over MaxFetchBytes), and returns the content as Slack streams it. Any
+// registered client may fetch any file the bot can see, as it may read
+// any thread.
+func (s *Server) Fetch(ctx context.Context, client, id string) (link.File, io.ReadCloser, error) {
+	if !fileID.MatchString(id) {
+		return link.File{}, nil, link.Refuse(link.ErrBadRequest, "%q is not a file id", id)
+	}
+	if s.Slack == nil {
+		return link.File{}, nil, errNoSlack
+	}
+	f, err := s.Slack.FileInfo(ctx, id)
+	if errors.Is(err, slack.ErrNotFound) {
+		return link.File{}, nil, link.Refuse(link.ErrNotFound, "file %s no longer exists in Slack", id)
+	}
+	if err != nil {
+		return link.File{}, nil, err
+	}
+	max := s.MaxFetchBytes
+	if max == 0 {
+		max = DefaultMaxFetchBytes
+	}
+	if int64(f.Size) > max {
+		return link.File{}, nil, link.Refuse(link.ErrDenied, "file %s is %d bytes, over the hub's limit of %d", id, f.Size, max)
+	}
+	body, err := s.Slack.Download(ctx, f)
+	if errors.Is(err, slack.ErrNotFound) {
+		return link.File{}, nil, link.Refuse(link.ErrNotFound, "file %s no longer exists in Slack", id)
+	}
+	if err != nil {
+		return link.File{}, nil, err
+	}
+	return link.File{Name: f.Name, Mimetype: f.Mimetype, Size: int64(f.Size)}, body, nil
 }
 
 // errNoSlack is returned for a request that needs Slack when Server.Slack

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/inbound"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
@@ -186,6 +187,36 @@ func TestHubRequests(t *testing.T) {
 		t.Fatalf("owner after reassign = %q, %v; want datamachine", owner, err)
 	}
 
+	// fetch-file brings a file the bot can see to this machine, under the
+	// client's files directory, and prints its path; a second time it is
+	// already there; a file Slack no longer has is not found.
+	f.AddFile(slack.File{ID: "F1", Name: "shot.png", Mimetype: "image/png", URL: "https://example.invalid/F1"}, []byte("PNG..."))
+	code, out = fednet("client", "fetch-file", "-socket", socket, "F1")
+	wantPath := filepath.Join(dir, "files", "F1", "shot.png")
+	if code != 0 || out != wantPath+"\n" {
+		t.Fatalf("fetch-file: exit %d, stdout %q; want %s", code, out, wantPath)
+	}
+	if b, err := os.ReadFile(wantPath); err != nil || string(b) != "PNG..." {
+		t.Fatalf("fetched file holds %q, %v; want the content", b, err)
+	}
+	code, out = fednet("client", "fetch-file", "-socket", socket, "-json", "F1")
+	var fetched struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(out), &fetched); code != 0 || err != nil || fetched.Path != wantPath {
+		t.Fatalf("fetch-file -json: exit %d, stdout %q; want the path", code, out)
+	}
+	f.RemoveFile("F1")
+	if code, _ := fednet("client", "fetch-file", "-socket", socket, "F1"); code != 0 {
+		t.Fatalf("fetch-file of a cached file Slack has deleted: exit %d, want 0 from the cache", code)
+	}
+	if code, _ := fednet("client", "fetch-file", "-socket", socket, "F2"); code != 1 || !strings.Contains(stderr.String(), "file F2 no longer exists in Slack") {
+		t.Fatalf("fetch-file of a missing file: exit %d, want 1 and a message saying so", code)
+	}
+	if code, _ := fednet("client", "fetch-file", "-socket", socket, "../F1"); code != 2 {
+		t.Fatalf("fetch-file of a malformed id: exit %d, want 2", code)
+	}
+
 	// A revoked client is denied; with the hub down a request fails at once.
 	if code, _ := fednet("hub", "revoke", "-db", hubDB, "workstation"); code != 0 {
 		t.Fatalf("hub revoke: exit %d", code)
@@ -198,6 +229,9 @@ func TestHubRequests(t *testing.T) {
 	}
 	if code, _ := fednet("client", "read-thread", "-socket", socket, thread); code != 4 {
 		t.Fatalf("read-thread with the hub down: exit %d, want 4", code)
+	}
+	if code, _ := fednet("client", "fetch-file", "-socket", socket, "F3"); code != 4 {
+		t.Fatalf("fetch-file with the hub down: exit %d, want 4", code)
 	}
 	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", "while the hub is down"); code != 4 || len(f.DMs("U1")) != 1 {
 		t.Fatalf("dm with the hub down: exit %d, DMs to U1 %q; want 4 and only the first", code, f.DMs("U1"))
@@ -313,6 +347,32 @@ func TestHubConfigHistory(t *testing.T) {
 	}
 }
 
+func TestHubConfigFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cfg, err := readHubConfig(write("set.json", `{"files": {"prefetch_types": ["image/png"], "prefetch_max_bytes": 1000, "prefetch_max_total_bytes": 3000, "fetch_max_bytes": 5000}}`))
+	if err != nil || !reflect.DeepEqual(cfg.prefetch(), inbound.Prefetch{Types: []string{"image/png"}, MaxBytes: 1000, MaxTotal: 3000}) || cfg.Files.FetchMaxBytes != 5000 {
+		t.Fatalf("readHubConfig = %+v, %v; want the four values", cfg.Files, err)
+	}
+	// Left out, the types are nil (the default list), not an empty list
+	// (nothing fetched).
+	if cfg, err := readHubConfig(write("unset.json", `{}`)); err != nil || !reflect.DeepEqual(cfg.prefetch(), inbound.Prefetch{}) || cfg.Files.FetchMaxBytes != 0 {
+		t.Fatalf("readHubConfig without files = %+v, %v; want zero, the defaults", cfg.Files, err)
+	}
+	if cfg, err := readHubConfig(write("none.json", `{"files": {"prefetch_types": []}}`)); err != nil || cfg.prefetch().Types == nil {
+		t.Fatalf("readHubConfig with an empty type list = %+v, %v; want an empty list, nothing fetched", cfg.Files, err)
+	}
+	if _, err := readHubConfig(write("bad.json", `{"files": {"fetch_max_bytes": -1}}`)); err == nil || !strings.Contains(err.Error(), "files limits must not be negative") {
+		t.Fatalf("readHubConfig with a negative limit = %v, want it refused", err)
+	}
+}
+
 // The example config in deploy/ is one the hub takes.
 func TestExampleHubConfig(t *testing.T) {
 	cfg, err := readHubConfig(filepath.Join("..", "..", "deploy", "hub.example.json"))
@@ -321,6 +381,9 @@ func TestExampleHubConfig(t *testing.T) {
 	}
 	if cfg.history() != (inbound.Limits{MaxMessages: inbound.DefaultMaxMessages, MaxChars: inbound.DefaultMaxChars, MaxMessageChars: inbound.DefaultMaxMessageChars}) {
 		t.Fatalf("the example's history limits are %+v, want the defaults", cfg.History)
+	}
+	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes {
+		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
 	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 {
 		t.Fatalf("example config = %+v, want every part set", cfg)

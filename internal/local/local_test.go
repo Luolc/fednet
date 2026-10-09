@@ -410,3 +410,46 @@ func TestAskWhileHubDown(t *testing.T) {
 		t.Fatalf("outbox = %+v, %v; want empty", ms, err)
 	}
 }
+
+// fetch-file hands the id to the daemon's Fetch and replies with the path;
+// the failures come back with their kind.
+func TestFetchFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fednet.sock")
+	ln, err := Listen(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	s := &Server{Fetch: func(_ context.Context, id string) (string, error) {
+		switch id {
+		case "F1":
+			return "/var/lib/fednet-client/files/F1/shot.png", nil
+		case "F2":
+			return "", link.Refuse(link.ErrNotFound, "file F2 no longer exists in Slack")
+		}
+		return "", link.ErrUnreachable
+	}}
+	go func() { done <- s.Serve(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	})
+	res, err := Do(t.Context(), path, Request{Cmd: FetchFile, File: "F1"})
+	if err != nil || res.Error != "" || res.Path != "/var/lib/fednet-client/files/F1/shot.png" {
+		t.Fatalf("Do(fetch-file F1) = %+v, %v; want the path", res, err)
+	}
+	for id, kind := range map[string]string{"F2": NotFound, "F3": Unreachable, "": BadRequest} {
+		res, err := Do(t.Context(), path, Request{Cmd: FetchFile, File: id})
+		if err != nil || res.Error == "" || res.Kind != kind || res.Path != "" {
+			t.Errorf("Do(fetch-file %q) = %+v, %v; want kind %q", id, res, err, kind)
+		}
+	}
+	// A socket that does not serve it says so.
+	s.Fetch = nil
+	if res, err := Do(t.Context(), path, Request{Cmd: FetchFile, File: "F1"}); err != nil || res.Kind != BadRequest {
+		t.Fatalf("Do(fetch-file) without Fetch = %+v, %v; want a bad request", res, err)
+	}
+}

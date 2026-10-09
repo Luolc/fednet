@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/auth"
+	"github.com/Luolc/fednet/internal/files"
 	"github.com/Luolc/fednet/internal/handoff"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/hubapi"
@@ -66,26 +68,34 @@ commands:
       [-slack-app-token-file PATH -slack-bot-token-file PATH] [-alert-webhook-file PATH]
       [-approval-key-file PATH] [-upgrade-request PATH]
         run the hub; with the two Slack token files it also takes in the
-        messages people post in Slack and posts the clients' posts there,
-        with the webhook file it sends alerts, and with the approval key
-        (an Ed25519 private key, PKCS#8 PEM) it runs approvals: posts the
-        cards and signs what the approvers approve; each file holds one
-        credential; the JSON config file says, for each channel, which
-        client takes the threads people start in it and which clients may
-        open threads in it, which client takes direct messages, lists the
-        Slack users fednet serves, each with a name for the agents, which
-        may be empty, names the channel approval cards go to and the
-        users, from that list, who may approve, bounds the thread history
-        a message that mentions the bot carries (how many messages, how
-        many characters in all, how many in one message before it is cut;
-        the defaults are shown), and names the users, from that list, who
-        may upgrade with /fednet upgrade and whether the hub upgrades on
-        its own when it finds a new release (default yes):
+        messages people post in Slack, posts the clients' posts there and
+        serves the files people upload to the clients, with the webhook
+        file it sends alerts, and with the approval key (an Ed25519
+        private key, PKCS#8 PEM) it runs approvals: posts the cards and
+        signs what the approvers approve; each file holds one credential;
+        the JSON config file says, for each channel, which client takes
+        the threads people start in it and which clients may open threads
+        in it, which client takes direct messages, lists the Slack users
+        fednet serves, each with a name for the agents, which may be
+        empty, names the channel approval cards go to and the users, from
+        that list, who may approve, bounds the thread history a message
+        that mentions the bot carries (how many messages, how many
+        characters in all, how many in one message before it is cut; the
+        defaults are shown), says which uploaded files a client fetches
+        before it hands a message to its hook (the types, "image/*" for
+        all images, the largest file, the most one message's files add up
+        to) and the largest file a client may fetch at all, in bytes (the
+        defaults are shown: 20 MiB, 50 MiB, 200 MiB), and names the users,
+        from that list, who may upgrade with /fednet upgrade and whether
+        the hub upgrades on its own when it finds a new release (default
+        yes):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
          "approvals": {"channel": "C456", "approvers": ["U123"]},
          "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
+         "files": {"prefetch_types": ["image/*", "application/pdf"], "prefetch_max_bytes": 20971520,
+                   "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200},
          "upgrade": {"admins": ["U123"], "auto": true}}
         the admin socket takes hub handoff; D is how long a new process may
         take to become ready at a handoff; the upgrade request is the file
@@ -103,6 +113,7 @@ commands:
         move every thread FROM-ID owns to TO-ID; prints how many moved
   client -hub URL -db PATH -credential PATH -socket PATH [-socket-group GROUP]
          [-hook-timeout D] [-hook-env NAME]... [-handoff-timeout D] [-upgrade-request PATH]
+         [-files-dir DIR] [-files-retention D] [-files-max-total-bytes N] [-prefetch-timeout D]
          [COMMAND [ARG]...]
         run a client on an agent machine; agents reach it through the socket,
         which only this user and the members of GROUP can connect to; COMMAND
@@ -110,7 +121,13 @@ commands:
         argument, in an environment of just PATH, HOME and each -hook-env NAME;
         the upgrade request is the file the client writes when the hub tells
         it to upgrade, for the machine's upgrader (fednet upgrade, run by
-        root); without it the hub's notices are dropped
+        root); without it the hub's notices are dropped; the files people
+        upload in Slack are fetched through the hub into DIR (default: files
+        next to the database), under <file id>/<name>, the images and PDFs
+        of a message before its hook runs (waiting at most -prefetch-timeout,
+        default 30s) and the rest on fetch-file; a file is kept for
+        -files-retention after it was last fetched (default 168h) and the
+        files are kept under N bytes in all (default 2 GiB)
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
@@ -133,6 +150,10 @@ commands:
         print the user list: each user's Slack id and name
   client dm -socket PATH -user USER-ID [-json] [--] TEXT
         send TEXT as a direct message to a user on the user list
+  client fetch-file -socket PATH [-json] FILE-ID
+        fetch the Slack file with FILE-ID (the id in a message's files)
+        through the hub into the client's files directory, unless it is
+        there already, and print its path
   client request-approval -socket PATH -agent NAME -action FILE [-requester USER-ID] [-json] [--] TEXT
         ask for approval of an action: TEXT says what it does, FILE holds
         its parameters as JSON, NAME is the agent that will act; prints the
@@ -312,6 +333,19 @@ type hubConfig struct {
 		MaxChars        int `json:"max_chars"`
 		MaxMessageChars int `json:"max_message_chars"`
 	} `json:"history"`
+	// Files is about the files people upload in Slack; a field left out
+	// or zero keeps the package's default.
+	Files struct {
+		// PrefetchTypes are the mimetypes of the files a client fetches
+		// before it runs the hook; PrefetchMaxBytes the largest such
+		// file and PrefetchMaxTotalBytes the most one message's add up
+		// to.
+		PrefetchTypes         []string `json:"prefetch_types"`
+		PrefetchMaxBytes      int64    `json:"prefetch_max_bytes"`
+		PrefetchMaxTotalBytes int64    `json:"prefetch_max_total_bytes"`
+		// FetchMaxBytes is the largest file the hub serves to a client.
+		FetchMaxBytes int64 `json:"fetch_max_bytes"`
+	} `json:"files"`
 	// Upgrade is about upgrades.
 	Upgrade struct {
 		// Admins are the Slack user ids of the people who may upgrade;
@@ -377,7 +411,16 @@ func readHubConfig(path string) (hubConfig, error) {
 	if h := cfg.History; h.MaxMessages < 0 || h.MaxChars < 0 || h.MaxMessageChars < 0 {
 		return hubConfig{}, fmt.Errorf("%s: history limits must not be negative", path)
 	}
+	if f := cfg.Files; f.PrefetchMaxBytes < 0 || f.PrefetchMaxTotalBytes < 0 || f.FetchMaxBytes < 0 {
+		return hubConfig{}, fmt.Errorf("%s: files limits must not be negative", path)
+	}
 	return cfg, nil
+}
+
+// prefetch is the files part of the config, as the inbound package takes
+// it.
+func (c hubConfig) prefetch() inbound.Prefetch {
+	return inbound.Prefetch{Types: c.Files.PrefetchTypes, MaxBytes: c.Files.PrefetchMaxBytes, MaxTotal: c.Files.PrefetchMaxTotalBytes}
 }
 
 // history is the limits of the thread history, as the inbound package
@@ -546,7 +589,8 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 			TTL: approvalTTL, Interval: approvalInterval, Stored: hub.WakeAll,
 		}
 	}
-	hub.Answer = (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals}).Answer
+	api := &hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals, MaxFetchBytes: cfg.Files.FetchMaxBytes}
+	hub.Answer, hub.Fetch = api.Answer, api.Fetch
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Request: *upgradeRequest, HandedOff: proc.Exit(),
 		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Auto: cfg.auto(),
@@ -590,7 +634,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Bot: bot, History: cfg.history(), Approvals: approvals, Commands: upgrades, Stored: func() {
+		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -804,6 +848,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return handoffCommand(ctx, "fednet client handoff", args[1:], stdout)
 		case "request-approval":
 			return clientRequestApproval(ctx, args[1:], stdout)
+		case "fetch-file":
+			return clientFetchFile(ctx, args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -828,6 +874,10 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	hookTimeout := fs.Duration("hook-timeout", hook.DefaultTimeout, "how long one run of the hook may take")
 	handoffTimeout := fs.Duration("handoff-timeout", handoff.DefaultTimeout, "how long a new process may take to become ready at a handoff")
 	upgradeRequest := fs.String("upgrade-request", "", "file the client writes when the hub tells it to upgrade, for the machine's upgrader; without it the notices are dropped")
+	filesDir := fs.String("files-dir", "", "where the files people upload in Slack are kept; default: files next to the database")
+	filesRetention := fs.Duration("files-retention", files.DefaultRetention, "how long a fetched file is kept after it was last fetched")
+	filesMaxTotal := fs.Int64("files-max-total-bytes", files.DefaultMaxTotal, "the most the fetched files add up to, in bytes")
+	prefetchTimeout := fs.Duration("prefetch-timeout", files.DefaultTimeout, "how long fetching one message's files before its hook runs may take")
 	env := hookEnv
 	fs.Func("hook-env", "environment variable to pass to the hook (repeatable)", func(name string) error {
 		env = append(env, name)
@@ -838,6 +888,12 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	}
 	if *hubURL == "" || *dbPath == "" || *credPath == "" || *socket == "" {
 		return usageError("fednet client: -hub, -db, -credential and -socket are required")
+	}
+	if *filesRetention <= 0 || *filesMaxTotal <= 0 || *prefetchTimeout <= 0 {
+		return usageError("fednet client: -files-retention, -files-max-total-bytes and -prefetch-timeout must be positive")
+	}
+	if *filesDir == "" {
+		*filesDir = filepath.Join(filepath.Dir(*dbPath), "files")
 	}
 	proc, err := newProcess(*handoffTimeout)
 	if err != nil {
@@ -861,6 +917,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
 	u := &upgrade.Client{Version: version, Request: *upgradeRequest, Alert: uplinkAlert(c)}
 	c.Divert, c.Upgrade = u.Divert, u.Notice
+	cache := &files.Store{Dir: *filesDir, Fetch: c.Fetch, Retention: *filesRetention, MaxTotal: *filesMaxTotal, Timeout: *prefetchTimeout}
 	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err
@@ -869,7 +926,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	defer cancel()
 	served := make(chan error, 1)
 	go func() {
-		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version}).Serve(ctx, ln)
+		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get}).Serve(ctx, ln)
 	}()
 	// Ready before the predecessor is told to go: a failure here means
 	// this process exits and the predecessor stays.
@@ -880,7 +937,11 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	}
 	var h *hook.Runner
 	if fs.NArg() > 0 {
-		h = &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c)}
+		h = &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c), Prepare: cache.Attach, Prune: func() {
+			if err := cache.Prune(); err != nil {
+				slog.Warn("client: pruning the files", "err", err)
+			}
+		}}
 		c.Received = h.Nudge
 	}
 	// hooked is closed once the hook has stopped, or will never start.
@@ -1333,6 +1394,28 @@ func clientRequestApproval(ctx context.Context, args []string, stdout io.Writer)
 		return json.NewEncoder(stdout).Encode(res)
 	}
 	_, err = fmt.Fprintln(stdout, res.ApprovalID)
+	return err
+}
+
+// clientFetchFile has the client daemon fetch a file through the hub and
+// prints where it is.
+func clientFetchFile(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client fetch-file", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || fs.Arg(0) == "" {
+		return usageError("fednet client fetch-file: -socket and FILE-ID are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: local.FetchFile, File: fs.Arg(0)})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.Path)
 	return err
 }
 

@@ -877,3 +877,39 @@ func runNotRunChild(t *testing.T) {
 		t.Fatalf("child did not run %s:\n%s", t.Name(), out)
 	}
 }
+
+// Prepare gets the payload before each run and decides what the event
+// file holds; the inbox keeps the payload as it came. Prune runs each
+// time the inbox is pruned.
+func TestPrepareAndPrune(t *testing.T) {
+	f := newFixture(t, `cp "$1" "$DIR/event"; grep -q fail "$1" && exit 1; exit 0`)
+	var prepared, pruned int
+	f.r.Prepare = func(_ context.Context, payload []byte) []byte {
+		prepared++
+		return []byte(strings.Replace(string(payload), "raw", "prepared", 1))
+	}
+	f.r.Prune = func() { pruned++ }
+	f.put("m1", `{"raw":true}`)
+	stop := f.run()
+	waitFor(t, "m1 delivered", func() bool { return f.delivered("m1") })
+	stop()
+	b, err := os.ReadFile(filepath.Join(f.dir, "event"))
+	if err != nil || !strings.Contains(string(b), `"prepared":true`) {
+		t.Fatalf("event = %q, %v; want the prepared payload", b, err)
+	}
+	qs, err := f.st.Inbox.Undelivered(t.Context())
+	if err != nil || len(qs) != 0 {
+		t.Fatal(err, qs)
+	}
+	if prepared != 1 || pruned != 1 {
+		t.Fatalf("prepared %d times, pruned %d times; want once each", prepared, pruned)
+	}
+	// A message that fails is prepared again on each attempt.
+	f.put("m2", `{"raw":"fail"}`)
+	stop = f.run()
+	waitFor(t, "m2 a dead letter", func() bool { return len(f.deadLetters()) == 1 })
+	stop()
+	if prepared != 1+testRetry.Attempts || pruned != 1 {
+		t.Fatalf("after a dead letter: prepared %d times, pruned %d times; want %d and 1", prepared, pruned, 1+testRetry.Attempts)
+	}
+}

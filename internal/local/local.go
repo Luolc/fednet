@@ -40,6 +40,10 @@ const (
 	Handoff = "handoff"
 	// Version replies with the version and pid of the process that answered.
 	Version = "version"
+	// FetchFile fetches the Slack file with id File through the hub into
+	// the client's files directory, unless it is there already, and
+	// replies with its path.
+	FetchFile = "fetch-file"
 )
 
 // Request is what a caller sends. Cmd selects the command; the other fields
@@ -55,6 +59,8 @@ type Request struct {
 	Agent     string `json:"agent,omitempty"`
 	Requester string `json:"requester,omitempty"`
 	Action    []byte `json:"action,omitempty"`
+	// File is the Slack file id FetchFile takes.
+	File string `json:"file,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -67,6 +73,7 @@ type Response struct {
 	Threads    []string        `json:"threads,omitempty"`
 	Users      []hubapi.User   `json:"users,omitempty"`
 	ApprovalID string          `json:"approval_id,omitempty"`
+	Path       string          `json:"path,omitempty"`
 	Version    string          `json:"version,omitempty"`
 	PID        int             `json:"pid,omitempty"`
 	Error      string          `json:"error,omitempty"`
@@ -85,14 +92,21 @@ const (
 	Unreachable = "unreachable"
 )
 
-// Timeout bounds one request on either side, except a Handoff: that one
-// is bounded by how long the daemon gives the new process to become ready.
-const Timeout = 10 * time.Second
+// Timeout bounds one request on either side, except a Handoff, which is
+// bounded by how long the daemon gives the new process to become ready,
+// and a FetchFile, which gets FetchTimeout: a download takes longer.
+const (
+	Timeout      = 10 * time.Second
+	FetchTimeout = 5 * time.Minute
+)
 
 // timeout returns ctx bounded for a request of cmd.
 func timeout(ctx context.Context, cmd string) (context.Context, context.CancelFunc) {
-	if cmd == Handoff {
+	switch cmd {
+	case Handoff:
 		return context.WithCancel(ctx)
+	case FetchFile:
+		return context.WithTimeout(ctx, FetchTimeout)
 	}
 	return context.WithTimeout(ctx, Timeout)
 }
@@ -227,6 +241,9 @@ type Server struct {
 	Handoff func(ctx context.Context) error
 	// Version is this process's version, for Version and Handoff.
 	Version string
+	// Fetch fetches the file with the given Slack id into the files
+	// directory and returns its path; nil means FetchFile is not served.
+	Fetch func(ctx context.Context, id string) (string, error)
 }
 
 // Serve answers connections on ln until ctx is done. When it returns it has
@@ -296,6 +313,11 @@ func (s *Server) handle(ctx context.Context, req Request) Response {
 		return s.version()
 	case Version:
 		return s.version()
+	case FetchFile:
+		if s.Fetch == nil {
+			return badRequest("fetch-file is not served on this socket")
+		}
+		return s.fetchFile(ctx, req)
 	default:
 		return badRequest(fmt.Sprintf("unknown command %q", req.Cmd))
 	}
@@ -322,6 +344,30 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 	return Response{MsgID: id}
 }
 
+func (s *Server) fetchFile(ctx context.Context, req Request) Response {
+	if req.File == "" {
+		return badRequest("fetch-file needs a file id")
+	}
+	path, err := s.Fetch(ctx, req.File)
+	if err != nil {
+		return failed(req.Cmd, err)
+	}
+	return Response{Path: path}
+}
+
+// failed is the Response for a request the hub or the link failed, with
+// the Kind the error maps to.
+func failed(cmd string, err error) Response {
+	res := Response{Error: cmd + ": " + err.Error()}
+	for _, k := range kinds {
+		if errors.Is(err, k.err) {
+			res.Kind = k.kind
+			break
+		}
+	}
+	return res
+}
+
 // kinds maps the link's errors to the Kind they are reported with.
 var kinds = []struct {
 	err  error
@@ -344,14 +390,7 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	defer cancel()
 	answer, err := s.Request(ctx, b)
 	if err != nil {
-		res := Response{Error: req.Cmd + ": " + err.Error()}
-		for _, k := range kinds {
-			if errors.Is(err, k.err) {
-				res.Kind = k.kind
-				break
-			}
-		}
-		return res
+		return failed(req.Cmd, err)
 	}
 	var reply hubapi.Reply
 	if err := json.Unmarshal(answer, &reply); err != nil {

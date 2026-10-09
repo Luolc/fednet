@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -63,7 +64,7 @@ func newTestWeb(t *testing.T, answer func(r request) (int, string)) (*Web, *test
 		w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-	w := &Web{c: slackgo.New(testToken, slackgo.OptionAPIURL(srv.URL+"/"))}
+	w := &Web{c: slackgo.New(testToken, slackgo.OptionAPIURL(srv.URL+"/")), token: testToken, base: srv.URL + "/", files: &http.Client{}}
 	w.sleep = func(_ context.Context, d time.Duration) error {
 		ts.mu.Lock()
 		defer ts.mu.Unlock()
@@ -628,5 +629,85 @@ func TestMentions(t *testing.T) {
 		if got := Mentions(tt.text, tt.user); got != tt.want {
 			t.Errorf("Mentions(%q, %q) = %v, want %v", tt.text, tt.user, got, tt.want)
 		}
+	}
+}
+
+// files.info and the download of a file: the download goes with the token
+// to Slack's host (here the test server's), not elsewhere; a file Slack has
+// deleted is ErrNotFound; one hosted outside Slack has nothing to download.
+func TestWebFiles(t *testing.T) {
+	ctx := context.Background()
+	var srv *httptest.Server
+	var downloads []string
+	w, _, srv := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "files.info":
+			switch r.form.Get("file") {
+			case "F1":
+				return 200, `{"ok":true,"file":{"id":"F1","name":"shot.png","mimetype":"image/png","size":6,"permalink":"https://example.invalid/F1","url_private_download":"` + srv.URL + `/files-pri/F1/download/shot.png"}}`
+			case "F2":
+				return 200, `{"ok":true,"file":{"id":"F2","name":"doc","is_external":true,"permalink":"https://example.invalid/F2","url_private":"https://docs.example.invalid/doc"}}`
+			case "F3":
+				return 200, `{"ok":true,"file":{"id":"F3","name":"shot.png","size":6,"url_private_download":"https://files.example.invalid/F3"}}`
+			}
+			return 200, `{"ok":false,"error":"file_not_found"}`
+		case "shot.png":
+			downloads = append(downloads, r.auth)
+			return 200, `PNG...`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	f, err := w.FileInfo(ctx, "F1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := File{ID: "F1", Name: "shot.png", Mimetype: "image/png", Size: 6, URL: "https://example.invalid/F1", DownloadURL: srv.URL + "/files-pri/F1/download/shot.png"}
+	if f != want {
+		t.Fatalf("FileInfo = %+v, want %+v", f, want)
+	}
+	body, err := w.Download(ctx, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(body)
+	body.Close()
+	if err != nil || string(b) != "PNG..." {
+		t.Fatalf("Download read %q, %v; want the content", b, err)
+	}
+	if len(downloads) != 1 || downloads[0] != "Bearer "+testToken {
+		t.Fatalf("the download went with %q, want the bot token as a bearer", downloads)
+	}
+	if _, err := w.FileInfo(ctx, "F9"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FileInfo of a missing file = %v, want ErrNotFound", err)
+	}
+	if _, err := w.FileInfo(ctx, "F2"); err == nil || !strings.Contains(err.Error(), "outside Slack") {
+		t.Fatalf("FileInfo of an external file = %v, want an error saying so", err)
+	}
+	// The token goes only to Slack or to the API's host.
+	f3, err := w.FileInfo(ctx, "F3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = w.Download(ctx, f3)
+	if err == nil || !strings.Contains(err.Error(), "refusing to send the token") || len(downloads) != 1 {
+		t.Fatalf("Download from another host = %v, %d downloads; want it refused before any request", err, len(downloads))
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Fatal("the error quotes the token")
+	}
+	// The file's own name is not needed for the download URL; a sign-in
+	// redirect (without access, Slack sends the browser to log in) is
+	// reported, not served as the file.
+	redirecting := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/signin" {
+			rw.Write([]byte("<html>sign in</html>"))
+			return
+		}
+		http.Redirect(rw, r, "/signin?redir="+r.URL.Path, http.StatusFound)
+	}))
+	defer redirecting.Close()
+	w.base = redirecting.URL + "/"
+	if _, err := w.Download(ctx, File{ID: "F4", DownloadURL: redirecting.URL + "/files-pri/F4"}); err == nil || !strings.Contains(err.Error(), "sign-in page") {
+		t.Fatalf("Download redirected to the sign-in page = %v, want an error saying so", err)
 	}
 }
