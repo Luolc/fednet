@@ -34,8 +34,9 @@ var version = "dev"
 const usage = `usage: fednet <command> [flags]
 
 commands:
-  hub -listen ADDR -db PATH
-        run the hub
+  hub -listen ADDR -db PATH [-config PATH]
+        run the hub; the JSON config file says which clients may open
+        threads in which channel: {"channels": {"C123": {"open_thread": ["CLIENT-ID"]}}}
   hub register -db PATH CLIENT-ID HASH
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
@@ -53,6 +54,10 @@ commands:
         put -- before a TEXT that starts with -
   client read-thread -socket PATH [-json] THREAD-KEY
         print the messages of a thread, read by the hub
+  client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
+        start a thread in CHANNEL with TEXT and print its key; this machine owns it
+  client threads -socket PATH [-json]
+        print the keys of the threads this machine owns
   client adopt -socket PATH [-json] THREAD-KEY
         make this machine the owner of a thread: people's replies in it come here
   client channel-context get -socket PATH [-json] CHANNEL
@@ -168,6 +173,44 @@ func hubCommand(ctx context.Context, args []string, stdout io.Writer) error {
 	return hubServe(ctx, args, stdout)
 }
 
+// hubConfig is the hub's config file.
+type hubConfig struct {
+	Channels map[string]struct {
+		// OpenThread lists the clients that may open threads in the channel.
+		OpenThread []string `json:"open_thread"`
+	} `json:"channels"`
+}
+
+// readHubConfig reads the config file at path. An unknown field is an
+// error, so that a misspelt one does not silently deny, and so is anything
+// after the config object.
+func readHubConfig(path string) (hubConfig, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return hubConfig{}, err
+	}
+	defer f.Close()
+	d := json.NewDecoder(f)
+	d.DisallowUnknownFields()
+	var cfg hubConfig
+	if err := d.Decode(&cfg); err != nil {
+		return hubConfig{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := d.Decode(&struct{}{}); err != io.EOF {
+		return hubConfig{}, fmt.Errorf("%s: more than one JSON value", path)
+	}
+	return cfg, nil
+}
+
+// openThread maps each channel to the clients that may open threads in it.
+func (c hubConfig) openThread() map[string][]string {
+	m := make(map[string][]string, len(c.Channels))
+	for ch, cc := range c.Channels {
+		m[ch] = cc.OpenThread
+	}
+	return m
+}
+
 // hubSlack is the hub's Slack API. It is nil until the hub connects to
 // Slack, so requests that need Slack fail; tests set a fake.
 var hubSlack slack.API
@@ -178,11 +221,19 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet hub", flag.ContinueOnError)
 	listen := fs.String("listen", "", "address to listen on, such as 127.0.0.1:8080 (required)")
 	dbPath := fs.String("db", "", "hub database file (required)")
+	configPath := fs.String("config", "", "hub config file; without one, no client may open threads")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
 	if *listen == "" || *dbPath == "" {
 		return usageError("fednet hub: -listen and -db are required")
+	}
+	var cfg hubConfig
+	if *configPath != "" {
+		var err error
+		if cfg, err = readHubConfig(*configPath); err != nil {
+			return err
+		}
 	}
 	st, err := store.OpenHub(ctx, *dbPath)
 	if err != nil {
@@ -192,7 +243,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	hub := &link.Hub{
 		Store:    st,
 		Identify: (&auth.Authenticator{Store: st}).Identify,
-		Answer:   (&hubapi.Server{Store: st, Slack: hubSlack}).Answer,
+		Answer:   (&hubapi.Server{Store: st, Slack: hubSlack, OpenThread: cfg.openThread()}).Answer,
 	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -294,6 +345,10 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientPost(ctx, args[1:], stdout)
 		case "read-thread":
 			return clientReadThread(ctx, args[1:], stdout)
+		case "open-thread":
+			return clientOpenThread(ctx, args[1:], stdout)
+		case "threads":
+			return clientThreads(ctx, args[1:], stdout)
 		case "adopt":
 			return clientAdopt(ctx, args[1:], stdout)
 		case "channel-context":
@@ -447,6 +502,53 @@ func clientReadThread(ctx context.Context, args []string, stdout io.Writer) erro
 	}
 	for _, m := range res.Messages {
 		if _, err := fmt.Fprintf(stdout, "%s %s: %s\n", m.TS, m.User, m.Text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clientOpenThread starts a thread through the hub and prints its key.
+func clientOpenThread(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client open-thread", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	channel := fs.String("channel", "", "channel to start the thread in (required)")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || *channel == "" || fs.Arg(0) == "" {
+		return usageError("fednet client open-thread: -socket, -channel and a non-empty TEXT are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.OpenThread, Channel: *channel, Text: fs.Arg(0)})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.Thread)
+	return err
+}
+
+// clientThreads prints the threads this client owns, one key a line.
+func clientThreads(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client threads", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" {
+		return usageError("fednet client threads: -socket is required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Threads})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	for _, t := range res.Threads {
+		if _, err := fmt.Fprintln(stdout, t); err != nil {
 			return err
 		}
 	}

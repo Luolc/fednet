@@ -1,6 +1,7 @@
 package hubapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -147,5 +148,78 @@ func TestWithoutSlack(t *testing.T) {
 	}
 	if _, err := answer(t, s, "workstation", Request{Cmd: Adopt, Thread: key}); err != nil {
 		t.Errorf("adopt without Slack = %v", err)
+	}
+}
+
+// countPosts is a Slack API that counts the calls to Post.
+type countPosts struct {
+	slack.API
+	n int
+}
+
+func (c *countPosts) Post(ctx context.Context, channel, text string) (string, error) {
+	c.n++
+	return c.API.Post(ctx, channel, text)
+}
+
+func TestOpenThread(t *testing.T) {
+	s, f := testServer(t)
+	f.AddChannel("C2", "")
+	posts := &countPosts{API: f}
+	s.Slack = posts
+	s.OpenThread = map[string][]string{"C1": {"workstation"}, "C9": {"workstation"}}
+	ctx := t.Context()
+
+	got, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, ts, ok := slack.ParseThreadKey(got.Thread)
+	if !ok || channel != "C1" {
+		t.Fatalf("open-thread = %+v, want a thread key in C1", got)
+	}
+	if ms, err := f.Replies(ctx, channel, ts); err != nil || len(ms) != 1 || ms[0].Text != "nightly report" {
+		t.Fatalf("Slack thread = %+v, %v; want the text", ms, err)
+	}
+	if owner, err := s.Store.Owner(ctx, got.Thread); err != nil || owner != "workstation" {
+		t.Fatalf("owner of the new thread = %q, %v; want workstation", owner, err)
+	}
+
+	tests := []struct {
+		name   string
+		client string
+		req    Request
+		want   error
+	}{
+		{"a client the channel does not list", "datamachine", Request{Cmd: OpenThread, Channel: "C1", Text: "x"}, link.ErrDenied},
+		{"a channel the config does not list", "workstation", Request{Cmd: OpenThread, Channel: "C2", Text: "x"}, link.ErrDenied},
+		{"a channel Slack does not know", "workstation", Request{Cmd: OpenThread, Channel: "C9", Text: "x"}, link.ErrNotFound},
+		{"no text", "workstation", Request{Cmd: OpenThread, Channel: "C1"}, link.ErrBadRequest},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, tt.client, tt.req); !errors.Is(err, tt.want) {
+			t.Errorf("%s: open-thread = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	// Only the open-thread to a channel Slack does not know reached Slack,
+	// besides the first one.
+	if posts.n != 2 {
+		t.Fatalf("Slack got %d posts, want 2", posts.n)
+	}
+}
+
+func TestThreads(t *testing.T) {
+	s, _ := testServer(t)
+	for thread, client := range map[string]string{"C1/2": "workstation", "C1/1": "workstation", "C1/3": "datamachine"} {
+		if err := s.Store.Claim(t.Context(), thread, client); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := answer(t, s, "workstation", Request{Cmd: Threads})
+	if err != nil || !slices.Equal(got.Threads, []string{"C1/1", "C1/2"}) {
+		t.Fatalf("threads = %+v, %v; want [C1/1 C1/2]", got, err)
+	}
+	if got, err := answer(t, s, "nobody", Request{Cmd: Threads}); err != nil || len(got.Threads) != 0 {
+		t.Fatalf("threads of a client with none = %+v, %v; want none", got, err)
 	}
 }

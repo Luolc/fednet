@@ -51,6 +51,8 @@ type Response struct {
 	MsgID    string          `json:"msg_id,omitempty"`
 	Messages []slack.Message `json:"messages,omitempty"`
 	Text     string          `json:"text,omitempty"`
+	Thread   string          `json:"thread,omitempty"`
+	Threads  []string        `json:"threads,omitempty"`
 	Error    string          `json:"error,omitempty"`
 	Kind     string          `json:"kind,omitempty"`
 }
@@ -223,7 +225,7 @@ func (s *Server) handle(ctx context.Context, req Request) Response {
 	switch req.Cmd {
 	case Post:
 		return s.post(ctx, req)
-	case hubapi.ReadThread, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext:
+	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext:
 		return s.ask(ctx, req)
 	default:
 		return badRequest(fmt.Sprintf("unknown command %q", req.Cmd))
@@ -283,7 +285,7 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err := json.Unmarshal(answer, &reply); err != nil {
 		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
 	}
-	return Response{Messages: reply.Messages, Text: reply.Text}
+	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An

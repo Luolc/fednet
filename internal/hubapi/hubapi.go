@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/slack"
@@ -19,6 +21,11 @@ import (
 const (
 	// ReadThread returns the messages of Thread.
 	ReadThread = "read-thread"
+	// OpenThread posts Text in Channel as a new thread, makes the
+	// requesting client its owner, and returns its key.
+	OpenThread = "open-thread"
+	// Threads returns the threads the requesting client owns.
+	Threads = "threads"
 	// Adopt makes the requesting client the owner of Thread, which must
 	// already have an owner.
 	Adopt = "adopt"
@@ -42,6 +49,8 @@ type Request struct {
 type Reply struct {
 	Messages []slack.Message `json:"messages,omitempty"`
 	Text     string          `json:"text,omitempty"`
+	Thread   string          `json:"thread,omitempty"`
+	Threads  []string        `json:"threads,omitempty"`
 }
 
 // Server answers requests on the hub. Its Answer is meant for
@@ -51,6 +60,9 @@ type Server struct {
 	// Slack is nil until the hub is connected to Slack; requests that need
 	// it fail until then.
 	Slack slack.API
+	// OpenThread maps a channel to the clients that may open threads in
+	// it. A client may open threads only in the channels that list it.
+	OpenThread map[string][]string
 }
 
 // errNoSlack is returned for a request that needs Slack when Server.Slack
@@ -68,6 +80,10 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 	switch r.Cmd {
 	case ReadThread:
 		reply, err = s.readThread(ctx, r)
+	case OpenThread:
+		reply, err = s.openThread(ctx, client, r)
+	case Threads:
+		reply.Threads, err = s.Store.Threads(ctx, client)
 	case Adopt:
 		err = s.adopt(ctx, client, r)
 	case GetChannelContext:
@@ -105,6 +121,33 @@ func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {
 		return Reply{}, link.Refuse(link.ErrNotFound, "no thread %s", r.Thread)
 	}
 	return Reply{Messages: ms}, err
+}
+
+// openThread posts the thread, then records its owner. If recording fails
+// the thread stays in Slack without an owner, as a thread from before
+// fednet does.
+func (s *Server) openThread(ctx context.Context, client string, r Request) (Reply, error) {
+	if r.Channel == "" || r.Text == "" {
+		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
+	}
+	if !slices.Contains(s.OpenThread[r.Channel], client) {
+		return Reply{}, link.Refuse(link.ErrDenied, "client %s may not open threads in %s", client, r.Channel)
+	}
+	if s.Slack == nil {
+		return Reply{}, errNoSlack
+	}
+	ts, err := s.Slack.Post(ctx, r.Channel, r.Text)
+	if errors.Is(err, slack.ErrNotFound) {
+		return Reply{}, link.Refuse(link.ErrNotFound, "no channel %s", r.Channel)
+	}
+	if err != nil {
+		return Reply{}, err
+	}
+	key := slack.ThreadKey(r.Channel, ts)
+	if err := s.Store.Claim(ctx, key, client); err != nil {
+		return Reply{}, fmt.Errorf("thread %s is open, but recording its owner failed: %w", key, err)
+	}
+	return Reply{Thread: key}, nil
 }
 
 func (s *Server) adopt(ctx context.Context, client string, r Request) error {

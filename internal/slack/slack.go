@@ -27,6 +27,9 @@ type API interface {
 	// Replies returns the messages of the thread that starts at ts in
 	// channel, the first message included, oldest first.
 	Replies(ctx context.Context, channel, ts string) ([]Message, error)
+	// Post posts text in channel as a new message, which starts a thread,
+	// and returns its ts.
+	Post(ctx context.Context, channel, text string) (string, error)
 	// Purpose returns channel's purpose, the description shown with it.
 	Purpose(ctx context.Context, channel string) (string, error)
 	// SetPurpose replaces channel's purpose.
@@ -94,6 +97,11 @@ func (f *Fake) Replies(_ context.Context, channel, ts string) ([]Message, error)
 		return nil, ErrNotFound
 	}
 	return append([]Message(nil), c.threads[ts]...), nil
+}
+
+// Post posts as the user "fednet".
+func (f *Fake) Post(_ context.Context, channel, text string) (string, error) {
+	return f.Start(channel, "fednet", text)
 }
 
 // Start posts text from user in channel as a new message, which starts a
