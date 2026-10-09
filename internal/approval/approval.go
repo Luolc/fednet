@@ -10,6 +10,10 @@
 // document: every field is written length-prefixed in a fixed order, so
 // two different contents never encode the same and the same content always
 // encodes the same, however the document that carried it was formatted.
+//
+// Flow, in hub.go, is the hub's side: it records what an agent asks, posts
+// the card in Slack, applies the clicks on it, signs when approved and
+// sends the outcome down to the client that asked.
 package approval
 
 import (

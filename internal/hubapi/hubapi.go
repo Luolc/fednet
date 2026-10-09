@@ -14,6 +14,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
@@ -41,6 +42,12 @@ const (
 	// DM sends Text to User, who must be on the user list, as a direct
 	// message.
 	DM = "dm"
+	// RequestApproval asks the people on the approver list to approve an
+	// action: Text says what it does, Action is its parameters, Agent is
+	// the agent that will act, and Requester, if set, is the Slack user id
+	// of the person the agent asks on behalf of. It returns the approval
+	// id; the outcome comes down the link later.
+	RequestApproval = "request-approval"
 )
 
 // Request is one request. Cmd selects the command; the other fields are its
@@ -51,6 +58,11 @@ type Request struct {
 	Channel string `json:"channel,omitempty"`
 	Text    string `json:"text,omitempty"`
 	User    string `json:"user,omitempty"`
+	// Agent, Requester and Action are the arguments of RequestApproval.
+	// Action is carried as bytes so that it reaches the hub byte for byte.
+	Agent     string `json:"agent,omitempty"`
+	Requester string `json:"requester,omitempty"`
+	Action    []byte `json:"action,omitempty"`
 }
 
 // User is one person on the user list.
@@ -63,11 +75,12 @@ type User struct {
 
 // Reply is the hub's answer. Which fields are set depends on the command.
 type Reply struct {
-	Messages []slack.Message `json:"messages,omitempty"`
-	Text     string          `json:"text,omitempty"`
-	Thread   string          `json:"thread,omitempty"`
-	Threads  []string        `json:"threads,omitempty"`
-	Users    []User          `json:"users,omitempty"`
+	Messages   []slack.Message `json:"messages,omitempty"`
+	Text       string          `json:"text,omitempty"`
+	Thread     string          `json:"thread,omitempty"`
+	Threads    []string        `json:"threads,omitempty"`
+	Users      []User          `json:"users,omitempty"`
+	ApprovalID string          `json:"approval_id,omitempty"`
 }
 
 // Server answers requests on the hub. Its Answer is meant for
@@ -84,6 +97,9 @@ type Server struct {
 	// serves, mapped to a name for the agents, which may be empty. Only
 	// people on it get direct messages.
 	Users map[string]string
+	// Approvals runs the approvals; nil means the hub cannot give any, and
+	// RequestApproval is refused.
+	Approvals *approval.Flow
 }
 
 // errNoSlack is returned for a request that needs Slack when Server.Slack
@@ -115,6 +131,8 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		reply.Users = s.users()
 	case DM:
 		err = s.dm(ctx, r)
+	case RequestApproval:
+		reply.ApprovalID, err = s.requestApproval(ctx, client, r)
 	default:
 		err = link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
 	}
@@ -246,4 +264,25 @@ func (s *Server) dm(ctx context.Context, r Request) error {
 		return errNoSlack
 	}
 	return s.Slack.DM(ctx, r.User, r.Text)
+}
+
+// requestApproval records the request and posts its card; the hub refuses
+// when it cannot run approvals, so that no agent waits for an approval
+// that cannot come.
+func (s *Server) requestApproval(ctx context.Context, client string, r Request) (string, error) {
+	switch {
+	case r.Agent == "" || r.Text == "" || len(r.Action) == 0:
+		return "", link.Refuse(link.ErrBadRequest, "needs an agent, a text and an action")
+	case len(r.Action) > approval.MaxAction:
+		return "", link.Refuse(link.ErrBadRequest, "action has %d bytes, at most %d", len(r.Action), approval.MaxAction)
+	case !json.Valid(r.Action):
+		return "", link.Refuse(link.ErrBadRequest, "action is not JSON")
+	case s.Approvals == nil:
+		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
+	}
+	id, err := s.Approvals.Request(ctx, client, r.Agent, r.Requester, r.Text, r.Action)
+	if errors.Is(err, approval.ErrOff) {
+		return "", link.Refuse(link.ErrDenied, "%v", err)
+	}
+	return id, err
 }

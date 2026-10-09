@@ -1,7 +1,10 @@
 package hubapi
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -11,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
@@ -341,5 +345,50 @@ func TestDM(t *testing.T) {
 	}
 	if got := f.DMs("U9"); len(got) != 0 {
 		t.Fatalf("DMs to the user not on the list = %q, want none", got)
+	}
+}
+
+// A request for approval is refused when the hub runs no approvals, or
+// when it is not well formed; otherwise it gets an approval id and a
+// card.
+func TestRequestApproval(t *testing.T) {
+	s, f := testServer(t)
+	f.AddChannel("C9", "approvals")
+	action := []byte(`{"op": "delete"}`)
+	good := Request{Cmd: RequestApproval, Agent: "ops-exec", Text: "delete b", Action: action}
+	if _, err := answer(t, s, "workstation", good); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "not set up") {
+		t.Fatalf("request-approval without approvals = %v, want denied as not set up", err)
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Approvals = &approval.Flow{Store: s.Store, Slack: f, Key: priv, Channel: "C9", Approvers: []string{"U1"}}
+	tests := []struct {
+		name string
+		req  Request
+		want error
+	}{
+		{"no agent", Request{Cmd: RequestApproval, Text: "x", Action: action}, link.ErrBadRequest},
+		{"no text", Request{Cmd: RequestApproval, Agent: "a", Action: action}, link.ErrBadRequest},
+		{"no action", Request{Cmd: RequestApproval, Agent: "a", Text: "x"}, link.ErrBadRequest},
+		{"action not JSON", Request{Cmd: RequestApproval, Agent: "a", Text: "x", Action: []byte("{")}, link.ErrBadRequest},
+		{"action too big", Request{Cmd: RequestApproval, Agent: "a", Text: "x", Action: append([]byte(`"`), append(bytes.Repeat([]byte("x"), approval.MaxAction), '"')...)}, link.ErrBadRequest},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, tt.want) {
+			t.Errorf("%s: request-approval = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if _, cards := f.Cards("C9"); len(cards) != 0 {
+		t.Fatalf("cards after refused requests = %+v, want none", cards)
+	}
+	reply, err := answer(t, s, "workstation", good)
+	if err != nil || reply.ApprovalID == "" {
+		t.Fatalf("request-approval = %+v, %v; want an approval id", reply, err)
+	}
+	_, cards := f.Cards("C9")
+	if len(cards) != 1 || cards[0].ID != reply.ApprovalID || cards[0].Params != string(action) || cards[0].Machine != "workstation" || cards[0].Agent != "ops-exec" {
+		t.Fatalf("cards = %+v, want one for %s from ops-exec on workstation with the action as given", cards, reply.ApprovalID)
 	}
 }

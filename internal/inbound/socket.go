@@ -1,6 +1,7 @@
 package inbound
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -18,8 +19,9 @@ import (
 const DefaultRetry = time.Minute
 
 // Run keeps a Socket Mode connection to Slack up until ctx is done, hands
-// every message event it brings to r.Handle and acks it once that has
-// returned without error; other events are acked at once. Each time the
+// every message event it brings to r.Handle, and every click on an
+// approval card to r.Click, and acks each once that has returned without
+// error; other events and interactions are acked at once. Each time the
 // connection comes up, r.Connected fixes where the backfill starts before
 // any event of the connection is handled, and the backfill runs in the
 // background, again after retry (DefaultRetry when zero) while it fails.
@@ -94,6 +96,17 @@ func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) err
 				if err := t.Ack(ctx, ev.Request.EnvelopeID); err != nil {
 					slog.Warn("inbound: ack", "err", err)
 				}
+			case socketmode.EventTypeInteractive:
+				if ev.Request == nil {
+					continue
+				}
+				if err := r.handleInteractive(ctx, ev.Data); err != nil {
+					slog.Warn("inbound: interaction not acked", "err", err)
+					continue
+				}
+				if err := t.Ack(ctx, ev.Request.EnvelopeID); err != nil {
+					slog.Warn("inbound: ack", "err", err)
+				}
 			}
 		}
 	}
@@ -123,6 +136,28 @@ func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 		}
 	}
 	return r.Handle(ctx, ev)
+}
+
+// handleInteractive hands each press on an approval card's button to
+// r.Click; any other interaction is not the hub's business.
+func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
+	cb, ok := data.(slackgo.InteractionCallback)
+	if !ok || cb.Type != slackgo.InteractionTypeBlockActions {
+		return nil
+	}
+	// The container names the message the buttons are on; older payloads
+	// name it at the top level instead.
+	channel, ts := cmp.Or(cb.Container.ChannelID, cb.Channel.ID), cmp.Or(cb.Container.MessageTs, cb.Message.Timestamp)
+	for _, a := range cb.ActionCallback.BlockActions {
+		if a.ActionID != slack.ApproveAction && a.ActionID != slack.RejectAction {
+			continue
+		}
+		c := slack.Click{ID: a.Value, Approve: a.ActionID == slack.ApproveAction, User: cb.User.ID, Bot: cb.User.IsBot, Channel: channel, TS: ts}
+		if err := r.Click(ctx, c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // backfill is the backfill goroutine run keeps: one at a time, the last

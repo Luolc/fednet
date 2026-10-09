@@ -4,12 +4,13 @@
 #   - a system user and group named fednet, which own nothing else;
 #   - the fednet binary at /usr/local/bin/fednet;
 #   - the hub config at /etc/fednet-hub/hub.json (see hub.example.json);
-#   - three credential files, one credential each, put in place by the
+#   - four credential files, one credential each, put in place by the
 #     deployment (paths below). systemd copies each into the service's own
 #     credentials directory (%d), readable by this service alone, and the
 #     hub reads them from there. Leave out both Slack lines, and their
 #     flags, to run the hub without Slack; leave out the webhook to run it
-#     without alerts.
+#     without alerts; leave out the approval key to run it without
+#     approvals (requests for approval are then refused).
 # The database lives in /var/lib/fednet-hub (StateDirectory).
 
 [Unit]
@@ -21,10 +22,11 @@ After=network-online.target
 Type=exec
 User=fednet
 Group=fednet
-# replace: where the deployment keeps the three credential files.
+# replace: where the deployment keeps the four credential files.
 LoadCredential=slack-app-token:/etc/fednet-hub/credentials/slack-app-token
 LoadCredential=slack-bot-token:/etc/fednet-hub/credentials/slack-bot-token
 LoadCredential=alert-webhook:/etc/fednet-hub/credentials/alert-webhook
+LoadCredential=approval-key:/etc/fednet-hub/credentials/approval-key
 StateDirectory=fednet-hub
 StateDirectoryMode=0700
 # replace: -listen with the address the clients reach the hub at, on the
@@ -37,7 +39,8 @@ ExecStart=/usr/local/bin/fednet hub \
     -config /etc/fednet-hub/hub.json \
     -slack-app-token-file %d/slack-app-token \
     -slack-bot-token-file %d/slack-bot-token \
-    -alert-webhook-file %d/alert-webhook
+    -alert-webhook-file %d/alert-webhook \
+    -approval-key-file %d/approval-key
 Restart=on-failure
 RestartSec=5s
 # Exit 2 is a usage error; restarting does not fix it.

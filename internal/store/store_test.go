@@ -807,3 +807,88 @@ func TestThreadsIn(t *testing.T) {
 		t.Fatalf("ThreadsIn(C2) = %v, %v; want nothing", got, err)
 	}
 }
+
+// An approval is recorded pending, decided once, and listed while pending
+// and while its card is not final.
+func TestApprovals(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	at := time.Date(2026, 10, 9, 12, 0, 0, 123456789, time.UTC)
+	a := Approval{ID: "apr-1", Client: "workstation", Agent: "ops-exec", Requester: "U2", Summary: "delete b", Action: []byte(`{"b":1}`),
+		Nonce: []byte{1, 2, 3}, RequestedAt: at, ExpiresAt: at.Add(time.Hour), Channel: "C9", TS: "1.1"}
+	if err := h.PutApproval(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.PutApproval(ctx, a); err == nil {
+		t.Fatal("PutApproval took the same id twice")
+	}
+	got, err := h.Approval(ctx, "apr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Status = Pending
+	if !reflect.DeepEqual(got, a) {
+		t.Fatalf("Approval = %+v, want %+v", got, a)
+	}
+	if _, err := h.Approval(ctx, "apr-9"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Approval(apr-9) = %v, want ErrNotFound", err)
+	}
+	if ps, err := h.PendingApprovals(ctx); err != nil || len(ps) != 1 || ps[0].ID != "apr-1" {
+		t.Fatalf("PendingApprovals = %+v, %v; want apr-1", ps, err)
+	}
+	if us, err := h.UnfinishedCards(ctx); err != nil || len(us) != 0 {
+		t.Fatalf("UnfinishedCards while pending = %+v, %v; want none", us, err)
+	}
+
+	// The first decision takes and runs its handler in the transaction; the
+	// second does not run its handler.
+	decidedAt := at.Add(10 * time.Minute)
+	ran := 0
+	decided, err := h.DecideApproval(ctx, "apr-1", "approved", "U1", decidedAt, func(tx *Hub) error {
+		ran++
+		_, err := tx.Outbox.Enqueue(ctx, "workstation", []byte("outcome"))
+		return err
+	})
+	if err != nil || !decided {
+		t.Fatalf("DecideApproval = %v, %v; want true", decided, err)
+	}
+	decided, err = h.DecideApproval(ctx, "apr-1", "rejected", "U2", decidedAt, func(tx *Hub) error { ran++; return nil })
+	if err != nil || decided {
+		t.Fatalf("second DecideApproval = %v, %v; want false", decided, err)
+	}
+	if ran != 1 {
+		t.Fatalf("handlers ran %d times, want 1", ran)
+	}
+	got, err = h.Approval(ctx, "apr-1")
+	if err != nil || got.Status != "approved" || got.DecidedBy != "U1" || !got.DecidedAt.Equal(decidedAt) || got.CardFinal {
+		t.Fatalf("Approval after deciding = %+v, %v; want approved by U1 at %s, card not final", got, err, decidedAt)
+	}
+	if ds, err := h.Outbox.After(ctx, "workstation", 0); err != nil || len(ds) != 1 {
+		t.Fatalf("outbox = %+v, %v; want the one outcome", ds, err)
+	}
+	// A handler that fails leaves the approval pending.
+	b := a
+	b.ID = "apr-2"
+	if err := h.PutApproval(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if decided, err := h.DecideApproval(ctx, "apr-2", "approved", "U1", decidedAt, func(*Hub) error { return errors.New("no") }); decided || err == nil {
+		t.Fatalf("DecideApproval with a failing handler = %v, %v; want false and the error", decided, err)
+	}
+	if got, err := h.Approval(ctx, "apr-2"); err != nil || got.Status != Pending {
+		t.Fatalf("Approval after a failed handler = %+v, %v; want still pending", got, err)
+	}
+
+	if ps, err := h.PendingApprovals(ctx); err != nil || len(ps) != 1 || ps[0].ID != "apr-2" {
+		t.Fatalf("PendingApprovals after deciding = %+v, %v; want apr-2", ps, err)
+	}
+	if us, err := h.UnfinishedCards(ctx); err != nil || len(us) != 1 || us[0].ID != "apr-1" {
+		t.Fatalf("UnfinishedCards after deciding = %+v, %v; want apr-1", us, err)
+	}
+	if err := h.MarkCardFinal(ctx, "apr-1"); err != nil {
+		t.Fatal(err)
+	}
+	if us, err := h.UnfinishedCards(ctx); err != nil || len(us) != 0 {
+		t.Fatalf("UnfinishedCards after marking final = %+v, %v; want none", us, err)
+	}
+}

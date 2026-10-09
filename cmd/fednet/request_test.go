@@ -236,6 +236,14 @@ func TestReadHubConfig(t *testing.T) {
 	if _, err := readHubConfig(two); err == nil {
 		t.Fatal("readHubConfig accepted a second JSON value after the config")
 	}
+	// An approver must be on the user list.
+	stranger := filepath.Join(dir, "stranger.json")
+	if err := os.WriteFile(stranger, []byte(`{"users": {"U1": "maintainer"}, "approvals": {"channel": "C9", "approvers": ["U1", "U9"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readHubConfig(stranger); err == nil || !strings.Contains(err.Error(), "approver U9 is not on the user list") {
+		t.Fatalf("readHubConfig(stranger) = %v, want an error naming the approver U9", err)
+	}
 }
 
 func TestHubConfigAlerts(t *testing.T) {
@@ -267,7 +275,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 {
+	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 {
 		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }

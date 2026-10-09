@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -48,6 +49,9 @@ func TestRun(t *testing.T) {
 		{"register with a bad hash", []string{"hub", "register", "-db", "x", "ws", "nothex"}, 2, "", "HASH must be"},
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
 		{"approval without verify", []string{"approval"}, 2, "", "want verify"},
+		{"request-approval without flags", []string{"client", "request-approval", "-socket", "x", "do it"}, 2, "", "-socket, -agent, -action and a non-empty TEXT are required"},
+		{"request-approval with a missing action file", []string{"client", "request-approval", "-socket", "x", "-agent", "a", "-action", "/nonexistent/action.json", "do it"}, 1, "", "no such file"},
+		{"hub with a missing approval key", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-approval-key-file", "/nonexistent/key"}, 1, "", "no such file"},
 		{"approval verify without flags", []string{"approval", "verify", "-pubkey", "x"}, 2, "", "-pubkey, -approval, -action, -machine, -agent and -used are required"},
 		{"no command", nil, 2, "", "usage: fednet"},
 		{"unknown command", []string{"serve"}, 2, "", "usage: fednet"},
@@ -286,7 +290,7 @@ func TestHubAndClient(t *testing.T) {
 	}
 	for _, m := range ms {
 		var got payload.Message
-		if err := json.Unmarshal(m.Payload, &got); err != nil || got != want[m.MsgID] {
+		if err := json.Unmarshal(m.Payload, &got); err != nil || !reflect.DeepEqual(got, want[m.MsgID]) {
 			t.Errorf("hub inbox has %s: %+v, %v; want %+v", m.MsgID, got, err, want[m.MsgID])
 		}
 	}

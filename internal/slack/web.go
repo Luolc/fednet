@@ -215,6 +215,81 @@ func (w *Web) SetPurpose(ctx context.Context, channel, purpose string) error {
 	})
 }
 
+// PostCard posts the card's blocks; the summary is the message's plain
+// text, for notifications.
+func (w *Web) PostCard(ctx context.Context, channel string, c Card) (string, error) {
+	var ts string
+	err := w.call(ctx, "chat.postMessage", func() (err error) {
+		_, ts, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionText(c.Summary, false), slackgo.MsgOptionBlocks(blocks(c)...))
+		return err
+	})
+	return ts, err
+}
+
+func (w *Web) UpdateCard(ctx context.Context, channel, ts string, c Card) error {
+	return w.call(ctx, "chat.update", func() error {
+		_, _, _, err := w.c.UpdateMessageContext(ctx, channel, ts, slackgo.MsgOptionText(c.Summary, false), slackgo.MsgOptionBlocks(blocks(c)...))
+		return err
+	})
+}
+
+func (w *Web) Whisper(ctx context.Context, channel, user, text string) error {
+	return w.call(ctx, "chat.postEphemeral", func() error {
+		_, err := w.c.PostEphemeralContext(ctx, channel, user, slackgo.MsgOptionText(text, false))
+		return err
+	})
+}
+
+// maxParams is how much of the action's parameters a card shows; Slack
+// takes at most 3000 characters in one text object.
+const maxParams = 2500
+
+// blocks lays the card out: a header, the summary, the parameters in a
+// code block, who asks and when it expires, then the buttons while it
+// waits or how it ended once decided. Times are Slack date tokens, which
+// each reader sees in their own time zone.
+func blocks(c Card) []slackgo.Block {
+	params := c.Params
+	if len(params) > maxParams {
+		params = params[:maxParams] + "\n…(truncated)"
+	}
+	bs := []slackgo.Block{
+		slackgo.NewHeaderBlock(slackgo.NewTextBlockObject(slackgo.PlainTextType, "审批请求", false, false)),
+		slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, "*做什么*\n"+c.Summary, false, false), nil, nil),
+		slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, "*参数*\n```"+params+"```", false, false), nil, nil),
+		slackgo.NewSectionBlock(nil, []*slackgo.TextBlockObject{
+			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*机器*\n"+c.Machine, false, false),
+			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*agent*\n"+c.Agent, false, false),
+			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*过期*\n"+date(c.Expires), false, false),
+			slackgo.NewTextBlockObject(slackgo.MarkdownType, "*编号*\n"+c.ID, false, false),
+		}, nil),
+	}
+	if c.Outcome == "" {
+		return append(bs, slackgo.NewActionBlock("approval:"+c.ID,
+			slackgo.NewButtonBlockElement(ApproveAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "批准", false, false)).WithStyle(slackgo.StylePrimary),
+			slackgo.NewButtonBlockElement(RejectAction, c.ID, slackgo.NewTextBlockObject(slackgo.PlainTextType, "拒绝", false, false)).WithStyle(slackgo.StyleDanger),
+		))
+	}
+	return append(bs, slackgo.NewSectionBlock(slackgo.NewTextBlockObject(slackgo.MarkdownType, outcomeText(c), false, false), nil, nil))
+}
+
+// outcomeText says how a decided card ended, in one line.
+func outcomeText(c Card) string {
+	switch c.Outcome {
+	case "approved":
+		return "✅ *已批准* <@" + c.Approver + "> " + date(c.DecidedAt)
+	case "rejected":
+		return "⛔ *已拒绝* <@" + c.Approver + "> " + date(c.DecidedAt)
+	default:
+		return "⌛ *已过期* " + date(c.DecidedAt)
+	}
+}
+
+// date writes t as a Slack date token, with an RFC 3339 fallback.
+func date(t time.Time) string {
+	return fmt.Sprintf("<!date^%d^{date_short_pretty} {time}|%s>", t.Unix(), t.UTC().Format(time.RFC3339))
+}
+
 // DM opens the direct message conversation with user, or finds the one
 // already open, and posts text in it.
 func (w *Web) DM(ctx context.Context, user, text string) error {

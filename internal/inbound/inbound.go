@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
@@ -80,6 +81,9 @@ type Receiver struct {
 	// it may have queued one for a client, or put a post from the hub in
 	// the hub's inbox. It must not block.
 	Stored func()
+	// Approvals takes the clicks on approval cards; nil means they are
+	// acked and dropped.
+	Approvals *approval.Flow
 
 	// mu guards the fields below, and serializes Connected's fixing of
 	// the backfill's start with a backfill's clearing of it.
@@ -152,6 +156,16 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		r.Stored()
 	}
 	return nil
+}
+
+// Click hands a press on an approval card's button to the approvals; an
+// error means it was not applied and must not be acked.
+func (r *Receiver) Click(ctx context.Context, c slack.Click) error {
+	if r.Approvals == nil {
+		slog.Warn("inbound: click on an approval card, but the hub runs no approvals", "approval", c.ID, "user", c.User)
+		return nil
+	}
+	return r.Approvals.Click(ctx, c)
 }
 
 // wanted reports whether ev is a message a person on the user list said.

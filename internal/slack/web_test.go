@@ -1,6 +1,7 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -333,5 +334,105 @@ func TestWebPostReplyAndDelete(t *testing.T) {
 	}
 	if rs[1].method != "chat.delete" || rs[1].form.Get("channel") != "C1" || rs[1].form.Get("ts") != "1.5" {
 		t.Fatalf("Delete sent %s %v", rs[1].method, rs[1].form)
+	}
+}
+
+// blocksJSON writes bs as JSON without escaping < and >, which Slack's
+// date and user tokens are made of.
+func blocksJSON(t *testing.T, bs []slackgo.Block) string {
+	t.Helper()
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(bs); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+// A pending card has the two buttons, each carrying the approval id; a
+// decided card has none and says how it ended; long parameters are cut.
+func TestCardBlocks(t *testing.T) {
+	c := Card{ID: "apr-1", Summary: "delete b", Params: `{"b":1}`, Machine: "workstation", Agent: "ops-exec", Expires: time.Unix(1_760_000_000, 0)}
+	bs := blocks(c)
+	actions, ok := bs[len(bs)-1].(*slackgo.ActionBlock)
+	if !ok || len(actions.Elements.ElementSet) != 2 {
+		t.Fatalf("pending card ends with %T, want an action block with two buttons", bs[len(bs)-1])
+	}
+	for i, want := range []string{ApproveAction, RejectAction} {
+		b, ok := actions.Elements.ElementSet[i].(*slackgo.ButtonBlockElement)
+		if !ok || b.ActionID != want || b.Value != "apr-1" {
+			t.Fatalf("button %d = %+v, want %s carrying apr-1", i, actions.Elements.ElementSet[i], want)
+		}
+	}
+	text := blocksJSON(t, bs)
+	for _, want := range []string{"delete b", `{\"b\":1}`, "workstation", "ops-exec", "<!date^1760000000^"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("pending card %s lacks %q", text, want)
+		}
+	}
+
+	c.Outcome, c.Approver, c.DecidedAt = "approved", "U1", time.Unix(1_760_000_100, 0)
+	bs = blocks(c)
+	if _, ok := bs[len(bs)-1].(*slackgo.ActionBlock); ok {
+		t.Fatal("decided card still has buttons")
+	}
+	text = blocksJSON(t, bs)
+	if !strings.Contains(text, "已批准") || !strings.Contains(text, "<@U1>") || !strings.Contains(text, "<!date^1760000100^") {
+		t.Errorf("approved card %s does not say approved by U1 at the time", text)
+	}
+	c.Outcome, c.Approver = "rejected", "U2"
+	if text = blocksJSON(t, blocks(c)); !strings.Contains(text, "已拒绝") || !strings.Contains(text, "<@U2>") {
+		t.Errorf("rejected card %s does not say rejected by U2", text)
+	}
+	c.Outcome, c.Approver = "expired", ""
+	if text = blocksJSON(t, blocks(c)); !strings.Contains(text, "已过期") {
+		t.Errorf("expired card %s does not say expired", text)
+	}
+
+	c.Params = strings.Repeat("x", maxParams+1)
+	text = blocksJSON(t, blocks(c))
+	if strings.Contains(text, c.Params) || !strings.Contains(text, "truncated") {
+		t.Error("long parameters are not cut")
+	}
+}
+
+// PostCard, UpdateCard and Whisper call chat.postMessage, chat.update and
+// chat.postEphemeral with the card's blocks and the summary as the text.
+func TestWebCards(t *testing.T) {
+	ctx := context.Background()
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "chat.postMessage", "chat.update":
+			return 200, `{"ok":true,"channel":"C9","ts":"1.5"}`
+		case "chat.postEphemeral":
+			return 200, `{"ok":true,"message_ts":"1.6"}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	c := Card{ID: "apr-1", Summary: "delete b", Params: `{"b":1}`, Machine: "workstation", Agent: "ops-exec", Expires: time.Unix(1_760_000_000, 0)}
+	if got, err := w.PostCard(ctx, "C9", c); err != nil || got != "1.5" {
+		t.Fatalf("PostCard = %q, %v; want 1.5", got, err)
+	}
+	c.Outcome, c.Approver, c.DecidedAt = "approved", "U1", time.Unix(1_760_000_100, 0)
+	if err := w.UpdateCard(ctx, "C9", "1.5", c); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Whisper(ctx, "C9", "U2", "你不在审批人名单上"); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := ts.got()
+	if len(rs) != 3 {
+		t.Fatalf("%d requests, want 3", len(rs))
+	}
+	post, update, whisper := rs[0], rs[1], rs[2]
+	if post.method != "chat.postMessage" || post.form.Get("channel") != "C9" || post.form.Get("text") != "delete b" || !strings.Contains(post.form.Get("blocks"), `"action_id":"approve"`) {
+		t.Errorf("PostCard sent %s %v, want a message in C9 with the buttons", post.method, post.form)
+	}
+	if update.method != "chat.update" || update.form.Get("channel") != "C9" || update.form.Get("ts") != "1.5" || strings.Contains(update.form.Get("blocks"), `"action_id"`) || !strings.Contains(update.form.Get("blocks"), "已批准") {
+		t.Errorf("UpdateCard sent %s %v, want an update of 1.5 in C9 without buttons", update.method, update.form)
+	}
+	if whisper.method != "chat.postEphemeral" || whisper.form.Get("channel") != "C9" || whisper.form.Get("user") != "U2" || whisper.form.Get("text") != "你不在审批人名单上" {
+		t.Errorf("Whisper sent %s %v, want an ephemeral message to U2 in C9", whisper.method, whisper.form)
 	}
 }
