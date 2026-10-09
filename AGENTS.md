@@ -43,12 +43,13 @@ push 之前先在本地审一遍，确认没有泄漏再开 PR：
 
 - 本地检查：`uvx pre-commit run --all-files`，裸跑，看退出码。新文件先 `git add`。
 - clone 之后执行一次 `uvx pre-commit install`，装上 git 钩子。
+- 钩子不跑 Go 的检查，本地要另外跑下面三条，CI 的 `check` 跑的也是这三条：`gofmt -l .` 输出必须为空 (它列出文件时退出码仍是 0，要看输出)，`go vet ./...` 和 `go test -race ./...` 看退出码。
 - 钩子按顺序是：`gitleaks` (扫暂存区的 diff，排在最前，保证泄漏在其他钩子改文件之前就被发现)，然后是 `limae` (检查中文 Markdown 的排版)。`rev` 固定在 tag 上，升级要单独开 PR。
 - `--no-verify` 会跳过所有钩子，包括 gitleaks。确实要用时，暂存之后手动跑 `gitleaks git --staged --redact --no-banner --verbose .`，`--redact` 必须带。
 
 ## CI 与合并
 
-- `.github/workflows/ci.yml` 只有一个 job `check`，是 `main` 上的 required status check。它先对完整历史跑一遍 gitleaks (钩子只看得到暂存区的 diff，两者覆盖的输入不同)，再跑 `pre-commit run --all-files`，并跳过 gitleaks 钩子 (`SKIP: gitleaks`)，因为完整历史的扫描已经覆盖了它。`check` 里还会检查 `docs/design.md` 的长度。
+- `.github/workflows/ci.yml` 只有一个 job `check`，是 `main` 上的 required status check。它先对完整历史跑一遍 gitleaks (钩子只看得到暂存区的 diff，两者覆盖的输入不同)，再跑 `pre-commit run --all-files`，并跳过 gitleaks 钩子 (`SKIP: gitleaks`)，因为完整历史的扫描已经覆盖了它。`check` 里还会检查 `docs/design.md` 的长度，最后跑 Go 的 gofmt、vet 和带 `-race` 的测试。
 - PR 不挂 auto-merge。LGTM 之后由维护者执行 `gh pr merge <N> --squash --delete-branch --match-head-commit <approved-sha> --auto` 合并：`--auto` 只是等 `check` 变绿，`--match-head-commit` 把合并固定在已审的 head 上，远端 head 变了就不合。
 
 ## 审查

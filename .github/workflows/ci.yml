@@ -1,6 +1,6 @@
-# PR gate: full-history secret scan, pre-commit on all files, then the
-# docs/design.md length check and its test. The job name `check` is the
-# required status check.
+# PR gate: full-history secret scan, pre-commit on all files, the
+# docs/design.md length check and its test, then the Go checks (gofmt, vet,
+# race-enabled tests). The job name `check` is the required status check.
 
 name: CI
 
@@ -82,3 +82,22 @@ jobs:
 
       - name: Design length (docs/design.md, at most 200 lines)
         run: .github/scripts/design-length.sh
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          # No dependencies yet, so there is no go.sum to key a cache on.
+          cache: false
+
+      # gofmt -l exits 0 even when it lists files, so fail on any output.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - run: go test -race ./...
