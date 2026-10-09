@@ -244,6 +244,28 @@ func TestReadHubConfig(t *testing.T) {
 	if _, err := readHubConfig(stranger); err == nil || !strings.Contains(err.Error(), "approver U9 is not on the user list") {
 		t.Fatalf("readHubConfig(stranger) = %v, want an error naming the approver U9", err)
 	}
+	// So must an upgrade admin; and the hub upgrades on its own unless
+	// told not to.
+	admin := filepath.Join(dir, "admin.json")
+	if err := os.WriteFile(admin, []byte(`{"users": {"U1": "maintainer"}, "upgrade": {"admins": ["U9"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readHubConfig(admin); err == nil || !strings.Contains(err.Error(), "upgrade admin U9 is not on the user list") {
+		t.Fatalf("readHubConfig(admin) = %v, want an error naming the admin U9", err)
+	}
+	if err := os.WriteFile(admin, []byte(`{"users": {"U1": "maintainer"}, "upgrade": {"admins": ["U1"], "auto": false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = readHubConfig(admin)
+	if err != nil || cfg.auto() || len(cfg.Upgrade.Admins) != 1 {
+		t.Fatalf("readHubConfig(admin) = %+v, %v; want auto off and one admin", cfg.Upgrade, err)
+	}
+	if err := os.WriteFile(admin, []byte(`{"users": {"U1": "maintainer"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := readHubConfig(admin); err != nil || !cfg.auto() {
+		t.Fatalf("readHubConfig without an upgrade section = %+v, %v; want auto on", cfg.Upgrade, err)
+	}
 }
 
 func TestHubConfigAlerts(t *testing.T) {

@@ -33,6 +33,9 @@ const (
 	ClientHeader = "Fednet-Client"
 	// VersionHeader carries the client's version.
 	VersionHeader = "Fednet-Version"
+	// UpgradeHeader, on the hub's response to a downlink handshake, names
+	// the release the client should upgrade to.
+	UpgradeHeader = "Fednet-Upgrade"
 )
 
 // MaxPayload is the largest payload either link carries. Send and Post

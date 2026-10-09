@@ -19,6 +19,9 @@ const (
 	// Approval is the outcome of an approval an agent requested, sent down
 	// to the client that requested it.
 	Approval = "approval"
+	// Upgrade tells a client to upgrade itself to Version, a release. The
+	// client acts on it itself; it never reaches the hook.
+	Upgrade = "upgrade"
 )
 
 // Outcomes of an approval, for Message.Outcome.
@@ -60,4 +63,6 @@ type Message struct {
 	// Approval is, on an approved outcome, the signed approval document
 	// as `fednet approval verify` reads it, to be written to a file as is.
 	Approval json.RawMessage `json:"approval,omitempty"`
+	// Version is, on an Upgrade, the release to upgrade to.
+	Version string `json:"version,omitempty"`
 }

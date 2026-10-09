@@ -1,0 +1,20 @@
+# systemd path unit that watches for a client's upgrade request, the
+# client's counterpart of fednet-hub-upgrade.path. The client (running as
+# its own user) writes the request when the hub tells it to upgrade, at the
+# path its -upgrade-request names; this unit, as root, then starts the
+# service. Copy it and fednet-client-upgrade.service to
+# /etc/systemd/system/, replace the lines marked "replace" in both with the
+# machine's paths, and enable this one.
+
+[Unit]
+Description=watch for an upgrade request from the fednet client
+
+[Path]
+# replace: the file the client's -upgrade-request names.
+PathExists=/run/fednet-client/upgrade
+Unit=fednet-client-upgrade.service
+TriggerLimitIntervalSec=10min
+TriggerLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

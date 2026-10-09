@@ -44,6 +44,12 @@ type Hub struct {
 	// Uplinked, if set, is called after an uplink message is stored in the
 	// inbox, before the client is told. It must not block.
 	Uplinked func()
+	// UpgradeTo, if set, is asked at each downlink handshake, accepted or
+	// refused, with the version in VersionHeader, and answers the release
+	// the client should upgrade to, or "": that goes to the client in
+	// UpgradeHeader on the handshake's response, so a client the hub no
+	// longer serves is told too.
+	UpgradeTo func(version string) string
 
 	mu       sync.Mutex
 	seen     map[string]time.Time
@@ -192,6 +198,11 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 	client, ok := h.authorize(w, r)
 	if !ok {
 		return
+	}
+	if h.UpgradeTo != nil {
+		if to := h.UpgradeTo(r.Header.Get(VersionHeader)); to != "" {
+			w.Header().Set(UpgradeHeader, to)
+		}
 	}
 	if h.AcceptVersion != nil {
 		if err := h.AcceptVersion(r.Header.Get(VersionHeader)); err != nil {

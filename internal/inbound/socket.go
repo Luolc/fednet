@@ -19,9 +19,11 @@ import (
 const DefaultRetry = time.Minute
 
 // Run keeps a Socket Mode connection to Slack up until ctx is done, hands
-// every message event it brings to r.Handle, and every click on an
-// approval card to r.Click, and acks each once that has returned without
-// error; other events and interactions are acked at once. Each time the
+// every message event it brings to r.Handle, every click on an approval
+// card to r.Click, every click on an upgrade card and every slash command
+// to r.Commands, and acks each once that has returned without error, a
+// slash command with its reply; other events and interactions are acked
+// at once. Each time the
 // connection comes up, r.Connected fixes where the backfill starts before
 // any event of the connection is handled, and the backfill runs in the
 // background, again after retry (DefaultRetry when zero) while it fails.
@@ -39,16 +41,17 @@ type transport interface {
 	// happens to the Events channel.
 	RunContext(ctx context.Context) error
 	Events() <-chan socketmode.Event
-	// Ack acks the request with envelopeID.
-	Ack(ctx context.Context, envelopeID string) error
+	// Ack acks the request with envelopeID, with payload as the response
+	// when that is not nil.
+	Ack(ctx context.Context, envelopeID string, payload any) error
 }
 
 type socketClient struct{ *socketmode.Client }
 
 func (c socketClient) Events() <-chan socketmode.Event { return c.Client.Events }
 
-func (c socketClient) Ack(ctx context.Context, envelopeID string) error {
-	return c.AckCtx(ctx, envelopeID, nil)
+func (c socketClient) Ack(ctx context.Context, envelopeID string, payload any) error {
+	return c.AckCtx(ctx, envelopeID, payload)
 }
 
 func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) error {
@@ -93,7 +96,7 @@ func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) err
 					slog.Warn("inbound: event not acked", "err", err)
 					continue
 				}
-				if err := t.Ack(ctx, ev.Request.EnvelopeID); err != nil {
+				if err := t.Ack(ctx, ev.Request.EnvelopeID, nil); err != nil {
 					slog.Warn("inbound: ack", "err", err)
 				}
 			case socketmode.EventTypeInteractive:
@@ -104,7 +107,19 @@ func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) err
 					slog.Warn("inbound: interaction not acked", "err", err)
 					continue
 				}
-				if err := t.Ack(ctx, ev.Request.EnvelopeID); err != nil {
+				if err := t.Ack(ctx, ev.Request.EnvelopeID, nil); err != nil {
+					slog.Warn("inbound: ack", "err", err)
+				}
+			case socketmode.EventTypeSlashCommand:
+				if ev.Request == nil {
+					continue
+				}
+				reply, err := r.handleCommand(ctx, ev.Data)
+				if err != nil {
+					slog.Warn("inbound: command not acked", "err", err)
+					continue
+				}
+				if err := t.Ack(ctx, ev.Request.EnvelopeID, slack.CommandAck(reply)); err != nil {
 					slog.Warn("inbound: ack", "err", err)
 				}
 			}
@@ -140,7 +155,8 @@ func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 
 // handleInteractive hands each press on an approval card's button, told
 // by its action id and the block id the card gives its buttons, to
-// r.Click; any other interaction is not the hub's business.
+// r.Click, and each press on an upgrade card's button to r.Commands; any
+// other interaction is not the hub's business.
 func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
 	cb, ok := data.(slackgo.InteractionCallback)
 	if !ok || cb.Type != slackgo.InteractionTypeBlockActions {
@@ -150,14 +166,51 @@ func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
 	// name it at the top level instead.
 	channel, ts := cmp.Or(cb.Container.ChannelID, cb.Channel.ID), cmp.Or(cb.Container.MessageTs, cb.Message.Timestamp)
 	for _, a := range cb.ActionCallback.BlockActions {
-		if (a.ActionID != slack.ApproveAction && a.ActionID != slack.RejectAction) || a.BlockID != slack.CardBlockID(a.Value) {
-			continue
+		c := slack.Click{ID: a.Value, User: cb.User.ID, Bot: cb.User.IsBot, Channel: channel, TS: ts, ResponseURL: cb.ResponseURL}
+		var err error
+		switch {
+		case (a.ActionID == slack.ApproveAction || a.ActionID == slack.RejectAction) && a.BlockID == slack.CardBlockID(a.Value):
+			c.Approve = a.ActionID == slack.ApproveAction
+			err = r.Click(ctx, c)
+		case (a.ActionID == slack.UpgradeConfirmAction || a.ActionID == slack.UpgradeCancelAction) && a.BlockID == slack.UpgradeBlockID(a.Value):
+			c.Approve = a.ActionID == slack.UpgradeConfirmAction
+			err = r.commander().Click(ctx, c)
 		}
-		c := slack.Click{ID: a.Value, Approve: a.ActionID == slack.ApproveAction, User: cb.User.ID, Bot: cb.User.IsBot, Channel: channel, TS: ts}
-		if err := r.Click(ctx, c); err != nil {
+		if err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// handleCommand answers a slash command through r.Commands; anything
+// else is acked with no reply.
+func (r *Receiver) handleCommand(ctx context.Context, data any) (slack.CommandReply, error) {
+	cmd, ok := data.(slackgo.SlashCommand)
+	if !ok {
+		return slack.CommandReply{}, nil
+	}
+	return r.commander().Command(ctx, slack.Command{Name: cmd.Command, Text: cmd.Text, User: cmd.UserID, Channel: cmd.ChannelID, ResponseURL: cmd.ResponseURL})
+}
+
+// commander returns r.Commands, or, when there is none, one that says so.
+func (r *Receiver) commander() Commander {
+	if r.Commands == nil {
+		return noCommands{}
+	}
+	return r.Commands
+}
+
+// noCommands is the Commander of a hub that serves no commands: it says
+// so to whoever sends one, and drops the clicks.
+type noCommands struct{}
+
+func (noCommands) Command(context.Context, slack.Command) (slack.CommandReply, error) {
+	return slack.CommandReply{Text: "这个 hub 不处理命令"}, nil
+}
+
+func (noCommands) Click(_ context.Context, c slack.Click) error {
+	slog.Warn("inbound: click on an upgrade card, but the hub serves no commands", "id", c.ID, "user", c.User)
 	return nil
 }
 

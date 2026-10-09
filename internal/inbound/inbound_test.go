@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -703,10 +704,13 @@ type fakeTransport struct {
 	events chan socketmode.Event
 	acks   chan string
 	ran    chan struct{}
+	// payloads maps each acked envelope to the payload of its ack.
+	mu       sync.Mutex
+	payloads map[string]any
 }
 
 func newFakeTransport() *fakeTransport {
-	return &fakeTransport{events: make(chan socketmode.Event), acks: make(chan string, 10), ran: make(chan struct{})}
+	return &fakeTransport{events: make(chan socketmode.Event), acks: make(chan string, 10), ran: make(chan struct{}), payloads: make(map[string]any)}
 }
 
 func (f *fakeTransport) RunContext(ctx context.Context) error {
@@ -717,9 +721,19 @@ func (f *fakeTransport) RunContext(ctx context.Context) error {
 
 func (f *fakeTransport) Events() <-chan socketmode.Event { return f.events }
 
-func (f *fakeTransport) Ack(_ context.Context, envelopeID string) error {
+func (f *fakeTransport) Ack(_ context.Context, envelopeID string, payload any) error {
+	f.mu.Lock()
+	f.payloads[envelopeID] = payload
+	f.mu.Unlock()
 	f.acks <- envelopeID
 	return nil
+}
+
+// payload returns what the ack of envelopeID carried.
+func (f *fakeTransport) payload(envelopeID string) any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.payloads[envelopeID]
 }
 
 // send delivers ev to run and waits until run has taken it.
@@ -956,6 +970,129 @@ func TestRunAcksClicks(t *testing.T) {
 	tr.send(t, clickEvent(t, "env5", slack.ApproveAction, id, cardTS, "U1", false))
 	if ack := tr.ack(2 * time.Second); ack != "env5" {
 		t.Fatalf("ack without approvals = %q, want env5", ack)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run returned %v, want context.Canceled", err)
+	}
+}
+
+// fakeCommander records the commands and clicks it is handed and answers
+// each command with the text it got.
+type fakeCommander struct {
+	mu       sync.Mutex
+	commands []slack.Command
+	clicks   []slack.Click
+	// fail makes Command and Click fail.
+	fail bool
+}
+
+func (f *fakeCommander) Command(_ context.Context, c slack.Command) (slack.CommandReply, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return slack.CommandReply{}, errors.New("store is gone")
+	}
+	f.commands = append(f.commands, c)
+	return slack.CommandReply{Text: "got " + c.Text}, nil
+}
+
+func (f *fakeCommander) Click(_ context.Context, c slack.Click) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("store is gone")
+	}
+	f.clicks = append(f.clicks, c)
+	return nil
+}
+
+// commandEvent is a Socket Mode event carrying a slash command, in the
+// envelope with id.
+func commandEvent(envelope, text string) socketmode.Event {
+	cmd := slackgo.SlashCommand{Command: "/fednet", Text: text, UserID: "U1", ChannelID: "D1", ResponseURL: "https://example.invalid/respond"}
+	return socketmode.Event{Type: socketmode.EventTypeSlashCommand, Data: cmd, Request: &socketmode.Request{Type: socketmode.RequestTypeSlashCommands, EnvelopeID: envelope}}
+}
+
+// upgradeClickEvent is a Socket Mode event carrying a press on an upgrade
+// card's button, with blockID as the button's block.
+func upgradeClickEvent(t *testing.T, envelope, actionID, id, blockID string) socketmode.Event {
+	t.Helper()
+	var cb slackgo.InteractionCallback
+	body := `{"type":"block_actions","user":{"id":"U1"},"container":{"type":"message","is_ephemeral":true,"channel_id":"D1"},"response_url":"https://example.invalid/click",` +
+		`"actions":[{"action_id":"` + actionID + `","block_id":"` + blockID + `","type":"button","value":"` + id + `","action_ts":"1.6"}]}`
+	if err := json.Unmarshal([]byte(body), &cb); err != nil {
+		t.Fatal(err)
+	}
+	return socketmode.Event{Type: socketmode.EventTypeInteractive, Data: cb, Request: &socketmode.Request{Type: socketmode.RequestTypeInteractive, EnvelopeID: envelope}}
+}
+
+// Through the transport: a slash command goes to the Commander and is
+// acked with its reply, as an ephemeral message; a press on an upgrade
+// card's button goes to the Commander with the response URL and is
+// acked; one from another block is acked and dropped; a command or click
+// the Commander fails is not acked; without a Commander a command is
+// answered that the hub serves none.
+func TestRunAcksCommands(t *testing.T) {
+	r, _ := newReceiver(t)
+	fc := &fakeCommander{}
+	r.Commands = fc
+	tr := newFakeTransport()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
+
+	tr.send(t, commandEvent("env1", "version"))
+	if ack := tr.ack(2 * time.Second); ack != "env1" {
+		t.Fatalf("ack = %q, want env1", ack)
+	}
+	p, ok := tr.payload("env1").(map[string]any)
+	if !ok || p["response_type"] != "ephemeral" || p["text"] != "got version" {
+		t.Fatalf("the command was acked with %#v, want the reply as an ephemeral message", tr.payload("env1"))
+	}
+	fc.mu.Lock()
+	if len(fc.commands) != 1 || fc.commands[0].Name != "/fednet" || fc.commands[0].User != "U1" || fc.commands[0].ResponseURL == "" {
+		t.Fatalf("the Commander got %+v", fc.commands)
+	}
+	fc.mu.Unlock()
+
+	tr.send(t, upgradeClickEvent(t, "env2", slack.UpgradeConfirmAction, "x1", slack.UpgradeBlockID("x1")))
+	if ack := tr.ack(2 * time.Second); ack != "env2" {
+		t.Fatalf("ack = %q, want env2", ack)
+	}
+	tr.send(t, upgradeClickEvent(t, "env3", slack.UpgradeCancelAction, "x1", "elsewhere"))
+	if ack := tr.ack(2 * time.Second); ack != "env3" {
+		t.Fatalf("ack = %q, want env3", ack)
+	}
+	fc.mu.Lock()
+	if len(fc.clicks) != 1 || fc.clicks[0].ID != "x1" || !fc.clicks[0].Approve || fc.clicks[0].User != "U1" || fc.clicks[0].ResponseURL != "https://example.invalid/click" {
+		t.Fatalf("the Commander got clicks %+v, want the confirm from the card's block alone", fc.clicks)
+	}
+	fc.fail = true
+	fc.mu.Unlock()
+	tr.send(t, commandEvent("env4", "version"))
+	if ack := tr.ack(200 * time.Millisecond); ack != "" {
+		t.Fatalf("acked %q although the command failed", ack)
+	}
+	tr.send(t, upgradeClickEvent(t, "env5", slack.UpgradeConfirmAction, "x1", slack.UpgradeBlockID("x1")))
+	if ack := tr.ack(200 * time.Millisecond); ack != "" {
+		t.Fatalf("acked %q although the click failed", ack)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run returned %v, want context.Canceled", err)
+	}
+
+	r, _ = newReceiver(t)
+	tr = newFakeTransport()
+	ctx, cancel = context.WithCancel(t.Context())
+	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
+	tr.send(t, commandEvent("env6", "version"))
+	if ack := tr.ack(2 * time.Second); ack != "env6" {
+		t.Fatalf("ack without a Commander = %q, want env6", ack)
+	}
+	if p, _ := tr.payload("env6").(map[string]any); p["text"] != "这个 hub 不处理命令" {
+		t.Fatalf("without a Commander the command was acked with %#v", tr.payload("env6"))
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {

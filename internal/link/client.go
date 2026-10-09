@@ -44,6 +44,15 @@ type Client struct {
 	// Received, if set, is called after a downlink message is stored in
 	// the inbox, before it is acked. It must not block.
 	Received func()
+	// Divert, if set, is offered each downlink message's payload before
+	// the message goes in the inbox. A message it takes (true) is acked
+	// without being stored, so it never reaches the hook; what it does
+	// with the message it does before returning, so a message it took is
+	// acted on before it is acked.
+	Divert func(ctx context.Context, payload []byte) (taken bool)
+	// Upgrade, if set, is called with the release named in UpgradeHeader
+	// on the hub's response to a dial, accepted or refused.
+	Upgrade func(ctx context.Context, version string)
 
 	// nudge has a buffer of one, so a Post is noticed even while the uplink
 	// loop is busy.
@@ -159,6 +168,11 @@ func (c *Client) downlink(ctx context.Context) error {
 	dctx, cancelDial := context.WithTimeout(ctx, c.timeout())
 	conn, res, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: c.httpClient(), HTTPHeader: c.header()})
 	cancelDial()
+	if res != nil && c.Upgrade != nil {
+		if to := res.Header.Get(UpgradeHeader); to != "" {
+			c.Upgrade(ctx, to)
+		}
+	}
 	if err != nil {
 		if res != nil && res.StatusCode == http.StatusUpgradeRequired {
 			// Dial keeps the first part of the body: the hub's reason.
@@ -200,11 +214,13 @@ func (c *Client) receive(ctx context.Context, conn *websocket.Conn) error {
 		if err := wsjson.Read(ctx, conn, &d); err != nil {
 			return err
 		}
-		if _, err := c.Store.Inbox.Put(ctx, store.Message{MsgID: d.MsgID, Payload: d.Payload}); err != nil {
-			return err
-		}
-		if c.Received != nil {
-			c.Received()
+		if c.Divert == nil || !c.Divert(ctx, d.Payload) {
+			if _, err := c.Store.Inbox.Put(ctx, store.Message{MsgID: d.MsgID, Payload: d.Payload}); err != nil {
+				return err
+			}
+			if c.Received != nil {
+				c.Received()
+			}
 		}
 		if err := wsjson.Write(ctx, conn, ack{Seq: d.Seq}); err != nil {
 			return err

@@ -28,6 +28,7 @@ import (
 	"github.com/Luolc/fednet/internal/local"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	"github.com/Luolc/fednet/internal/upgrade"
 )
 
 // asFednet is the environment variable that makes this test binary run as
@@ -35,16 +36,27 @@ import (
 // the same binary again with the same arguments and environment.
 const asFednet = "FEDNET_TEST_AS_FEDNET"
 
+// testVersion is the environment variable that sets the version the test
+// binary reports when it runs as fednet.
+const testVersion = "FEDNET_TEST_VERSION"
+
 // The hubs and clients the tests run in this process cannot hand off: the
 // real mechanism allows one per OS process. The handoff tests run this
 // binary as fednet instead, so nothing is built during the tests.
 func TestMain(m *testing.M) {
 	if os.Getenv(asFednet) == "1" {
+		// The version a release build would have baked in.
+		if v := os.Getenv(testVersion); v != "" {
+			version = v
+		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
 	}
 	newProcess = func(time.Duration) (handoff.Process, error) { return handoff.None{}, nil }
+	// No test reaches the real releases: a fetch that slips through fails
+	// at once on a port nothing listens on.
+	releases = upgrade.Releases{Latest: "http://127.0.0.1:9/latest", Download: "http://127.0.0.1:9/download"}
 	os.Exit(m.Run())
 }
 
@@ -70,11 +82,19 @@ type daemon struct {
 // returns when this process exits, not when its successor does.
 func startDaemon(t *testing.T, args []string, env ...string) *daemon {
 	t.Helper()
+	return startDaemonAt(t, fednetBinary(t), args, env...)
+}
+
+// startDaemonAt is startDaemon with the binary at path, a copy of this
+// one: a handoff starts the binary at the path again, so an upgrade test
+// replaces that copy.
+func startDaemonAt(t *testing.T, path string, args []string, env ...string) *daemon {
+	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(fednetBinary(t), args...)
+	cmd := exec.Command(path, args...)
 	cmd.Stdout, cmd.Stderr = w, w
 	cmd.Env = append(append(os.Environ(), asFednet+"=1"), env...)
 	if err := cmd.Start(); err != nil {

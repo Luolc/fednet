@@ -124,7 +124,7 @@ func TestHubWithSlack(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "hub.json")
-	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"machine": "workstation"}}, "users": {"U1": "maintainer"}}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"machine": "workstation"}}, "users": {"U1": "maintainer"}, "upgrade": {"admins": ["U1"], "auto": false}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -193,6 +193,23 @@ func TestHubWithSlack(t *testing.T) {
 		reg, err := hs.Registration(ctx, "workstation")
 		return err == nil && reg.Version != ""
 	})
+
+	// The slash command is wired to the hub: the maintainer gets the
+	// versions, with the client online.
+	reply, err := sr.r.Commands.Command(ctx, slack.Command{Name: "/fednet", Text: "version", User: "U1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the client to be online", func() bool {
+		reply, err = sr.r.Commands.Command(ctx, slack.Command{Name: "/fednet", Text: "version", User: "U1"})
+		return err == nil && strings.Contains(reply.Text, "workstation：dev 在线")
+	})
+	if !strings.Contains(reply.Text, "hub：dev") || !strings.Contains(reply.Text, "最新 release：查不到") {
+		t.Fatalf("/fednet version = %q", reply.Text)
+	}
+	if reply, _ := sr.r.Commands.Command(ctx, slack.Command{Name: "/fednet", Text: "upgrade", User: "U1"}); !strings.Contains(reply.Text, "不是发布版") {
+		t.Fatalf("/fednet upgrade on a dev hub = %q", reply.Text)
+	}
 
 	// Someone posts in C1: the message reaches the connected client.
 	ts, err := f.Start("C1", "U1", "please fix the build")

@@ -86,7 +86,54 @@ type API interface {
 	UpdateCard(ctx context.Context, channel, ts string, c Card) error
 	// Whisper shows text in channel to user alone, as an ephemeral message.
 	Whisper(ctx context.Context, channel, user, text string) error
+	// Respond posts text through the response URL of a slash command or
+	// of a click on what one showed, in place of the message there, which
+	// is seen by that person alone.
+	Respond(ctx context.Context, responseURL, text string) error
 }
+
+// Command is a slash command someone sent, as Socket Mode delivers it.
+type Command struct {
+	// Name is the command with its slash, such as "/fednet"; Text is what
+	// followed it.
+	Name string
+	Text string
+	// User is the Slack user id of the sender; Channel is where it was
+	// sent, which the bot need not be in.
+	User    string
+	Channel string
+	// ResponseURL takes a later reply to the sender alone.
+	ResponseURL string
+}
+
+// CommandReply is the answer to a Command, shown to the sender alone:
+// Text, or an UpgradeCard when Card is set.
+type CommandReply struct {
+	Text string
+	Card *UpgradeCard
+}
+
+// UpgradeCard asks the sender of `/fednet upgrade` to confirm: it shows
+// the upgrade and has a confirm and a cancel button, each carrying ID.
+type UpgradeCard struct {
+	// ID identifies the confirmation; a click reports it.
+	ID string
+	// From and To are the hub's version and the release to upgrade to.
+	From, To string
+	// Clients lists each client with its version and whether it is
+	// online, one a line.
+	Clients []string
+}
+
+// Action ids and block id of an UpgradeCard's buttons.
+const (
+	UpgradeConfirmAction = "upgrade-confirm"
+	UpgradeCancelAction  = "upgrade-cancel"
+)
+
+// UpgradeBlockID is the id of the block the buttons of the upgrade card
+// with id are in.
+func UpgradeBlockID(id string) string { return "upgrade:" + id }
 
 // Card is an approval card: what an agent asks leave to do, and, once
 // decided, how it ended. While Outcome is empty the card has an approve
@@ -130,6 +177,10 @@ type Click struct {
 	// Channel and TS locate the card.
 	Channel string
 	TS      string
+	// ResponseURL takes a reply to the clicker alone, in place of the
+	// message the button was on; a click on an approval card does not
+	// use it.
+	ResponseURL string
 }
 
 // Limits of a card: Slack takes at most maxBlocks blocks in one message
@@ -233,7 +284,9 @@ type Fake struct {
 	cards map[string]Card
 	// whispers maps a user to the ephemeral texts shown to them.
 	whispers map[string][]string
-	clock    int
+	// responses maps a response URL to the texts posted through it.
+	responses map[string][]string
+	clock     int
 }
 
 type fakeChannel struct {
@@ -516,4 +569,24 @@ func (f *Fake) Whispers(user string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.whispers[user]...)
+}
+
+func (f *Fake) Respond(_ context.Context, responseURL, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if responseURL == "" {
+		return errors.New("slack: no response URL")
+	}
+	if f.responses == nil {
+		f.responses = make(map[string][]string)
+	}
+	f.responses[responseURL] = append(f.responses[responseURL], text)
+	return nil
+}
+
+// Responses returns the texts posted through responseURL, oldest first.
+func (f *Fake) Responses(responseURL string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.responses[responseURL]...)
 }

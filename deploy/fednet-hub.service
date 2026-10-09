@@ -23,6 +23,12 @@
 # NotifyAccess=all because the new process reports before it is the main
 # one. A change to this unit, or a database migration the old binary cannot
 # handle, needs `systemctl restart` instead.
+#
+# The hub upgrades itself the same way: on `/fednet upgrade` in Slack, or
+# when it finds a new release, it writes the release's version to the
+# upgrade request file (-upgrade-request, in RuntimeDirectory), and the
+# root units fednet-hub-upgrade.path and fednet-hub-upgrade.service do the
+# download and the handoff. Install those two units with this one.
 
 [Unit]
 Description=fednet hub
@@ -55,7 +61,8 @@ ExecStart=/usr/local/bin/fednet hub \
     -slack-app-token-file %d/slack-app-token \
     -slack-bot-token-file %d/slack-bot-token \
     -alert-webhook-file %d/alert-webhook \
-    -approval-key-file %d/approval-key
+    -approval-key-file %d/approval-key \
+    -upgrade-request %t/fednet-hub/upgrade
 ExecReload=/usr/local/bin/fednet hub handoff -socket %t/fednet-hub/admin.sock
 Restart=on-failure
 RestartSec=5s

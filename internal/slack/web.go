@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
+
+	"github.com/Luolc/fednet/internal/alert"
 )
 
 // maxRetries is how many times a call that Slack rate-limits is retried,
@@ -23,14 +27,19 @@ const maxWait = time.Minute
 // token it was made with, and writes no logs.
 type Web struct {
 	c *slackgo.Client
+	// http posts to response URLs, which take no token.
+	http *http.Client
 	// sleep waits for d or until ctx is done; tests replace it.
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // New returns a Web that calls Slack with token, a bot token.
 func New(token string) *Web {
-	return &Web{c: slackgo.New(token), sleep: sleep}
+	return &Web{c: slackgo.New(token), http: &http.Client{Timeout: responseTimeout}, sleep: sleep}
 }
+
+// responseTimeout bounds one post to a response URL.
+const responseTimeout = 10 * time.Second
 
 func sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -238,6 +247,51 @@ func (w *Web) Whisper(ctx context.Context, channel, user, text string) error {
 		_, err := w.c.PostEphemeralContext(ctx, channel, user, slackgo.MsgOptionText(text, false))
 		return err
 	})
+}
+
+// Respond posts text through responseURL, replacing the message there,
+// as an ephemeral message.
+// The URL lets whoever has it post in the sender's place for a while,
+// so the error never carries it.
+func (w *Web) Respond(ctx context.Context, responseURL, text string) error {
+	err := w.call(ctx, "response_url", func() error {
+		return slackgo.PostWebhookCustomHTTPContext(ctx, responseURL, w.http, &slackgo.WebhookMessage{
+			Text: text, ResponseType: "ephemeral", ReplaceOriginal: true,
+		})
+	})
+	if err != nil {
+		return errors.New(alert.Redact(responseURL, err.Error()))
+	}
+	return nil
+}
+
+// CommandAck is the payload a slash command is acked with: r, as an
+// ephemeral message.
+func CommandAck(r CommandReply) map[string]any {
+	ack := map[string]any{"response_type": "ephemeral", "text": r.Text}
+	if r.Card != nil {
+		ack["text"] = "从 " + r.Card.From + " 升到 " + r.Card.To + "？"
+		ack["blocks"] = upgradeBlocks(*r.Card)
+	}
+	return ack
+}
+
+// upgradeBlocks lays the upgrade card out: the question, the clients,
+// then the two buttons.
+func upgradeBlocks(c UpgradeCard) []slackgo.Block {
+	plain := func(s string) *slackgo.TextBlockObject {
+		return slackgo.NewTextBlockObject(slackgo.PlainTextType, s, false, false)
+	}
+	bs := []slackgo.Block{
+		slackgo.NewSectionBlock(plain("从 "+c.From+" 升到 "+c.To+"？先升在线的 client，都升好了再升 hub。"), nil, nil),
+	}
+	if len(c.Clients) > 0 {
+		bs = append(bs, slackgo.NewSectionBlock(plain(strings.Join(c.Clients, "\n")), nil, nil))
+	}
+	return append(bs, slackgo.NewActionBlock(UpgradeBlockID(c.ID),
+		slackgo.NewButtonBlockElement(UpgradeConfirmAction, c.ID, plain("升级")).WithStyle(slackgo.StylePrimary),
+		slackgo.NewButtonBlockElement(UpgradeCancelAction, c.ID, plain("取消")),
+	))
 }
 
 // blocks lays the card out: a header, the summary, the parameters in

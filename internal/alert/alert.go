@@ -45,15 +45,18 @@ func (w *Webhook) Send(ctx context.Context, text string) error {
 	return errors.New("alert: " + w.redact(err.Error()))
 }
 
-// redact removes the URL from s, in the forms an error may quote it in.
-func (w *Webhook) redact(s string) string {
-	forms := []string{w.URL}
-	if u, err := url.Parse(w.URL); err == nil {
+func (w *Webhook) redact(s string) string { return Redact(w.URL, s) }
+
+// Redact removes the webhook or response URL u from s, in the forms an
+// error may quote it in, for an error that must not carry it.
+func Redact(u, s string) string {
+	forms := []string{u}
+	if u, err := url.Parse(u); err == nil {
 		forms = append(forms, u.String(), u.Redacted(), u.Path, u.EscapedPath())
 	}
 	for _, f := range forms {
 		if f != "" && f != "/" {
-			s = strings.ReplaceAll(s, f, "<webhook>")
+			s = strings.ReplaceAll(s, f, "<url>")
 		}
 	}
 	return s
