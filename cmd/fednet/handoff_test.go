@@ -11,10 +11,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -30,43 +30,32 @@ import (
 	"github.com/Luolc/fednet/internal/store"
 )
 
+// asFednet is the environment variable that makes this test binary run as
+// fednet: the handoff tests start it as a subprocess, and a handoff starts
+// the same binary again with the same arguments and environment.
+const asFednet = "FEDNET_TEST_AS_FEDNET"
+
 // The hubs and clients the tests run in this process cannot hand off: the
-// real mechanism allows one per OS process. The handoff tests run the
-// built binary instead.
+// real mechanism allows one per OS process. The handoff tests run this
+// binary as fednet instead, so nothing is built during the tests.
 func TestMain(m *testing.M) {
-	newProcess = func(time.Duration) (handoff.Process, error) { return handoff.None{}, nil }
-	code := m.Run()
-	if binDir != "" {
-		os.RemoveAll(binDir)
+	if os.Getenv(asFednet) == "1" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
 	}
-	os.Exit(code)
+	newProcess = func(time.Duration) (handoff.Process, error) { return handoff.None{}, nil }
+	os.Exit(m.Run())
 }
 
-var (
-	binOnce sync.Once
-	binDir  string
-	binPath string
-	binErr  error
-)
-
-// fednetBinary builds the fednet binary once and returns its path.
+// fednetBinary returns the path of the binary to run as fednet: this one.
 func fednetBinary(t *testing.T) string {
 	t.Helper()
-	binOnce.Do(func() {
-		binDir, binErr = os.MkdirTemp("", "fednet-bin-")
-		if binErr != nil {
-			return
-		}
-		binPath = filepath.Join(binDir, "fednet")
-		out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput()
-		if err != nil {
-			binErr = fmt.Errorf("go build: %v\n%s", err, out)
-		}
-	})
-	if binErr != nil {
-		t.Fatal(binErr)
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
 	}
-	return binPath
+	return path
 }
 
 // daemon is a fednet process started from the binary. Its output, and that
@@ -87,7 +76,7 @@ func startDaemon(t *testing.T, args []string, env ...string) *daemon {
 	}
 	cmd := exec.Command(fednetBinary(t), args...)
 	cmd.Stdout, cmd.Stderr = w, w
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(append(os.Environ(), asFednet+"=1"), env...)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

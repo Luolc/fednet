@@ -556,6 +556,24 @@ func TestStopRecordsTheOutcome(t *testing.T) {
 	}
 }
 
+// A Stop that lands after Run has looked at the inbox and found it empty,
+// just before it waits, still makes Run return.
+func TestStopJustBeforeWaitReturns(t *testing.T) {
+	f := newFixture(t, `exit 0`)
+	var once sync.Once
+	f.r.beforeWait = func() { once.Do(f.r.Stop) }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(t.Context())
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after a Stop just before it waited")
+	}
+}
+
 func TestRetryDelay(t *testing.T) {
 	r := Retry{Min: time.Second, Max: 10 * time.Second, Attempts: 5}
 	for attempts, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 4: 8 * time.Second, 5: 10 * time.Second, 40: 10 * time.Second} {

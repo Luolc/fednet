@@ -108,6 +108,10 @@ type Runner struct {
 	// stop is closed by Stop.
 	stop     chan struct{}
 	stopOnce sync.Once
+	// beforeWait, if set, runs after Run has decided to wait for
+	// something to do and before it picks what to wait for; a test puts
+	// a Stop there.
+	beforeWait func()
 }
 
 // outcome is what one run of the hook ended in: err nil means it exited 0.
@@ -207,10 +211,14 @@ func (r *Runner) Run(ctx context.Context) {
 			timer = time.NewTimer(wait)
 			due = timer.C
 		}
-		// Once stopping, the loop only waits to record what it has; Stop
-		// must not wake it.
+		// With an outcome to record the loop waits only for the retry;
+		// Stop, already called, must not wake it. Otherwise it listens for
+		// Stop: one that came since pass looked would be missed.
+		if r.beforeWait != nil {
+			r.beforeWait()
+		}
 		var stop <-chan struct{}
-		if !r.stopping() {
+		if r.unsaved == nil {
 			stop = r.stopCh()
 		}
 		select {
