@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/Luolc/fednet/internal/link"
@@ -34,6 +35,11 @@ const (
 	GetChannelContext = "channel-context-get"
 	// SetChannelContext replaces the description of Channel with Text.
 	SetChannelContext = "channel-context-set"
+	// Users returns the user list.
+	Users = "users"
+	// DM sends Text to User, who must be on the user list, as a direct
+	// message.
+	DM = "dm"
 )
 
 // Request is one request. Cmd selects the command; the other fields are its
@@ -43,6 +49,15 @@ type Request struct {
 	Thread  string `json:"thread,omitempty"`
 	Channel string `json:"channel,omitempty"`
 	Text    string `json:"text,omitempty"`
+	User    string `json:"user,omitempty"`
+}
+
+// User is one person on the user list.
+type User struct {
+	// ID is the person's Slack user id.
+	ID string `json:"id"`
+	// Name is what the agents call them; it may be empty.
+	Name string `json:"name,omitempty"`
 }
 
 // Reply is the hub's answer. Which fields are set depends on the command.
@@ -51,6 +66,7 @@ type Reply struct {
 	Text     string          `json:"text,omitempty"`
 	Thread   string          `json:"thread,omitempty"`
 	Threads  []string        `json:"threads,omitempty"`
+	Users    []User          `json:"users,omitempty"`
 }
 
 // Server answers requests on the hub. Its Answer is meant for
@@ -63,6 +79,10 @@ type Server struct {
 	// OpenThread maps a channel to the clients that may open threads in
 	// it. A client may open threads only in the channels that list it.
 	OpenThread map[string][]string
+	// Users is the user list: the Slack user id of each person fednet
+	// serves, mapped to a name for the agents, which may be empty. Only
+	// people on it get direct messages.
+	Users map[string]string
 }
 
 // errNoSlack is returned for a request that needs Slack when Server.Slack
@@ -90,6 +110,10 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		reply, err = s.channelContext(ctx, r)
 	case SetChannelContext:
 		err = s.setChannelContext(ctx, r)
+	case Users:
+		reply.Users = s.users()
+	case DM:
+		err = s.dm(ctx, r)
 	default:
 		err = link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
 	}
@@ -187,4 +211,26 @@ func (s *Server) setChannelContext(ctx context.Context, r Request) error {
 		return link.Refuse(link.ErrNotFound, "no channel %s", r.Channel)
 	}
 	return err
+}
+
+// users returns the user list, ordered by id.
+func (s *Server) users() []User {
+	var us []User
+	for _, id := range slices.Sorted(maps.Keys(s.Users)) {
+		us = append(us, User{ID: id, Name: s.Users[id]})
+	}
+	return us
+}
+
+func (s *Server) dm(ctx context.Context, r Request) error {
+	if r.User == "" || r.Text == "" {
+		return link.Refuse(link.ErrBadRequest, "needs a user and a text")
+	}
+	if _, ok := s.Users[r.User]; !ok {
+		return link.Refuse(link.ErrDenied, "user %s is not on the user list", r.User)
+	}
+	if s.Slack == nil {
+		return errNoSlack
+	}
+	return s.Slack.DM(ctx, r.User, r.Text)
 }

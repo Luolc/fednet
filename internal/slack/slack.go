@@ -34,6 +34,9 @@ type API interface {
 	Purpose(ctx context.Context, channel string) (string, error)
 	// SetPurpose replaces channel's purpose.
 	SetPurpose(ctx context.Context, channel, purpose string) error
+	// DM sends text to user as a direct message, which belongs to no
+	// thread.
+	DM(ctx context.Context, user, text string) error
 }
 
 // ThreadKey is how fednet names a thread: its channel and the ts of its
@@ -51,6 +54,7 @@ func ParseThreadKey(key string) (channel, ts string, ok bool) {
 type Fake struct {
 	mu       sync.Mutex
 	channels map[string]*fakeChannel
+	dms      map[string][]string
 	clock    int
 }
 
@@ -137,4 +141,21 @@ func (f *Fake) SetPurpose(_ context.Context, channel, purpose string) error {
 	}
 	c.purpose = purpose
 	return nil
+}
+
+func (f *Fake) DM(_ context.Context, user, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dms == nil {
+		f.dms = make(map[string][]string)
+	}
+	f.dms[user] = append(f.dms[user], text)
+	return nil
+}
+
+// DMs returns the texts sent to user as direct messages, oldest first.
+func (f *Fake) DMs(user string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.dms[user]...)
 }

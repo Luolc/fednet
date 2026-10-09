@@ -53,10 +53,11 @@ func TestHubRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// workstation may open threads in C1, and no one in C2.
+	// workstation may open threads in C1, and no one in C2; U1 and U2 are
+	// on the user list.
 	f.AddChannel("C2", "")
 	config := filepath.Join(dir, "hub.json")
-	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, &stdout, &stderr)
@@ -143,6 +144,27 @@ func TestHubRequests(t *testing.T) {
 		t.Fatalf("threads -json: exit %d, stdout %q; want just %s", code, out, opened)
 	}
 
+	// users lists the user list; dm reaches a user on it, and no one else.
+	if code, out := fednet("client", "users", "-socket", socket); code != 0 || out != "U1 maintainer\nU2\n" {
+		t.Fatalf("users: exit %d, stdout %q; want U1 with its name, then U2", code, out)
+	}
+	code, out = fednet("client", "users", "-socket", socket, "-json")
+	var users struct {
+		Users []struct{ ID, Name string } `json:"users"`
+	}
+	if err := json.Unmarshal([]byte(out), &users); code != 0 || err != nil || len(users.Users) != 2 || users.Users[0].Name != "maintainer" {
+		t.Fatalf("users -json: exit %d, stdout %q", code, out)
+	}
+	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", "daily report"); code != 0 || !slices.Equal(f.DMs("U1"), []string{"daily report"}) {
+		t.Fatalf("dm: exit %d, DMs to U1 %q; want the report", code, f.DMs("U1"))
+	}
+	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U9", "hello"); code != 3 || len(f.DMs("U9")) != 0 {
+		t.Fatalf("dm to a user not on the list: exit %d, DMs %q; want 3 and none", code, f.DMs("U9"))
+	}
+	if code, _ := fednet("client", "dm", "-socket", socket, "hello"); code != 2 {
+		t.Fatalf("dm without -user: exit %d, want 2", code)
+	}
+
 	// adopt takes the thread over from the old machine; hub reassign then
 	// moves everything this machine owns to another.
 	if code, _ := fednet("client", "adopt", "-socket", socket, thread); code != 0 {
@@ -174,6 +196,9 @@ func TestHubRequests(t *testing.T) {
 	if code, _ := fednet("client", "read-thread", "-socket", socket, thread); code != 4 {
 		t.Fatalf("read-thread with the hub down: exit %d, want 4", code)
 	}
+	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", "while the hub is down"); code != 4 || len(f.DMs("U1")) != 1 {
+		t.Fatalf("dm with the hub down: exit %d, DMs to U1 %q; want 4 and only the first", code, f.DMs("U1"))
+	}
 	if got, err := f.Replies(ctx, "C1", ts); err != nil || !slices.ContainsFunc(got, func(m slack.Message) bool { return m.Text == "on it" }) {
 		t.Fatalf("Slack thread = %+v, %v", got, err)
 	}
@@ -186,7 +211,7 @@ func TestReadHubConfig(t *testing.T) {
 	good := filepath.Join(dir, "good.json")
 	typo := filepath.Join(dir, "typo.json")
 	two := filepath.Join(dir, "two.json")
-	if err := os.WriteFile(good, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}}}`), 0o600); err != nil {
+	if err := os.WriteFile(good, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}}, "users": {"U1": "maintainer"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(typo, []byte(`{"channels": {"C1": {"open_threads": ["workstation"]}}}`), 0o600); err != nil {
@@ -196,8 +221,8 @@ func TestReadHubConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := readHubConfig(good)
-	if err != nil || !slices.Equal(cfg.openThread()["C1"], []string{"workstation"}) {
-		t.Fatalf("readHubConfig(good) = %+v, %v; want workstation allowed in C1", cfg, err)
+	if err != nil || !slices.Equal(cfg.openThread()["C1"], []string{"workstation"}) || cfg.Users["U1"] != "maintainer" {
+		t.Fatalf("readHubConfig(good) = %+v, %v; want workstation allowed in C1 and U1 on the user list", cfg, err)
 	}
 	if _, err := readHubConfig(typo); err == nil || !strings.Contains(err.Error(), "open_threads") {
 		t.Fatalf("readHubConfig(typo) = %v, want an error naming the unknown field", err)
