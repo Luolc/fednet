@@ -3,6 +3,7 @@
 这个目录放部署 `fednet hub` 用的通用材料，随代码一起改：
 
 - [`fednet-hub.service`](fednet-hub.service)：systemd 单元模板，标了 `replace` 的几行按自己的机器改。
+- [`echo-hook.sh`](echo-hook.sh)：client 的示例钩子，把收到的每条消息的概要回到同一个线程，见下面「回声钩子」一节。
 - `fednet-hub-upgrade.path`、`fednet-hub-upgrade.service`、`fednet-client-upgrade.path`、`fednet-client-upgrade.service`：让 hub 和 client 自己升级的 root 单元，见下面「升级」一节。
 - [`hub.example.json`](hub.example.json)：hub 配置的示例，channel id、机器名、用户 id 都是示例值。字段的含义以 `fednet` 不带参数时打印的用法为准。
 
@@ -95,3 +96,23 @@ sudo systemctl reload fednet-hub
 它经管理 socket 执行 `fednet hub handoff`：新进程起来、接过端口和 socket 之后，旧进程处理完手上的请求再退出，client 的连接会断一次、自己重连。新进程起不来时 reload 失败，旧进程照常服务，原因在 `journalctl -u fednet-hub` 里。改了单元文件、或者新版本的数据库迁移旧版本写不了的，用 `systemctl restart`。
 
 agent 机器上的 client 由本机的 agent 执行 `fednet client handoff -socket <socket>`，走同一套机制。
+
+## 回声钩子
+
+[`echo-hook.sh`](echo-hook.sh) 是 client 钩子的最小示例，也可以拿来检查一台 client 收到的消息是否完整：每收到一条 `message` 类型的消息，就用 `fednet client post` 在同一个线程里回一行概要。其它类型的事件 (例如审批结果) 不回，直接退出 0。它只用 `sh` 和 `jq`，`fednet` 要在 `PATH` 上。
+
+接法：client 的命令行末尾给这个脚本作为钩子，并用 `-hook-env` 把 socket 路径放行给它 (钩子的环境只有 `PATH`、`HOME` 和 `-hook-env` 列出的变量)，client 单元里再设这个变量，值和 `-socket` 一样：
+
+```sh
+Environment=FEDNET_SOCKET=/run/fednet-client/client.sock   # replace: same as -socket
+ExecStart=/usr/local/bin/fednet client ... -socket ${FEDNET_SOCKET} -hook-env FEDNET_SOCKET /usr/local/bin/echo-hook.sh
+```
+
+没设 `FEDNET_SOCKET` 时脚本报错退出 (非 0)，消息按钩子失败的规则重试。钩子失败重试、或 client 在钩子退出后崩溃时，同一条消息可能回声两次，`msg_id` 相同。
+
+输出是一行：`回声：type=…，trigger=…，history <included>/<total> 条 (<截断数> 条截断)，附件 <n> 个 (<名字>，已下载/下载失败/未下载)，msg_id=…`。字段不存在时写「无」，旧版本的 hub 没有 `trigger`、`history` 和附件。附件项有非空的 `path` (已下载到本机的路径) 写「已下载」，有 `error` (下载失败的原因) 写「下载失败」，两个都没有写「未下载」，现在的 hub 不下载附件，就是这种。样例：
+
+```
+回声：type=message，trigger=mention，history 10/12 条 (1 条截断)，附件 3 个 (a.png，未下载；b.pdf，已下载；c.zip，下载失败)，msg_id=m1
+回声：type=message，trigger=无，history 无，附件 无，msg_id=m2
+```
