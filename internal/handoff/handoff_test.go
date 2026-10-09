@@ -2,6 +2,7 @@ package handoff
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -111,5 +112,41 @@ func TestHandoffWaitsForReady(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("handoff did not return")
+	}
+}
+
+// Waiting for Ready ends on each of its exits: Ready, Stop, the request's
+// context and the timeout.
+func TestAwaitReady(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	fired := make(chan time.Time, 1)
+	fired <- time.Time{}
+	for _, tt := range []struct {
+		name           string
+		ready, stopped <-chan struct{}
+		ctx            context.Context
+		expired        <-chan time.Time
+		want           string
+	}{
+		{"ready", closed, nil, context.Background(), nil, "<nil>"},
+		{"stopped", nil, closed, context.Background(), nil, "<nil>"},
+		{"canceled", nil, nil, canceled, nil, context.Canceled.Error()},
+		{"expired", nil, nil, context.Background(), fired, "handoff: this process did not become ready within 1s"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			done := make(chan error, 1)
+			go func() { done <- awaitReady(tt.ctx, tt.ready, tt.stopped, tt.expired, time.Second) }()
+			select {
+			case err := <-done:
+				if got := fmt.Sprint(err); got != tt.want {
+					t.Fatalf("awaitReady = %v, want %q", err, tt.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("awaitReady did not return on %s", tt.name)
+			}
+		})
 	}
 }

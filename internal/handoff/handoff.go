@@ -185,19 +185,9 @@ func (l *Live) WaitForParent(ctx context.Context) error { return l.upg.WaitForPa
 // started, waits for it as long as a successor would get.
 func (l *Live) Handoff(ctx context.Context) error {
 	deadline := time.Now().Add(l.timeout)
-	select {
-	case <-l.ready:
-	default:
-		awaitingReady()
-		select {
-		case <-l.ready:
-		case <-l.upg.Exit():
-			// Stopped: Upgrade says so.
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Until(deadline)):
-			return fmt.Errorf("handoff: this process did not become ready within %s", l.timeout)
-		}
+	// Once stopped, Upgrade answers with tableflip's own error.
+	if err := awaitReady(ctx, l.ready, l.upg.Exit(), time.After(l.timeout), l.timeout); err != nil {
+		return err
 	}
 	err := l.upg.Upgrade()
 	// tableflip picks at random between Ready and a request it has both of,
@@ -216,6 +206,26 @@ func (l *Live) Handoff(ctx context.Context) error {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(buf[:n])))
 	}
 	return err
+}
+
+// awaitReady returns nil once ready or stopped is closed, or an error once
+// ctx is done or expired fires, after timeout.
+func awaitReady(ctx context.Context, ready, stopped <-chan struct{}, expired <-chan time.Time, timeout time.Duration) error {
+	select {
+	case <-ready:
+		return nil
+	default:
+	}
+	awaitingReady()
+	select {
+	case <-ready:
+	case <-stopped:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-expired:
+		return fmt.Errorf("handoff: this process did not become ready within %s", timeout)
+	}
+	return nil
 }
 
 func (l *Live) Report(err error) {
