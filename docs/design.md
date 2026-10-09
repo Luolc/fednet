@@ -71,7 +71,7 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 15. 凭证文件只有所有者能读，已有的不会被覆盖，被别人能读的凭证文件不用。[`TestCredentialFile`](../internal/auth/auth_test.go)
 16. 退役只打标记不删记录；重新登记替换哈希、解除退役、保留版本。[`TestRegistry`](../internal/store/store_test.go)
 17. 登记之后 client 连上 hub，hub 在它连上之前排队的消息送到它的 inbox，hub 记下它报的版本。[`TestHubAndClient`](../cmd/fednet/main_test.go)
-18. 下行连接开着的时候退役这台 client，或者给它换了凭证，hub 在一个心跳间隔内断开这条连接，旧凭证再连、再发上行都回 401，新凭证能连上并收到消息；没有变化的 client 不受影响。[`TestRegistryChangeDropsConnection`](../internal/auth/auth_test.go)
+18. 下行连接开着的时候退役这台 client，或者给它换了凭证，hub 在改动写进库文件之后开始的第一次重新认证就断开这条连接，旧凭证再连、再发上行都回 401，新凭证能连上并收到消息；没有变化的 client 不受影响。[`TestRegistryChangeDropsConnection`](../internal/auth/auth_test.go)
 
 本机 socket：
 
