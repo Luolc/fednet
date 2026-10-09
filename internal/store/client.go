@@ -51,7 +51,7 @@ func OpenClient(ctx context.Context, path string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{db: db, Inbox: ClientInbox{Inbox{db}}, Outbox: ClientOutbox{db}}, nil
+	return &Client{db: db, Inbox: ClientInbox{Inbox{db}, db}, Outbox: ClientOutbox{db}}, nil
 }
 
 // Close closes the database.
@@ -59,7 +59,11 @@ func (c *Client) Close() error { return c.db.Close() }
 
 // ClientInbox is the client's inbox, which also tracks the hook's attempts
 // at each message and keeps the messages the hook gave up on.
-type ClientInbox struct{ Inbox }
+type ClientInbox struct {
+	Inbox
+	// conn opens the transactions Bury needs.
+	conn *sql.DB
+}
 
 // Queued is an undelivered inbox message with the hook's retry state.
 type Queued struct {
@@ -137,7 +141,7 @@ func (in ClientInbox) Retry(ctx context.Context, msgID string, next time.Time) e
 // recording reason. It returns ErrNotFound if the message is not in the
 // inbox.
 func (in ClientInbox) Bury(ctx context.Context, msgID, reason string) error {
-	tx, err := in.db.BeginTx(ctx, nil)
+	tx, err := in.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

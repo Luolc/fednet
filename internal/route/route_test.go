@@ -3,6 +3,7 @@ package route
 import (
 	"errors"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 
@@ -134,5 +135,69 @@ func TestRouteConcurrentFirstMessages(t *testing.T) {
 	}
 	if n := len(queued(t, h, got[0])); n != 2 {
 		t.Fatalf("owner %s has %d queued, want 2", got[0], n)
+	}
+}
+
+func TestRouteDM(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t)
+	r := New(h, Config{DM: "workstation"})
+
+	// Each message that starts a direct message thread goes to the DM
+	// machine, which owns the thread; replies in it follow the owner.
+	if got, err := r.RouteNewDM(ctx, "D1/t1", []byte("first")); err != nil || got != "workstation" {
+		t.Fatalf("RouteNewDM = %q, %v; want workstation", got, err)
+	}
+	if got := routeReply(t, r, "D1/t1", "reply"); got != "workstation" {
+		t.Fatalf("reply in a DM thread went to %q, want workstation", got)
+	}
+	if err := h.Reassign(ctx, "D1/t1", "datamachine"); err != nil {
+		t.Fatal(err)
+	}
+	r = New(h, Config{})
+	if got := routeReply(t, r, "D1/t1", "after"); got != "datamachine" {
+		t.Fatalf("reply after Reassign went to %q, want datamachine", got)
+	}
+	// With no DM machine, a new DM thread goes nowhere.
+	if _, err := r.RouteNewDM(ctx, "D1/t2", []byte("x")); !errors.Is(err, ErrNoMachine) {
+		t.Fatalf("RouteNewDM with no DM machine: err = %v, want ErrNoMachine", err)
+	}
+	if got := queued(t, h, "workstation"); !slices.Equal(got, []string{"first", "reply"}) {
+		t.Fatalf("queued for workstation = %v, want [first reply]", got)
+	}
+}
+
+// A Router on a Hub bound to a transaction queues in that transaction:
+// when the transaction fails, nothing it queued, and no ownership it
+// recorded, is left behind.
+func TestRouteInTransaction(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t)
+	cfg := Config{Defaults: map[string]string{"dev": "workstation"}}
+	boom := errors.New("boom")
+	fresh, err := h.ReceiveSlack(ctx, store.SlackMessage{Channel: "dev", TS: "1.1"}, func(tx *store.Hub) error {
+		if _, err := New(tx, cfg).RouteNew(ctx, "dev", "dev/1.1", []byte("first")); err != nil {
+			return err
+		}
+		return boom
+	})
+	if fresh || !errors.Is(err, boom) {
+		t.Fatalf("ReceiveSlack = %v, %v; want false, boom", fresh, err)
+	}
+	if got := queued(t, h, "workstation"); len(got) != 0 {
+		t.Fatalf("queued for workstation after a failed transaction = %v, want nothing", got)
+	}
+	if _, err := h.Owner(ctx, "dev/1.1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Owner after a failed transaction: err = %v, want ErrNotFound", err)
+	}
+	fresh, err = h.ReceiveSlack(ctx, store.SlackMessage{Channel: "dev", TS: "1.1"}, func(tx *store.Hub) error {
+		_, err := New(tx, cfg).RouteNew(ctx, "dev", "dev/1.1", []byte("first"))
+		return err
+	})
+	if !fresh || err != nil {
+		t.Fatalf("ReceiveSlack again = %v, %v; want true, nil", fresh, err)
+	}
+	if got := queued(t, h, "workstation"); !slices.Equal(got, []string{"first"}) {
+		t.Fatalf("queued for workstation = %v, want [first]", got)
 	}
 }

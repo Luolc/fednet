@@ -25,6 +25,7 @@ import (
 	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/local"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -36,10 +37,13 @@ const usage = `usage: fednet <command> [flags]
 
 commands:
   hub -listen ADDR -db PATH [-config PATH]
-        run the hub; the JSON config file says which clients may open
-        threads in which channel, and lists the Slack users fednet serves,
-        each with a name for the agents, which may be empty:
-        {"channels": {"C123": {"open_thread": ["CLIENT-ID"]}}, "users": {"U123": "NAME"}}
+        run the hub; the JSON config file says, for each channel, which
+        client takes the threads people start in it and which clients may
+        open threads in it, which client takes direct messages, and lists
+        the Slack users fednet serves, each with a name for the agents,
+        which may be empty:
+        {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
+         "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"}}
   hub register -db PATH CLIENT-ID HASH
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
@@ -183,9 +187,18 @@ func hubCommand(ctx context.Context, args []string, stdout io.Writer) error {
 // hubConfig is the hub's config file.
 type hubConfig struct {
 	Channels map[string]struct {
+		// Machine is the client that takes the threads people start in
+		// the channel; empty when none does.
+		Machine string `json:"machine"`
 		// OpenThread lists the clients that may open threads in the channel.
 		OpenThread []string `json:"open_thread"`
 	} `json:"channels"`
+	// DM is about direct messages to the bot.
+	DM struct {
+		// Machine is the client that takes the threads people start in
+		// direct messages; empty when none does.
+		Machine string `json:"machine"`
+	} `json:"dm"`
 	// Users maps the Slack user id of each person fednet serves to a name
 	// for the agents, which may be empty.
 	Users map[string]string `json:"users"`
@@ -238,6 +251,18 @@ func readHubConfig(path string) (hubConfig, error) {
 		return hubConfig{}, fmt.Errorf("%s: more than one JSON value", path)
 	}
 	return cfg, nil
+}
+
+// route is the routing part of the config: which client takes new threads
+// in each channel and in direct messages.
+func (c hubConfig) route() route.Config {
+	defaults := make(map[string]string)
+	for ch, cc := range c.Channels {
+		if cc.Machine != "" {
+			defaults[ch] = cc.Machine
+		}
+	}
+	return route.Config{Defaults: defaults, DM: c.DM.Machine}
 }
 
 // openThread maps each channel to the clients that may open threads in it.

@@ -21,6 +21,10 @@ var ErrNoOwner = errors.New("route: thread has no owner")
 type Config struct {
 	// Defaults maps a channel to the client that takes its new threads.
 	Defaults map[string]string
+	// DM is the client that takes new threads in direct messages, where
+	// every message that is not a reply starts a thread; empty when none
+	// does.
+	DM string
 }
 
 // Router queues the messages people post in threads. A message is queued
@@ -31,7 +35,8 @@ type Router struct {
 	cfg Config
 }
 
-// New returns a Router that queues into hub's outbox.
+// New returns a Router that queues into hub's outbox. hub may be bound to
+// a transaction (see store.Hub.ReceiveSlack); the Router then queues in it.
 func New(hub *store.Hub, cfg Config) *Router {
 	return &Router{hub: hub, cfg: cfg}
 }
@@ -41,8 +46,17 @@ func New(hub *store.Hub, cfg Config) *Router {
 // already has an owner, payload goes to that owner instead. It returns the
 // client the message was queued for.
 func (r *Router) RouteNew(ctx context.Context, channel, thread string, payload []byte) (string, error) {
-	def, ok := r.cfg.Defaults[channel]
-	if !ok {
+	return r.routeNew(ctx, r.cfg.Defaults[channel], thread, payload)
+}
+
+// RouteNewDM is RouteNew for a thread in a direct message conversation,
+// which the DM client takes.
+func (r *Router) RouteNewDM(ctx context.Context, thread string, payload []byte) (string, error) {
+	return r.routeNew(ctx, r.cfg.DM, thread, payload)
+}
+
+func (r *Router) routeNew(ctx context.Context, def, thread string, payload []byte) (string, error) {
+	if def == "" {
 		client, err := r.RouteReply(ctx, thread, payload)
 		if errors.Is(err, ErrNoOwner) {
 			return "", ErrNoMachine

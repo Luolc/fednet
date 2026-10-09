@@ -77,7 +77,7 @@ func migrate(ctx context.Context, db *sql.DB, migrations []string) error {
 
 // Inbox is the receiving side of a channel. The msg_id is unique, so a
 // redelivered message is stored once.
-type Inbox struct{ db *sql.DB }
+type Inbox struct{ db dbtx }
 
 // Put stores a message unless one with the same msg_id is already there, and
 // reports whether it was new.

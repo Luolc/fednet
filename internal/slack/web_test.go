@@ -92,6 +92,16 @@ func TestWeb(t *testing.T) {
 			return 200, `{"ok":true,"channel":{"id":"C1"}}`
 		case "conversations.open":
 			return 200, `{"ok":true,"channel":{"id":"D1"}}`
+		case "conversations.history":
+			if r.form.Get("cursor") == "" {
+				return 200, `{"ok":true,"messages":[{"ts":"2.3","user":"U2","text":"newest","thread_ts":"2.3","reply_count":1},{"ts":"2.2","bot_id":"B1","subtype":"bot_message","text":"from a bot"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
+			}
+			return 200, `{"ok":true,"messages":[{"ts":"2.1","user":"U1","text":"oldest","subtype":"file_share","files":[{"name":"a.txt","permalink":"https://example.invalid/a"}]}],"has_more":false}`
+		case "users.conversations":
+			if r.form.Get("cursor") == "" {
+				return 200, `{"ok":true,"channels":[{"id":"C1","is_channel":true}],"response_metadata":{"next_cursor":"page2"}}`
+			}
+			return 200, `{"ok":true,"channels":[{"id":"D1","is_im":true}],"response_metadata":{"next_cursor":""}}`
 		}
 		return 200, `{"ok":false,"error":"unknown_method"}`
 	})
@@ -118,22 +128,45 @@ func TestWeb(t *testing.T) {
 	if err := w.DM(ctx, "U1", "psst"); err != nil {
 		t.Error(err)
 	}
+	// History comes from Slack newest first and is returned oldest first,
+	// with the fields the inbound filter needs; a thread's first message
+	// is not a reply, so its thread_ts is dropped.
+	hs, err := w.History(ctx, "C1", "2.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHistory := []Message{
+		{TS: "2.1", User: "U1", Text: "oldest", SubType: "file_share", Files: []File{{Name: "a.txt", URL: "https://example.invalid/a"}}},
+		{TS: "2.2", Text: "from a bot", BotID: "B1", SubType: "bot_message"},
+		{TS: "2.3", User: "U2", Text: "newest"},
+	}
+	if !reflect.DeepEqual(hs, wantHistory) {
+		t.Errorf("History = %+v, want %+v", hs, wantHistory)
+	}
+	cs, err := w.Conversations(ctx)
+	if err != nil || !reflect.DeepEqual(cs, []Conversation{{ID: "C1"}, {ID: "D1", IM: true}}) {
+		t.Errorf("Conversations = %+v, %v; want C1 and the IM D1", cs, err)
+	}
 
 	type sent struct{ method, args string }
 	var got []sent
 	rs, _ := ts.got()
 	for _, r := range rs {
 		f := r.form
-		got = append(got, sent{r.method, strings.Join([]string{f.Get("channel"), f.Get("ts"), f.Get("cursor"), f.Get("text"), f.Get("purpose"), f.Get("users")}, "|")})
+		got = append(got, sent{r.method, strings.Join([]string{f.Get("channel"), f.Get("ts"), f.Get("cursor"), f.Get("text"), f.Get("purpose"), f.Get("users"), f.Get("oldest"), f.Get("types"), f.Get("thread_ts")}, "|")})
 	}
 	wantSent := []sent{
-		{"conversations.replies", "C1|1.1||||"},
-		{"conversations.replies", "C1|1.1|page2|||"},
-		{"chat.postMessage", "C1|||hello||"},
-		{"conversations.info", "C1|||||"},
-		{"conversations.setPurpose", "C1||||new purpose|"},
-		{"conversations.open", "|||||U1"},
-		{"chat.postMessage", "D1|||psst||"},
+		{"conversations.replies", "C1|1.1|||||||"},
+		{"conversations.replies", "C1|1.1|page2||||||"},
+		{"chat.postMessage", "C1|||hello|||||"},
+		{"conversations.info", "C1||||||||"},
+		{"conversations.setPurpose", "C1||||new purpose||||"},
+		{"conversations.open", "|||||U1|||"},
+		{"chat.postMessage", "D1|||psst|||||"},
+		{"conversations.history", "C1||||||2.0||"},
+		{"conversations.history", "C1||page2||||2.0||"},
+		{"users.conversations", "|||||||public_channel,private_channel,im|"},
+		{"users.conversations", "||page2|||||public_channel,private_channel,im|"},
 	}
 	if !reflect.DeepEqual(got, wantSent) {
 		t.Errorf("requests = %v, want %v", got, wantSent)
@@ -152,6 +185,7 @@ func TestWebNotFound(t *testing.T) {
 		"Purpose":    func() error { _, err := w.Purpose(ctx, "C1"); return err },
 		"SetPurpose": func() error { return w.SetPurpose(ctx, "C1", "p") },
 		"DM":         func() error { return w.DM(ctx, "U1", "hi") },
+		"History":    func() error { _, err := w.History(ctx, "C1", "1.0"); return err },
 	}
 	for name, call := range calls {
 		if err := call(); !errors.Is(err, ErrNotFound) {

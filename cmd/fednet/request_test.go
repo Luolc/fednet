@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -212,7 +214,7 @@ func TestReadHubConfig(t *testing.T) {
 	good := filepath.Join(dir, "good.json")
 	typo := filepath.Join(dir, "typo.json")
 	two := filepath.Join(dir, "two.json")
-	if err := os.WriteFile(good, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}}, "users": {"U1": "maintainer"}}`), 0o600); err != nil {
+	if err := os.WriteFile(good, []byte(`{"channels": {"C1": {"machine": "workstation", "open_thread": ["workstation"]}, "C2": {}}, "dm": {"machine": "datamachine"}, "users": {"U1": "maintainer"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(typo, []byte(`{"channels": {"C1": {"open_threads": ["workstation"]}}}`), 0o600); err != nil {
@@ -224,6 +226,10 @@ func TestReadHubConfig(t *testing.T) {
 	cfg, err := readHubConfig(good)
 	if err != nil || !slices.Equal(cfg.openThread()["C1"], []string{"workstation"}) || cfg.Users["U1"] != "maintainer" {
 		t.Fatalf("readHubConfig(good) = %+v, %v; want workstation allowed in C1 and U1 on the user list", cfg, err)
+	}
+	// A channel without a machine is left out of the routing defaults.
+	if rt := cfg.route(); !reflect.DeepEqual(rt, route.Config{Defaults: map[string]string{"C1": "workstation"}, DM: "datamachine"}) {
+		t.Fatalf("route() = %+v, want C1 to workstation, direct messages to datamachine", rt)
 	}
 	if _, err := readHubConfig(typo); err == nil || !strings.Contains(err.Error(), "open_threads") {
 		t.Fatalf("readHubConfig(typo) = %v, want an error naming the unknown field", err)

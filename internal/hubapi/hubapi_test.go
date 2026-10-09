@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -61,8 +62,8 @@ func TestReadThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []slack.Message{{TS: ts, User: "U1", Text: "please fix the build"}, {TS: reply, User: "B1", Text: "on it"}}
-	if !slices.Equal(got.Messages, want) {
+	want := []slack.Message{{TS: ts, User: "U1", Text: "please fix the build"}, {TS: reply, User: "B1", Text: "on it", ThreadTS: ts}}
+	if !reflect.DeepEqual(got.Messages, want) {
 		t.Fatalf("read-thread = %+v, want %+v", got.Messages, want)
 	}
 
