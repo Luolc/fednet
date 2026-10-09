@@ -94,7 +94,7 @@ func TestWeb(t *testing.T) {
 		case "chat.postMessage":
 			return 200, `{"ok":true,"channel":"` + r.form.Get("channel") + `","ts":"1.3"}`
 		case "conversations.info":
-			return 200, `{"ok":true,"channel":{"id":"C1","purpose":{"value":"what C1 is for"}}}`
+			return 200, `{"ok":true,"channel":{"id":"C1","name":"example-one","purpose":{"value":"what C1 is for"}}}`
 		case "conversations.setPurpose":
 			return 200, `{"ok":true,"channel":{"id":"C1"}}`
 		case "conversations.open":
@@ -131,9 +131,9 @@ func TestWeb(t *testing.T) {
 	if err != nil || ts1 != "1.3" {
 		t.Errorf("Post = %q, %v; want 1.3", ts1, err)
 	}
-	p, err := w.Purpose(ctx, "C1")
-	if err != nil || p != "what C1 is for" {
-		t.Errorf("Purpose = %q, %v", p, err)
+	info, err := w.ChannelInfo(ctx, "C1")
+	if want := (ChannelInfo{Name: "example-one", Purpose: "what C1 is for"}); err != nil || info != want {
+		t.Errorf("ChannelInfo = %+v, %v; want %+v", info, err, want)
 	}
 	if err := w.SetPurpose(ctx, "C1", "new purpose"); err != nil {
 		t.Error(err)
@@ -194,12 +194,12 @@ func TestWebNotFound(t *testing.T) {
 		return 200, `{"ok":false,"error":"` + code + `"}`
 	})
 	calls := map[string]func() error{
-		"Replies":    func() error { _, err := w.Replies(ctx, "C1", "1.1"); return err },
-		"Post":       func() error { _, err := w.Post(ctx, "C1", "hi"); return err },
-		"Purpose":    func() error { _, err := w.Purpose(ctx, "C1"); return err },
-		"SetPurpose": func() error { return w.SetPurpose(ctx, "C1", "p") },
-		"DM":         func() error { return w.DM(ctx, "U1", "hi") },
-		"History":    func() error { _, err := w.History(ctx, "C1", "1.0"); return err },
+		"Replies":     func() error { _, err := w.Replies(ctx, "C1", "1.1"); return err },
+		"Post":        func() error { _, err := w.Post(ctx, "C1", "hi"); return err },
+		"ChannelInfo": func() error { _, err := w.ChannelInfo(ctx, "C1"); return err },
+		"SetPurpose":  func() error { return w.SetPurpose(ctx, "C1", "p") },
+		"DM":          func() error { return w.DM(ctx, "U1", "hi") },
+		"History":     func() error { _, err := w.History(ctx, "C1", "1.0"); return err },
 	}
 	for name, call := range calls {
 		if err := call(); !errors.Is(err, ErrNotFound) {

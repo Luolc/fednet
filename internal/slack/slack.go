@@ -80,6 +80,14 @@ type Conversation struct {
 	IM bool
 }
 
+// ChannelInfo is what Slack says about a channel.
+type ChannelInfo struct {
+	// Name is the channel's current name, without the #.
+	Name string
+	// Purpose is the description shown with the channel.
+	Purpose string
+}
+
 // API is what the hub needs from Slack.
 type API interface {
 	// Self returns the Slack user id of the bot the token belongs to.
@@ -96,8 +104,8 @@ type API interface {
 	// Post posts text in channel as a new message, which starts a thread,
 	// and returns its ts.
 	Post(ctx context.Context, channel, text string) (string, error)
-	// Purpose returns channel's purpose, the description shown with it.
-	Purpose(ctx context.Context, channel string) (string, error)
+	// ChannelInfo returns channel's name and purpose.
+	ChannelInfo(ctx context.Context, channel string) (ChannelInfo, error)
 	// SetPurpose replaces channel's purpose.
 	SetPurpose(ctx context.Context, channel, purpose string) error
 	// PostReply posts text in the thread that starts at ts in channel,
@@ -338,6 +346,7 @@ type fakeFile struct {
 }
 
 type fakeChannel struct {
+	name    string
 	purpose string
 	im      bool
 	threads map[string][]Message
@@ -501,14 +510,21 @@ func (f *Fake) Delete(_ context.Context, channel, ts string) error {
 	return ErrNotFound
 }
 
-func (f *Fake) Purpose(_ context.Context, channel string) (string, error) {
+func (f *Fake) ChannelInfo(_ context.Context, channel string) (ChannelInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c, ok := f.channels[channel]
 	if !ok {
-		return "", ErrNotFound
+		return ChannelInfo{}, ErrNotFound
 	}
-	return c.purpose, nil
+	return ChannelInfo{Name: c.name, Purpose: c.purpose}, nil
+}
+
+// RenameChannel gives channel a new name; a channel added has none.
+func (f *Fake) RenameChannel(channel, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.channels[channel].name = name
 }
 
 func (f *Fake) SetPurpose(_ context.Context, channel, purpose string) error {

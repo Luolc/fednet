@@ -36,7 +36,7 @@ func queued(t *testing.T, h *store.Hub, client string) []string {
 
 func routeNew(t *testing.T, r *Router, channel, thread, payload string) string {
 	t.Helper()
-	client, err := r.RouteNew(t.Context(), channel, thread, []byte(payload))
+	client, err := r.RouteNew(t.Context(), channel, "", thread, []byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestRoute(t *testing.T) {
 	}
 
 	// A new thread in a channel with no default machine goes nowhere.
-	if _, err := r.RouteNew(ctx, "random", "t2", []byte("x")); !errors.Is(err, ErrNoMachine) {
+	if _, err := r.RouteNew(ctx, "random", "", "t2", []byte("x")); !errors.Is(err, ErrNoMachine) {
 		t.Fatalf("RouteNew in a channel with no default: err = %v, want ErrNoMachine", err)
 	}
 	if _, err := h.Owner(ctx, "t2"); !errors.Is(err, store.ErrNotFound) {
@@ -122,7 +122,7 @@ func TestRouteConcurrentFirstMessages(t *testing.T) {
 	var wg sync.WaitGroup
 	for i, r := range routers {
 		wg.Go(func() {
-			client, err := r.RouteNew(t.Context(), "dev", "t1", []byte("m"))
+			client, err := r.RouteNew(t.Context(), "dev", "", "t1", []byte("m"))
 			if err != nil {
 				t.Error(err)
 			}
@@ -176,7 +176,7 @@ func TestRouteInTransaction(t *testing.T) {
 	cfg := Config{Defaults: map[string]string{"dev": "workstation"}}
 	boom := errors.New("boom")
 	fresh, err := h.ReceiveSlack(ctx, store.SlackMessage{Channel: "dev", TS: "1.1"}, func(tx *store.Hub) error {
-		if _, err := New(tx, cfg).RouteNew(ctx, "dev", "dev/1.1", []byte("first")); err != nil {
+		if _, err := New(tx, cfg).RouteNew(ctx, "dev", "", "dev/1.1", []byte("first")); err != nil {
 			return err
 		}
 		return boom
@@ -191,7 +191,7 @@ func TestRouteInTransaction(t *testing.T) {
 		t.Fatalf("Owner after a failed transaction: err = %v, want ErrNotFound", err)
 	}
 	fresh, err = h.ReceiveSlack(ctx, store.SlackMessage{Channel: "dev", TS: "1.1"}, func(tx *store.Hub) error {
-		_, err := New(tx, cfg).RouteNew(ctx, "dev", "dev/1.1", []byte("first"))
+		_, err := New(tx, cfg).RouteNew(ctx, "dev", "", "dev/1.1", []byte("first"))
 		return err
 	})
 	if !fresh || err != nil {

@@ -240,7 +240,7 @@ func TestOwner(t *testing.T) {
 	// The first claim wins; a later claim gets the existing owner back, and
 	// its message is queued for that owner.
 	for _, claim := range []string{"a", "b"} {
-		got, d, err := h.ClaimAndEnqueue(ctx, "t1", claim, []byte(claim))
+		got, d, err := h.ClaimAndEnqueue(ctx, "t1", claim, "", []byte(claim))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -264,7 +264,7 @@ func TestOwner(t *testing.T) {
 
 	// ReassignClient moves only the threads of the given client.
 	for thread, client := range map[string]string{"t2": "b", "t3": "c"} {
-		if _, _, err := h.ClaimAndEnqueue(ctx, thread, client, []byte("x")); err != nil {
+		if _, _, err := h.ClaimAndEnqueue(ctx, thread, client, "", []byte("x")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -291,7 +291,7 @@ func TestClaimAndEnqueueConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for i, c := range clients {
 		wg.Go(func() {
-			owner, _, err := h.ClaimAndEnqueue(ctx, "t1", c, []byte(c))
+			owner, _, err := h.ClaimAndEnqueue(ctx, "t1", c, "", []byte(c))
 			if err != nil {
 				t.Error(err)
 			}
@@ -323,7 +323,7 @@ func TestClaimAndEnqueueAtomic(t *testing.T) {
 		"CREATE TRIGGER fail BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'outbox write fails'); END"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := h.ClaimAndEnqueue(ctx, "t1", "a", []byte("x")); err == nil {
+	if _, _, err := h.ClaimAndEnqueue(ctx, "t1", "a", "", []byte("x")); err == nil {
 		t.Fatal("ClaimAndEnqueue with a failing outbox: err = nil")
 	}
 	// The failed enqueue leaves the thread unowned.
@@ -422,6 +422,9 @@ func TestHubUpgradeKeepsData(t *testing.T) {
 	}
 	if owner, err := h.Owner(ctx, "t1"); err != nil || owner != "a" {
 		t.Fatalf("Owner(t1) after upgrade = %q, %v; want a", owner, err)
+	}
+	if name, err := h.ChannelName(ctx, "t1"); err != nil || name != "" {
+		t.Fatalf("ChannelName(t1) after upgrade = %q, %v; want none", name, err)
 	}
 	// The old row is dated at the upgrade, not at the epoch.
 	var at int64
@@ -684,6 +687,32 @@ func TestClientUpgradeKeepsData(t *testing.T) {
 	}
 }
 
+// The channel name recorded with a thread's owner is the first claim's,
+// and stays when the thread changes hands.
+func TestChannelName(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	if _, err := h.ChannelName(ctx, "C1/1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ChannelName of a thread with no owner: err = %v, want ErrNotFound", err)
+	}
+	if err := h.Claim(ctx, "C1/1", "a", "example-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Reassign(ctx, "C1/1", "b"); err != nil {
+		t.Fatal(err)
+	}
+	for _, claim := range []string{"example-b", "renamed"} {
+		if _, _, err := h.ClaimAndEnqueue(ctx, "C2/1", "a", claim, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for thread, want := range map[string]string{"C1/1": "example-a", "C2/1": "example-b"} {
+		if got, err := h.ChannelName(ctx, thread); err != nil || got != want {
+			t.Errorf("ChannelName(%s) = %q, %v; want %q", thread, got, err, want)
+		}
+	}
+}
+
 func TestClaimAndThreads(t *testing.T) {
 	ctx := t.Context()
 	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
@@ -691,7 +720,7 @@ func TestClaimAndThreads(t *testing.T) {
 		t.Fatalf("Threads(a) with no threads = %v, %v; want none", got, err)
 	}
 	for thread, client := range map[string]string{"C1/2": "a", "C1/1": "a", "C2/1": "b"} {
-		if err := h.Claim(ctx, thread, client); err != nil {
+		if err := h.Claim(ctx, thread, client, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -703,7 +732,7 @@ func TestClaimAndThreads(t *testing.T) {
 		t.Fatalf("outbox of a = %v, %v; want empty", ds, err)
 	}
 	// A thread that has an owner keeps it.
-	if err := h.Claim(ctx, "C2/1", "a"); err == nil {
+	if err := h.Claim(ctx, "C2/1", "a", ""); err == nil {
 		t.Fatal("Claim of an owned thread succeeded")
 	}
 	if got, err := h.Threads(ctx, "a"); err != nil || !slices.Equal(got, []string{"C1/1", "C1/2"}) {
@@ -795,7 +824,7 @@ func TestThreadsIn(t *testing.T) {
 	ctx := t.Context()
 	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
 	for thread, client := range map[string]string{"C1/1.2": "a", "C1/1.1": "b", "C10/1.1": "a", "D1/1.1": "a"} {
-		if err := h.Claim(ctx, thread, client); err != nil {
+		if err := h.Claim(ctx, thread, client, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
