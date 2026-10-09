@@ -94,7 +94,7 @@ func TestWeb(t *testing.T) {
 		case "chat.postMessage":
 			return 200, `{"ok":true,"channel":"` + r.form.Get("channel") + `","ts":"1.3"}`
 		case "conversations.info":
-			return 200, `{"ok":true,"channel":{"id":"C1","name":"repo-fednet","purpose":{"value":"what C1 is for"}}}`
+			return 200, `{"ok":true,"channel":{"id":"C1","name":"example-one","purpose":{"value":"what C1 is for"}}}`
 		case "conversations.setPurpose":
 			return 200, `{"ok":true,"channel":{"id":"C1"}}`
 		case "conversations.open":
@@ -132,7 +132,7 @@ func TestWeb(t *testing.T) {
 		t.Errorf("Post = %q, %v; want 1.3", ts1, err)
 	}
 	info, err := w.ChannelInfo(ctx, "C1")
-	if want := (ChannelInfo{Name: "repo-fednet", Purpose: "what C1 is for"}); err != nil || info != want {
+	if want := (ChannelInfo{Name: "example-one", Purpose: "what C1 is for"}); err != nil || info != want {
 		t.Errorf("ChannelInfo = %+v, %v; want %+v", info, err, want)
 	}
 	if err := w.SetPurpose(ctx, "C1", "new purpose"); err != nil {

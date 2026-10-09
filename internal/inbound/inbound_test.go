@@ -438,7 +438,7 @@ func (noChannelInfo) ChannelInfo(context.Context, string) (slack.ChannelInfo, er
 
 func TestHandleWithoutChannelInfo(t *testing.T) {
 	r, f := newReceiver(t)
-	f.RenameChannel("C1", "repo-fednet")
+	f.RenameChannel("C1", "example-one")
 	r.Slack = noChannelInfo{f}
 	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
 	got := queued(t, r.Store, "workstation")
@@ -454,9 +454,9 @@ func TestHandleWithoutChannelInfo(t *testing.T) {
 // and a direct message carry none.
 func TestHandleChannelName(t *testing.T) {
 	r, f := newReceiver(t)
-	f.RenameChannel("C1", "repo-fednet")
+	f.RenameChannel("C1", "example-one")
 	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
-	f.RenameChannel("C1", "repo-renamed")
+	f.RenameChannel("C1", "example-renamed")
 	handle(t, r, message("Ev2", "C1", "1.2", "1.1", "reply"))
 	handle(t, r, message("Ev3", "C1", "1.3", "", hey+"second"))
 	if err := r.Store.Claim(t.Context(), "C1/1.4", "workstation", ""); err != nil {
@@ -473,7 +473,7 @@ func TestHandleChannelName(t *testing.T) {
 	for _, m := range queued(t, r.Store, "workstation") {
 		got = append(got, m.Trigger+":"+m.ChannelName)
 	}
-	if want := []string{"mention:repo-fednet", "reply:repo-fednet", "mention:repo-renamed", "reply:", "dm:"}; !slices.Equal(got, want) {
+	if want := []string{"mention:example-one", "reply:example-one", "mention:example-renamed", "reply:", "dm:"}; !slices.Equal(got, want) {
 		t.Fatalf("triggers and channel names = %q, want %q", got, want)
 	}
 }

@@ -695,18 +695,18 @@ func TestChannelName(t *testing.T) {
 	if _, err := h.ChannelName(ctx, "C1/1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ChannelName of a thread with no owner: err = %v, want ErrNotFound", err)
 	}
-	if err := h.Claim(ctx, "C1/1", "a", "repo-a"); err != nil {
+	if err := h.Claim(ctx, "C1/1", "a", "example-a"); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Reassign(ctx, "C1/1", "b"); err != nil {
 		t.Fatal(err)
 	}
-	for _, claim := range []string{"repo-b", "renamed"} {
+	for _, claim := range []string{"example-b", "renamed"} {
 		if _, _, err := h.ClaimAndEnqueue(ctx, "C2/1", "a", claim, []byte("x")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for thread, want := range map[string]string{"C1/1": "repo-a", "C2/1": "repo-b"} {
+	for thread, want := range map[string]string{"C1/1": "example-a", "C2/1": "example-b"} {
 		if got, err := h.ChannelName(ctx, thread); err != nil || got != want {
 			t.Errorf("ChannelName(%s) = %q, %v; want %q", thread, got, err, want)
 		}

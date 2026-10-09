@@ -172,7 +172,7 @@ func (c *countPosts) Post(ctx context.Context, channel, text string) (string, er
 
 func TestOpenThread(t *testing.T) {
 	s, f := testServer(t)
-	f.RenameChannel("C1", "repo-fednet")
+	f.RenameChannel("C1", "example-one")
 	f.AddChannel("C2", "")
 	posts := &countPosts{API: f}
 	s.Slack = posts
@@ -193,8 +193,8 @@ func TestOpenThread(t *testing.T) {
 	if owner, err := s.Store.Owner(ctx, got.Thread); err != nil || owner != "workstation" {
 		t.Fatalf("owner of the new thread = %q, %v; want workstation", owner, err)
 	}
-	if name, err := s.Store.ChannelName(ctx, got.Thread); err != nil || name != "repo-fednet" {
-		t.Fatalf("channel name of the new thread = %q, %v; want repo-fednet", name, err)
+	if name, err := s.Store.ChannelName(ctx, got.Thread); err != nil || name != "example-one" {
+		t.Fatalf("channel name of the new thread = %q, %v; want example-one", name, err)
 	}
 
 	tests := []struct {
@@ -231,7 +231,7 @@ func (noChannelInfo) ChannelInfo(context.Context, string) (slack.ChannelInfo, er
 // with no name recorded.
 func TestOpenThreadWithoutChannelName(t *testing.T) {
 	s, f := testServer(t)
-	f.RenameChannel("C1", "repo-fednet")
+	f.RenameChannel("C1", "example-one")
 	s.Slack = noChannelInfo{f}
 	s.OpenThread = map[string][]string{"C1": {"workstation"}}
 	got, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
