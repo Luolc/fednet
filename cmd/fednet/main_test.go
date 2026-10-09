@@ -49,6 +49,8 @@ func TestRun(t *testing.T) {
 		{"reassign without a target", []string{"hub", "reassign", "-db", "x", "workstation"}, 2, "", "want 2 arguments"},
 		{"register with a bad hash", []string{"hub", "register", "-db", "x", "ws", "nothex"}, 2, "", "HASH must be"},
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
+		{"approval without verify", []string{"approval"}, 2, "", "want verify"},
+		{"approval verify without flags", []string{"approval", "verify", "-pubkey", "x"}, 2, "", "-pubkey, -approval, -action, -machine, -agent and -used are required"},
 		{"no command", nil, 2, "", "usage: fednet"},
 		{"unknown command", []string{"serve"}, 2, "", "usage: fednet"},
 	}

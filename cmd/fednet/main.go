@@ -112,6 +112,13 @@ commands:
         send TEXT as a direct message to a user on the user list
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
+  approval verify -pubkey PATH -approval PATH -action PATH -machine CLIENT-ID -agent NAME -used PATH
+        check an approval the hub signed before acting on it: the signature,
+        that it has not expired, that it is for this machine and agent and for
+        the action file as given, and that it was not used before; then record
+        it as used; exit 0 to act, 5 bad signature, 6 expired, 7 the target or
+        the action differs, 8 already used, 1 a file cannot be read or the
+        public key is not an ssh-ed25519 line, 2 the approval is not well formed
   version
         print the version
 `
@@ -137,6 +144,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		cmd = hubCommand
 	case "client":
 		cmd = clientCommand
+	case "approval":
+		cmd = func(_ context.Context, args []string, stdout io.Writer) error { return approvalCommand(args, stdout) }
 	case "version":
 		fmt.Fprintln(stdout, version)
 		return 0
