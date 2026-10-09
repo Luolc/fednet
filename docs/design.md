@@ -8,7 +8,7 @@ fednet 让用户在 Slack 线程里和各台机器上的 coding agent 打交道�
 
 计划只有一个二进制 `fednet`，分三组子命令：`fednet hub` 跑在一台固定的 hub 机器上，负责和 Slack 的连接；`fednet client` 跑在每台 agent 机器 (工作站、数据机) 上，主动连到 hub，把消息交给本机的 agent；`fednet approval` 给执行高风险操作的脚本验一份用户的批准，不连 hub。
 
-**当前状态：`fednet hub` 和 `fednet client` 都能跑起来，client 凭登记过的凭证连上 hub，hub 排队的消息送到 client 的 inbox 后，由 client 执行配置的钩子命令交给本机的 agent，交不出去的进死信，并经 hub 报警；本机的 agent 可以用 `fednet client post` 经 client 往线程发消息；agent 还可以经 client 请 hub 当场回答：读一个线程、开一个线程、列出本机的线程、读写 channel 的描述、接管一个线程、列出用户名单、给名单上的用户发私信。给了 Slack 的两个 token 文件时，hub 用 Socket Mode 收人在 Slack 里发的消息，按线程路由送给 client，再把 client 发的 post 发到线程里，给了报警 webhook 时还会报警；没给时 hub 只跑 client 用的 HTTP 服务，post 只落进 inbox，要用 Slack 的请求都失败。hub 和 client 都能不停机换成新版本的进程：新进程接过监听的端口和 socket 之后旧进程才退出，新进程起不来就还是旧的在服务；hub 不给版本过旧的 client 派消息。这些都只在测试里对着假的 Slack 跑通，还没有连真的 Slack workspace 跑过。签名审批整条走通了：agent 用 `fednet client request-approval` 交上动作，hub 在 Slack 发审批卡，审批人点「批准」hub 才签名，结果经下行送回发起的 client、交给钩子；拒绝和过期也送回，不签名；执行方用 `fednet approval verify` 验签。同样只在测试里对着假的 Slack 跑通。推一个 `vX.Y.Z` tag 就会把 amd64、arm64 两个二进制发布成 GitHub release，部署和升级从那里下载；还没有发过版。** 下面各节照实写，不描述还不存在的东西。
+**当前状态：`fednet hub` 和 `fednet client` 都能跑起来，client 凭登记过的凭证连上 hub，hub 排队的消息送到 client 的 inbox 后，由 client 执行配置的钩子命令交给本机的 agent，交不出去的进死信，并经 hub 报警；本机的 agent 可以用 `fednet client post` 经 client 往线程发消息；agent 还可以经 client 请 hub 当场回答：读一个线程、开一个线程、列出本机的线程、读写 channel 的描述、接管一个线程、列出用户名单、给名单上的用户发私信。给了 Slack 的两个 token 文件时，hub 用 Socket Mode 收人在 Slack 里发的消息，按线程路由送给 client，再把 client 发的 post 发到线程里，给了报警 webhook 时还会报警；没给时 hub 只跑 client 用的 HTTP 服务，post 只落进 inbox，要用 Slack 的请求都失败。hub 和 client 都能不停机换成新版本的进程：新进程接过监听的端口和 socket 之后旧进程才退出，新进程起不来就还是旧的在服务；hub 不给版本过旧的 client 派消息。这些都只在测试里对着假的 Slack 跑通，还没有连真的 Slack workspace 跑过。签名审批整条走通了：agent 用 `fednet client request-approval` 交上动作，hub 在 Slack 发审批卡，审批人点「批准」hub 才签名，结果经下行送回发起的 client、交给钩子；拒绝和过期也送回，不签名；执行方用 `fednet approval verify` 验签。同样只在测试里对着假的 Slack 跑通。推一个 `vX.Y.Z` tag 就会把 amd64、arm64 两个二进制发布成 GitHub release，部署和升级从那里下载；还没有发过版。hub 和 client 能自己升到最新的 release：Slack 里 `/fednet upgrade` 或者 hub 每小时的检查触发，先升在线的 client、都升好了再升 hub，下载、校验和交接由每台机器上 root 的 oneshot 单元做；同样只在测试里对着假的 Slack 和假的 release 跑通，systemd 单元没有真跑过。** 下面各节照实写，不描述还不存在的东西。
 
 fednet 不是：
 
@@ -47,6 +47,8 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 交接在 [`internal/handoff`](../internal/handoff)，用 `github.com/cloudflare/tableflip`。旧进程收到 `handoff` 就用自己的命令行起一个新进程 (二进制取路径上现在的那个)，把监听的 fd 传过去：hub 是 TCP 端口和管理 socket，client 是本机 socket，socket 连同它的锁文件一起传，锁跟着打开的文件走，两个进程都持有时不会松开。新进程打开数据库、接过 fd、开始回答之后报就绪：先经 `$NOTIFY_SOCKET` 告诉 systemd `MAINPID` 换了并且 `READY=1`，再告诉旧进程；新 hub 在这之前就开自己的 Socket Mode 连接，连上了才算就绪，Slack 拒绝 token 就退出、交接失败，两条连接并存期间两边收到同一个事件，靠库里的记录去重；补拉的起点也只在库里定：每条连接连上时在库里把连接的代数加一并定下起点，一次补拉做完时只有代数还是它开始时那个才推进最后看到的消息、清掉起点，所以旧进程晚做完的补拉动不了新进程的起点。旧进程这时停止接新连接，把手上的事做完才退出：socket 上的请求 (包括这次 `handoff`) 回答完，正在执行的钩子等它退出并记下结果 (库暂时写不进就等到写进)，正在发的 post 发到 Slack 不再收为止、已发的段数和交付都记进库，再断开全部下行 WebSocket、关掉自己的 Socket Mode 连接，退出码 0；client 按退避重连到新进程，没 ack 的消息按 `seq` 续传。出站、报警检查、审批扫描和钩子只在一个进程里跑：新进程等旧进程退出后才起它们。新进程在一个超时 (`-handoff-timeout`，默认一分钟) 内没就绪、或者退出了，就被杀掉，旧进程照常服务，`handoff` 回答失败的原因，新进程启动时的错误经一条传过去的管道带回来。两个进程短时同时写同一个 SQLite 库，所以只有旧二进制也能写的迁移才能走交接。版本的规矩在 [`internal/release`](../internal/release)：版本是 `vMAJOR.MINOR.PATCH`；hub 服务和自己同版本的 client，以及不低于它写死的最低版本的发布版，其它的 (包括 `dev` 对发布版) 不派消息。升级先 client 后 hub：新 client 要能连旧 hub。
 
 发版在 [`.github/workflows/release.yml`](../.github/workflows/release.yml)，推 `v*` tag 时触发：先调用 PR 用的 `ci.yml` 跑同一套检查，再确认 tag 指向的 commit 在 `origin/main` 的历史里，然后 amd64、arm64 各在同架构的 runner 上构建 (`CGO_ENABLED=0`、`-trimpath`，版本经 `-ldflags` 注入)，每个二进制跑一次 `fednet version`，打出的必须正好是 tag，都通过了才生成 `SHA256SUMS`、建 release、传资产。两道守卫是 [`.github/scripts`](../.github/scripts) 里的两个脚本，读不出来的一律不放行。手动触发 (`workflow_dispatch`) 只跑到构建和守卫，不发布。
+
+升级在 [`internal/upgrade`](../internal/upgrade)。hub 和 client 进程都不改自己的二进制：要升级时写一个升级请求文件 (`-upgrade-request`，内容是目标版本)，先写旁边的临时文件再改名，由 [`deploy`](../deploy) 里 root 的 path 单元监视，起 oneshot 单元跑 `fednet upgrade`：它先删掉请求文件 (所以一个请求只执行一次)，经 socket 问正在跑的进程的版本，目标不是比它新的发布版就拒绝；从 release 下载 `SHA256SUMS` 和本机架构 (`runtime.GOARCH`) 的二进制，边下边算 SHA-256，写在二进制旁边的临时文件里，和 `SHA256SUMS` 里的一致才改成 0755、一次 rename 换掉二进制，不一致、没有这个架构、下载失败都不换；然后经同一个 socket 做第 2 节的交接，交接失败时新二进制已在原处、旧进程照常服务。hub 侧：Socket Mode 收 slash command `/fednet` (ack 里带回复，只有发命令的人看得到) 和升级卡的按钮点击；`version` 用户名单上的人都能用，回 hub 的版本、当场查到的最新 release (查不到就说查不到) 和每台 client 的版本与是否在线；`upgrade` 只有配置里 `upgrade.admins` 列的人能用，hub 不是发布版、没配请求文件、没有更新的 release、正在升级时只回一句话，否则回一张带随机编号的确认卡，十分钟内由发卡给他的那个人点「升级」才开始，点「取消」、别人点、bot 点、再点一次都不开始，点的人经 response URL 收到答复。一次升级：先给每台在线、版本不是目标的 client 发类型为 `upgrade` 的下行消息，再等它们登记表里的版本都变成目标 (默认十分钟，每五秒看一次)，有一台发不出、超时，hub 就不写自己的请求；都到齐才写请求、等交接，交接发生就报完成，到时没发生报失败；离线的不等，它重连时握手报的版本比 hub 旧就补发一次通知 (每个版本一次)。开始、hub 开始、汇总三句经报警 webhook 发出，没配就只记日志。配置里 `upgrade.auto` 不是 `false` 时 hub 每小时查一次最新 release，比自己新就按同一条路走；hub 不是发布版时不查。同一时刻只有一次升级在进行，定时检查和 Slack 都不会开第二次。client 侧：下行消息进 inbox 之前先给 `Divert`，类型为 `upgrade` 的被拿走、不进 inbox、不交给钩子，版本比自己新才写请求文件，否则丢掉并记日志，没配请求文件的也丢掉；拿走之后才 ack。升级只在一个进程里跑：新进程等旧进程退出后才起，旧进程交接之后等汇总发出才退出。
 
 ## 3. 不变量
 
@@ -150,6 +152,13 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 68. hub 不给版本过旧的 client 派消息：下行握手被拒，消息留在 outbox，上行照收，兼容的 client 照常收；这台 client 换成兼容的版本后收到留下的消息。版本相同的总算兼容。[`TestOutdatedClientGetsNoDownlink`](../internal/link/link_test.go)、[`TestCompatible`](../internal/release/release_test.go)
 69. 一台 client 以 hub 不服务的版本连过，报一次警，说明哪台、什么版本、要求什么；换一个不服务的版本再报，换成服务的版本不报。[`TestOutdatedClient`](../internal/watch/watch_test.go)
 
+升级：
+
+72. 升级器只换校验通过、本机架构、比正在跑的进程新的发布版，换是一次 rename，任一时刻路径上都是完整的旧或新二进制；校验不过、没有这个架构、下载失败、版本不比正在跑的新都不换，请求文件无论如何先删。[`TestInstall`](../internal/upgrade/upgrade_test.go)、[`TestInstallIsAtomic`](../internal/upgrade/upgrade_test.go)、[`TestUpgradeCommand`](../cmd/fednet/upgrade_test.go)
+73. `/fednet version` 用户名单上的人都能用；`upgrade` 只有管理员能用，且只在 hub 是发布版、有更新的 release 时出卡；卡只有发卡给他的人点「升级」才开始，取消、别人点、再点都不开始；命令和点击先处理完再 ack。[`TestCommand`](../internal/upgrade/hub_test.go)、[`TestClickStartsTheUpgrade`](../internal/upgrade/hub_test.go)、[`TestRunAcksCommands`](../internal/inbound/inbound_test.go)、[`TestUpgradeCardBlocks`](../internal/slack/web_test.go)
+74. 先 client 后 hub：在线且版本不是目标的 client 先收到通知，已是目标的和离线的不收；全部报上目标版本才写 hub 的请求；有一台发不出或超时，hub 的请求不写、汇总点名；交接之后才报完成。重连的 client 版本比 hub 旧就补发一次通知。[`TestRolloutClientsThenHub`](../internal/upgrade/hub_test.go)、[`TestRolloutStopsWhenAClientFails`](../internal/upgrade/hub_test.go)、[`TestConnectedTellsOldClients`](../internal/upgrade/hub_test.go)、[`TestDivertAndConnected`](../internal/link/link_test.go)
+75. 升级通知由 client 程序自己变成请求文件，不进 inbox、不交给钩子，版本不比自己新的丢掉；定时检查关掉后不再查 release，开着时查到新版本就开始。[`TestClientDivert`](../internal/upgrade/client_test.go)、[`TestUpgradeCommand`](../cmd/fednet/upgrade_test.go)、[`TestAutoCheck`](../internal/upgrade/hub_test.go)
+
 仓库层面：
 
 52. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
@@ -158,10 +167,11 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 
 ## 4. 接口
 
-- 命令行：`fednet hub`、`fednet hub register`、`fednet hub revoke`、`fednet hub reassign`、`fednet hub handoff`、`fednet client`、`fednet client init`、`fednet client handoff`、`fednet client post`、`fednet client read-thread`、`fednet client open-thread`、`fednet client threads`、`fednet client adopt`、`fednet client channel-context`、`fednet client users`、`fednet client dm`、`fednet client request-approval`、`fednet approval verify`、`fednet version`，参数以 `fednet` 不带参数时打印的用法为准 ([`cmd/fednet/main.go`](../cmd/fednet/main.go))。
-- hub 配置文件 (每个 channel 的默认机器和开线程的权限、私信的默认机器、用户名单、报警阈值、审批卡的 channel 与审批人名单)：格式在 [`cmd/fednet/main.go`](../cmd/fednet/main.go) 的 `hubConfig`，例子在 [`deploy/hub.example.json`](../deploy/hub.example.json)。
+- 命令行：`fednet hub`、`fednet hub register`、`fednet hub revoke`、`fednet hub reassign`、`fednet hub handoff`、`fednet client`、`fednet client init`、`fednet client handoff`、`fednet client post`、`fednet client read-thread`、`fednet client open-thread`、`fednet client threads`、`fednet client adopt`、`fednet client channel-context`、`fednet client users`、`fednet client dm`、`fednet client request-approval`、`fednet approval verify`、`fednet upgrade`、`fednet version`，参数以 `fednet` 不带参数时打印的用法为准 ([`cmd/fednet/main.go`](../cmd/fednet/main.go))。
+- hub 配置文件 (每个 channel 的默认机器和开线程的权限、私信的默认机器、用户名单、报警阈值、审批卡的 channel 与审批人名单、能升级的管理员与要不要定时检查)：格式在 [`cmd/fednet/main.go`](../cmd/fednet/main.go) 的 `hubConfig`，例子在 [`deploy/hub.example.json`](../deploy/hub.example.json)。
 - 发版：release 的 tag、资产名和 `SHA256SUMS` 的格式见 [`deploy/README.md`](../deploy/README.md) 的「下载二进制」一节，部署和自己升级都按它下载；流水线在 [`.github/workflows/release.yml`](../.github/workflows/release.yml)。
-- 部署：hub 要的文件和参数见 [`deploy/README.md`](../deploy/README.md)，systemd 单元模板是 [`deploy/fednet-hub.service`](../deploy/fednet-hub.service)。
+- 部署：hub 要的文件和参数见 [`deploy/README.md`](../deploy/README.md)，systemd 单元模板是 [`deploy/fednet-hub.service`](../deploy/fednet-hub.service)；升级用的 root 单元和每台机器要装什么见同一份 README 的「升级」一节。
+- 升级：请求文件的格式、下载与校验在 [`internal/upgrade/upgrade.go`](../internal/upgrade/upgrade.go)；hub 侧的命令、卡片与顺序在 [`internal/upgrade/hub.go`](../internal/upgrade/hub.go)，slash command 和卡片的格式在 [`internal/slack/slack.go`](../internal/slack/slack.go) 的 `Command` 与 `UpgradeCard`；给 client 的通知是 payload 里类型为 `upgrade` 的消息。
 - 入站：收事件、补拉和连接状态的查询在 [`internal/inbound/inbound.go`](../internal/inbound/inbound.go)，报警要的 `SlackLink` 由 `Receiver.DownFor` 实现，处理完一条消息后的通知是 `Receiver.Stored`；接 Socket Mode 的入口在 [`internal/inbound/socket.go`](../internal/inbound/socket.go)。
 - HTTP：只给 client 用，路径和帧格式在 [`internal/link/link.go`](../internal/link/link.go)；唤醒下行连接的 `Hub.WakeAll` 在 [`internal/link/wake.go`](../internal/link/wake.go)。
 - 本机 socket：只给本机的 agent 用，请求和回应的格式在 [`internal/local/local.go`](../internal/local/local.go)；hub 的管理 socket 用同一种格式。
@@ -184,5 +194,5 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 - 看过死信的原因后手动重放的命令还没有。
 - client 的报警要经 hub 发出，hub 停了时 client 的死信报警发不出去，留在 client 的上行 outbox 里等 hub 回来。
 - 一段 post 发到 Slack 之后、段数记进库之前 hub 被杀，重启后这一段会再发一次。
-- 不停机升级还没有在 systemd 下真跑过，`MAINPID` 的交接只按 systemd 的文档写。报警检查记在内存里的「已报过」在交接后是空的，交接后还在的问题会再报一次。
+- 不停机升级还没有在 systemd 下真跑过，`MAINPID` 的交接只按 systemd 的文档写，升级用的 path 与 oneshot 单元也只按文档写。报警检查记在内存里的「已报过」在交接后是空的，交接后还在的问题会再报一次。
 - `open-thread` 开线程的第一条消息不标来源机器。

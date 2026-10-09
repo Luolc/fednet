@@ -6,5 +6,6 @@
   "dm": {"machine": "workstation"},
   "users": {"U0000000001": "maintainer"},
   "alerts": {"slack_down": "5m", "offline_queued": "10m"},
-  "approvals": {"channel": "C0000000003", "approvers": ["U0000000001"]}
+  "approvals": {"channel": "C0000000003", "approvers": ["U0000000001"]},
+  "upgrade": {"admins": ["U0000000001"], "auto": true}
 }

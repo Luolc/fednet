@@ -1,0 +1,19 @@
+# systemd path unit that watches for the hub's upgrade request. Copy it
+# and fednet-hub-upgrade.service to /etc/systemd/system/ and enable this
+# one. The hub (running as fednet) writes the request, a file naming the
+# release, in its runtime directory; this unit, as root, then starts the
+# service, which carries the request out and deletes it.
+
+[Unit]
+Description=watch for an upgrade request from the fednet hub
+
+[Path]
+PathExists=/run/fednet-hub/upgrade
+Unit=fednet-hub-upgrade.service
+# The service deletes the request first of all, so a request never starts
+# it twice; this only bounds a runaway.
+TriggerLimitIntervalSec=10min
+TriggerLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

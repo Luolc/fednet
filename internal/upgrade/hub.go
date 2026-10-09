@@ -31,6 +31,9 @@ const (
 	DefaultFetch = 2500 * time.Millisecond
 	// cardTTL is how long an upgrade card waits for its click.
 	cardTTL = 10 * time.Minute
+	// tellTimeout bounds the queuing of a notice from Connected, which
+	// runs on the connection's own goroutine.
+	tellTimeout = 10 * time.Second
 )
 
 // Hub decides the upgrades on the hub. Its Command and Click answer the
@@ -311,7 +314,7 @@ func (h *Hub) Connected(client, version string) {
 	if told {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), or(h.Poll, DefaultPoll))
+	ctx, cancel := context.WithTimeout(context.Background(), tellTimeout)
 	defer cancel()
 	if err := h.tell(ctx, client, h.Version); err != nil {
 		slog.Warn("upgrade: telling a client that connected with an old release", "client", client, "err", err)

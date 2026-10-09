@@ -3,6 +3,7 @@
 这个目录放部署 `fednet hub` 用的通用材料，随代码一起改：
 
 - [`fednet-hub.service`](fednet-hub.service)：systemd 单元模板，标了 `replace` 的几行按自己的机器改。
+- `fednet-hub-upgrade.path`、`fednet-hub-upgrade.service`、`fednet-client-upgrade.path`、`fednet-client-upgrade.service`：让 hub 和 client 自己升级的 root 单元，见下面「升级」一节。
 - [`hub.example.json`](hub.example.json)：hub 配置的示例，channel id、机器名、用户 id 都是示例值。字段的含义以 `fednet` 不带参数时打印的用法为准。
 
 机器本身怎么建、文件怎么装上去，不在这个仓里。
@@ -40,10 +41,13 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 | 报警的 incoming webhook URL | `-alert-webhook-file` | 只放在 hub 上。 |
 | 审批签名的私钥 | `-approval-key-file` | Ed25519，PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`)，只有所有者能读。只放在 hub 上；公钥分发到各台 agent 机器给 `fednet approval verify` 用。 |
 | 管理 socket | `-admin-socket` | 收 `fednet hub handoff`。单元模板放在 `RuntimeDirectory` 下。 |
+| 升级请求 | `-upgrade-request` | hub 要升级时写的文件，由 root 的升级单元监视，见「升级」一节。单元模板放在 `RuntimeDirectory` 下。 |
 
 前三个凭证文件各放一个凭证，首尾的空白 (包括末尾换行) 读的时候去掉；私钥文件按 PEM 整个读。fednet 只从这几个文件读凭证，不读环境变量，也不把凭证写进日志和错误信息；文件由部署方提供，单元模板用 `LoadCredential=` 把它们交给服务。
 
 两个 Slack 文件要么都给，要么都不给。都不给时 hub 只跑 client 用的 HTTP 服务，启动日志里有一句 `Slack not configured`，适合本地试跑。没给 Slack 时 webhook 文件不读，给了也不用；给了 Slack、没给 webhook 时，报警只进日志。
+
+`/fednet upgrade` 要在配置里的 `upgrade.admins` 写上谁能升级 (Slack 用户 id，每个都得在 `users` 名单上)；`upgrade.auto` 默认是 `true`。
 
 审批要同时有 Slack 和私钥，还要在配置里的 `approvals` 写上审批卡发到哪个 channel (`channel`) 和谁能批 (`approvers`，Slack 用户 id，每个都得在 `users` 名单上)。缺任何一样，agent 的 `request-approval` 直接被拒绝，不发卡、不签名；没给私钥时启动日志里有一句 `approvals are off`。
 
@@ -60,6 +64,25 @@ client 那边不需要 webhook：钩子放弃的消息由 client 经上行告诉
 ## 升级
 
 先升 client，再升 hub：新版本的 client 要能连旧版本的 hub，反过来不保证。hub 不给版本过旧的 client 派消息，消息留在它的 outbox 里，报警里会说明是哪台、跑的什么版本。
+
+### 从 Slack 升级，或者让 hub 自己升
+
+hub 和 client 都不改自己的二进制。要升级时它们只写一个升级请求文件，内容是目标版本 (`vX.Y.Z` 加换行)；每台机器上一对 root 的 systemd 单元监视这个文件：path 单元看到文件就起 oneshot 单元，oneshot 跑 `fednet upgrade`，它先把请求文件删掉，再经 socket 问正在跑的进程是什么版本，目标不比它新就拒绝；然后从 GitHub release 下载本机架构的二进制和 `SHA256SUMS`，校验通过才用一次 rename 换掉 `/usr/local/bin/fednet`，最后经同一个 socket 交接 (hub 是管理 socket，client 是本机 socket)。下载不对、校验不过都不换二进制，原因在 `journalctl -u fednet-hub-upgrade` (client 上是 `fednet-client-upgrade`) 里。
+
+每台机器要装的东西：
+
+- hub 机器：[`fednet-hub-upgrade.path`](fednet-hub-upgrade.path) 和 [`fednet-hub-upgrade.service`](fednet-hub-upgrade.service)，照抄到 `/etc/systemd/system/`，`systemctl enable --now fednet-hub-upgrade.path`。hub 单元模板已经带了 `-upgrade-request %t/fednet-hub/upgrade`，和 path 单元监视的是同一个文件。
+- 每台 agent 机器：[`fednet-client-upgrade.path`](fednet-client-upgrade.path) 和 [`fednet-client-upgrade.service`](fednet-client-upgrade.service)，标了 `replace` 的几行改成本机的路径：请求文件 (client 的 `-upgrade-request`，要放在 client 用户能写的目录里)、二进制、client 的 socket (`-socket`)；`ReadWritePaths` 要盖住二进制和请求文件所在的目录。client 启动参数加上 `-upgrade-request <同一个文件>`，没有这个参数时 hub 的升级通知会被丢掉、记一条日志。
+- 首次安装仍按「下载二进制」一节手工装；装好之后版本就由 fednet 自己管，部署工具不要再把二进制钉回某个版本，否则每次重新配置都会把升过的版本降回去。
+
+升级怎么触发，两条路都走上面这套单元：
+
+- Slack 里的 slash command `/fednet`。正式 app 的 manifest 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
+- hub 每小时查一次最新的 release，有新的就自己开始升级；配置里 `upgrade.auto` 设成 `false` 就只留手动。hub 跑的不是发布版 (`fednet version` 打出 `dev`) 时不查，也不能从 Slack 升级。
+
+一次升级的顺序：hub 先给每台在线、版本不是目标版本的 client 发升级通知，client 程序自己写请求文件 (不经过 agent)；hub 等它们都重连并报上新版本 (默认最多等十分钟)，全部到齐才写自己的请求文件、换成新进程。有一台失败或超时，hub 不升，汇总里列出是哪台，处理好了再发一次 `/fednet upgrade`。离线的 client 不等，它下次连上来时 hub 发现版本比自己旧，再给它补发一次通知。开始、hub 开始升级、最后的汇总都作为普通消息发到报警 webhook 对应的 channel，没配 webhook 就只进日志。
+
+### 手工升级
 
 在 hub 机器上，按上面「下载二进制」一节把新的二进制放到 `/usr/local/bin/fednet`，然后：
 

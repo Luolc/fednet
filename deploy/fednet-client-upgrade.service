@@ -1,0 +1,42 @@
+# systemd oneshot unit that upgrades a client, started by
+# fednet-client-upgrade.path; what it does is in fednet-hub-upgrade.service,
+# with the client's socket in place of the hub's admin socket. Replace the
+# lines marked "replace" with the machine's paths; ReadWritePaths must
+# cover the binary's directory and the request's.
+
+[Unit]
+Description=upgrade the fednet client to the requested release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# replace: the request file (the client's -upgrade-request), the binary
+# the client runs, and the client's socket (its -socket).
+ExecStart=/usr/local/bin/fednet upgrade \
+    -request /run/fednet-client/upgrade \
+    -binary /usr/local/bin/fednet \
+    -socket /run/fednet-client/fednet.sock
+
+UMask=0022
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+# replace: the binary's directory and the request's.
+ReadWritePaths=/usr/local/bin /run/fednet-client
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
