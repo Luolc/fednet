@@ -177,8 +177,7 @@ func TestGetOnce(t *testing.T) {
 }
 
 // A file whose own name looks like one being written is a file like any
-// other: it is found in the cache and survives pruning. Regression: the
-// files being written used to share the directory and a prefix.
+// other: it is found in the cache and survives pruning.
 func TestGetNameLikeATemporaryFile(t *testing.T) {
 	h := newHub()
 	h.add("F1", tmpPrefix+"report.txt", []byte("report"))
