@@ -36,7 +36,7 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 
 入站在 [`internal/inbound`](../internal/inbound)。hub 用 Socket Mode 收 `message` 事件：每个事件先过滤，只留用户名单上的人发的、不带 `bot_id`、子类型是人说的话的 (普通消息、`/me`、带文件的消息、广播到 channel 的回复)；编辑、删除、有人加入、改 topic 这些子类型都不是；留下的在一个事务里记进收过的消息表并交给路由写进 outbox，事务提交了才向 Slack ack，所以 hub 死在 ack 之前 Slack 会重投，重投的按事件 id、按 channel 加 ts 都去重，只交一次。channel 里的顶层消息是新线程，连同 channel 的 purpose 一起交下去 (purpose 读不到就不带，agent 可以自己再问)；线程里的是回复；私信里每条顶层消息都算一个新线程，不带 purpose，之后在它下面的回复照归属走。hub 不认识的线程里来了回复 (断线那一刻在路上的两条消息，Slack 重投时次序不定)，先从 Slack 读这个线程的第一条，它在补拉的回看窗口里就先把它当新线程收进来，再处理回复；线程还是没有归属的回复记下、不送。新线程的 channel 没配默认机器时不送，hub 在同一个事务里往自己的 inbox 放一条 `post`，由出站以 `hub` 的名义发到线程里：「没有机器接这个 channel」，发不出去由出站重试。上传的文件只把文件名和链接列在正文末尾，不下载。送给 client 的 payload 类型是 `message`，带线程 key、正文、发消息的人的 Slack 用户 id、消息的 ts，新线程再带 channel 的 purpose。连接每次建立时，先停掉上一条连接还在跑的补拉，再定下这次补拉从哪开始 (最后看到的消息；有没做完的补拉就从它那里)，然后才处理这条连接的消息，所以实时消息先到也推不走补拉的起点；一次补拉只在它开始之后没有新连接时才清起点，上一条连接的补拉做完也清不掉新连接的；补拉在后台跑：对 bot 所在的每个 channel 和私信会话，从起点之后、最多回看 24 小时，读顶层消息的历史和每个有归属的线程的回复，走和实时收到的同一条路、同一套去重；起点全部读完才清掉，所以读到一半失败的补拉下次从同一处重来，hub 重启也从持久化的位置继续；还没看到过任何消息时不补。补拉失败按固定间隔重试。连接状态 (连着还是断着、从什么时候起、断了多久) 可以查，报警要的 `SlackLink` 就是它。每处理完一条消息，入站唤醒下行连接，并让出站立刻看一次 inbox。Socket Mode 的传输层是 `slack-go` 的 `socketmode`，它自己重连；凭证不对时退出。
 
-认证在 [`internal/auth`](../internal/auth)。client 自己生成 256 bit 的随机凭证，存在本机一个只有所有者能读 (0600) 的文件里，连同 client id 一起；hub 只登记它的 SHA-256。每个请求带 `Authorization: Bearer <凭证>` 和 `Fednet-Version`，hub 算哈希、与登记表常数时间比对，并记下版本；未登记、已退役、凭证不对的一律回 401，正文固定是 `unauthorized`，原因只进 hub 的日志，凭证不进日志、错误信息和任何命令的输出。登记 (`fednet hub register`) 写入 id 与哈希，重复登记替换哈希并解除退役；退役 (`fednet hub revoke`) 让这台 client 的凭证失效，已经建立的连接要到断开才生效。Tailscale `WhoIs` 核对来源节点还没有接。
+认证在 [`internal/auth`](../internal/auth)。client 自己生成 256 bit 的随机凭证，存在本机一个只有所有者能读 (0600) 的文件里，连同 client id 一起；hub 只登记它的 SHA-256。每个请求带 `Authorization: Bearer <凭证>` 和 `Fednet-Version`，hub 算哈希、与登记表常数时间比对，并记下版本；未登记、已退役、凭证不对的一律回 401，正文固定是 `unauthorized`，原因只进 hub 的日志，凭证不进日志、错误信息和任何命令的输出。登记 (`fednet hub register`) 写入 id 与哈希，重复登记替换哈希并解除退役；退役 (`fednet hub revoke`) 让这台 client 的凭证失效。这两个命令是另起的进程，和 hub 只共用库文件，所以 hub 对每条开着的下行连接每隔一个心跳间隔 (默认 10 秒，和 client 的默认心跳间隔相同) 按握手时的请求头重新认一次，认不过就断开；上行和请求本来就每次都认。Tailscale `WhoIs` 核对来源节点还没有接。
 
 本机 socket 在 [`internal/local`](../internal/local)。agent 拿不到 client 的凭证，只能经这个 socket 把请求交给常驻的 client 进程。socket 的路径由参数给出；不给组时权限是 0600，只有 client 所在的 Unix 用户能连，给了组 (`-socket-group`) 时是 0660，组里的用户也能连。socket 先建在一个只有 client 用户能进的临时目录里，权限和组设好后再改名到给定的路径。一个路径同一时间只归一个 client：启动时先对 socket 旁边的 `<socket>.lock` 加排他的 `flock`，拿不到就不启动，拿到后一直持有到进程退出 (进程死了由内核释放)。检查和改名都在持锁之后，所以路径上已有的 socket 一定是旧进程留下的，直接替换；路径上是别的文件时不启动。一个连接只承载一个请求：调用方写一个 JSON 请求，按 `cmd` 字段分派，client 回一个 JSON 回应后关闭连接。`post` 由 client 自己回答：把消息写进 outbox 就回 `msg_id`，不等 hub，hub 连不上也照样排队。其余命令由 client 经请求通道转给 hub，把 hub 的回答或拒绝的原因带回来，hub 的那一段另有一个比 socket 请求短的超时。`fednet client` 的这几条命令只连 socket，不打开数据库；退出码是 0 成功、2 用法错误或请求不合法、3 没有权限连 socket 或 hub 不允许、4 连不上 client 或 hub，其它失败 (例如线程不存在) 是 1。client 与 hub 之间的 payload 是一个 JSON 对象，`type` 字段说明它是什么，格式在 [`internal/payload`](../internal/payload)，两端共用；post 的 payload 带线程 key 和正文。
 
@@ -67,56 +67,57 @@ hub 怎么回答请求在 [`internal/hubapi`](../internal/hubapi)，请求和回
 15. 凭证文件只有所有者能读，已有的不会被覆盖，被别人能读的凭证文件不用。[`TestCredentialFile`](../internal/auth/auth_test.go)
 16. 退役只打标记不删记录；重新登记替换哈希、解除退役、保留版本。[`TestRegistry`](../internal/store/store_test.go)
 17. 登记之后 client 连上 hub，hub 在它连上之前排队的消息送到它的 inbox，hub 记下它报的版本。[`TestHubAndClient`](../cmd/fednet/main_test.go)
+18. 下行连接开着的时候退役这台 client，或者给它换了凭证，hub 在一个心跳间隔内断开这条连接，旧凭证再连、再发上行都回 401，新凭证能连上并收到消息；没有变化的 client 不受影响。[`TestRegistryChangeDropsConnection`](../internal/auth/auth_test.go)
 
 本机 socket：
 
-18. `post` 写进 client 的 outbox 就返回 `msg_id`；hub 连不上时照样返回，连上后送到 hub。[`TestPost`](../internal/local/local_test.go)、[`TestPostWhileHubDown`](../internal/local/local_test.go)
-19. socket 不给组时只有 client 的用户能连 (0600)，给了组时组里的用户也能连 (0660)。同一个路径同一时间只归一个 client：已有 client 持锁时 (包括它还没发布 socket 的时候) 第二个 client 起不来，几个 client 同时启动只有一个成功，连接都进它；持锁的 client 关闭后新 client 能接手；旧 socket 被替换，别的文件不被替换。[`TestListen`](../internal/local/local_test.go)、[`TestListenWhileAnotherIsStarting`](../internal/local/local_test.go)、[`TestListenConcurrent`](../internal/local/local_test.go)、[`TestListenRefusesAFile`](../internal/local/local_test.go)
-20. agent 经 `fednet client post` 发的消息，hub 的 inbox 收到时 `type` 是 `post`，线程 key 和正文不变。[`TestHubAndClient`](../cmd/fednet/main_test.go)
-21. `fednet client post` 用法错误退 2，没有权限连 socket 退 3，连不上 client 退 4。[`TestRun`](../cmd/fednet/main_test.go)、[`TestPostDenied`](../cmd/fednet/main_test.go)
+19. `post` 写进 client 的 outbox 就返回 `msg_id`；hub 连不上时照样返回，连上后送到 hub。[`TestPost`](../internal/local/local_test.go)、[`TestPostWhileHubDown`](../internal/local/local_test.go)
+20. socket 不给组时只有 client 的用户能连 (0600)，给了组时组里的用户也能连 (0660)。同一个路径同一时间只归一个 client：已有 client 持锁时 (包括它还没发布 socket 的时候) 第二个 client 起不来，几个 client 同时启动只有一个成功，连接都进它；持锁的 client 关闭后新 client 能接手；旧 socket 被替换，别的文件不被替换。[`TestListen`](../internal/local/local_test.go)、[`TestListenWhileAnotherIsStarting`](../internal/local/local_test.go)、[`TestListenConcurrent`](../internal/local/local_test.go)、[`TestListenRefusesAFile`](../internal/local/local_test.go)
+21. agent 经 `fednet client post` 发的消息，hub 的 inbox 收到时 `type` 是 `post`，线程 key 和正文不变。[`TestHubAndClient`](../cmd/fednet/main_test.go)
+22. `fednet client post` 用法错误退 2，没有权限连 socket 退 3，连不上 client 退 4。[`TestRun`](../cmd/fednet/main_test.go)、[`TestPostDenied`](../cmd/fednet/main_test.go)
 
 请求通道：
 
-22. 请求不排队：hub 连不上或者不回答，请求在超时之内失败，client 的 outbox 里不留下东西。[`TestRequestUnreachable`](../internal/link/link_test.go)、[`TestAskWhileHubDown`](../internal/local/local_test.go)
-23. hub 拒绝的原因原样回到 client，其它失败的原因不出 hub；hub 不认凭证的请求算不允许。[`TestRequest`](../internal/link/link_test.go)、[`TestRequestUnauthorized`](../internal/link/link_test.go)
-24. `adopt` 只改已有归属的线程，改成发请求的 client；`hub reassign` 把一台 client 的线程全部改给另一台。`open-thread` 开的线程归调用方，配置不允许调用方的 channel 不开，也不发到 Slack；已有归属的线程不能再登记；`threads` 只列调用方的线程。`dm` 只发给用户名单上的人，名单之外的不发到 Slack；`users` 按 id 排序列出名单。[`TestAdopt`](../internal/hubapi/hubapi_test.go)、[`TestOpenThread`](../internal/hubapi/hubapi_test.go)、[`TestThreads`](../internal/hubapi/hubapi_test.go)、[`TestDM`](../internal/hubapi/hubapi_test.go)、[`TestUsers`](../internal/hubapi/hubapi_test.go)、[`TestClaimAndThreads`](../internal/store/store_test.go)、[`TestHubRequests`](../cmd/fednet/request_test.go)
-25. agent 经 socket 发的 `read-thread`、`open-thread`、`threads`、`channel-context`、`adopt`、`users`、`dm` 走真的认证到 hub，拿回 hub 的回答；线程 key 不合法或 `dm` 缺用户退 2，线程不存在退 1，在配置不允许的 channel 开线程、给名单之外的人发私信、client 已退役都退 3，hub 停了退 4。[`TestHubRequests`](../cmd/fednet/request_test.go)、[`TestAsk`](../internal/local/local_test.go)
+23. 请求不排队：hub 连不上或者不回答，请求在超时之内失败，client 的 outbox 里不留下东西。[`TestRequestUnreachable`](../internal/link/link_test.go)、[`TestAskWhileHubDown`](../internal/local/local_test.go)
+24. hub 拒绝的原因原样回到 client，其它失败的原因不出 hub；hub 不认凭证的请求算不允许。[`TestRequest`](../internal/link/link_test.go)、[`TestRequestUnauthorized`](../internal/link/link_test.go)
+25. `adopt` 只改已有归属的线程，改成发请求的 client；`hub reassign` 把一台 client 的线程全部改给另一台。`open-thread` 开的线程归调用方，配置不允许调用方的 channel 不开，也不发到 Slack；已有归属的线程不能再登记；`threads` 只列调用方的线程。`dm` 只发给用户名单上的人，名单之外的不发到 Slack；`users` 按 id 排序列出名单。[`TestAdopt`](../internal/hubapi/hubapi_test.go)、[`TestOpenThread`](../internal/hubapi/hubapi_test.go)、[`TestThreads`](../internal/hubapi/hubapi_test.go)、[`TestDM`](../internal/hubapi/hubapi_test.go)、[`TestUsers`](../internal/hubapi/hubapi_test.go)、[`TestClaimAndThreads`](../internal/store/store_test.go)、[`TestHubRequests`](../cmd/fednet/request_test.go)
+26. agent 经 socket 发的 `read-thread`、`open-thread`、`threads`、`channel-context`、`adopt`、`users`、`dm` 走真的认证到 hub，拿回 hub 的回答；线程 key 不合法或 `dm` 缺用户退 2，线程不存在退 1，在配置不允许的 channel 开线程、给名单之外的人发私信、client 已退役都退 3，hub 停了退 4。[`TestHubRequests`](../cmd/fednet/request_test.go)、[`TestAsk`](../internal/local/local_test.go)
 
 钩子：
 
-26. 在 client 存活期间，每条进 inbox 的消息钩子至多成功执行一次：重复下发的不再执行，成功过的不再执行，结果写不进库时留在内存里补写、不重跑。client 死在钩子退出之后、写库之前的那条会再执行一次。[`TestRunsOncePerMessage`](../internal/hook/hook_test.go)、[`TestRetriesUntilSuccess`](../internal/hook/hook_test.go)、[`TestOutcomeKeptWhenStoreFails`](../internal/hook/hook_test.go)、[`TestHubAndClient`](../cmd/fednet/main_test.go)
-27. 失败或超时的消息留在 inbox，按逐次加倍、有上限的间隔重试；到上限转进死信，不删、不再自动重试，重复下发的也不再执行。重试记录或死信写不进库时同样不重跑，上限不会被突破；钩子没起来不算尝试。[`TestRetriesUntilSuccess`](../internal/hook/hook_test.go)、[`TestDeadLetterAtLimit`](../internal/hook/hook_test.go)、[`TestOutcomeKeptWhenStoreFails`](../internal/hook/hook_test.go)、[`TestNotRunIsNotAnAttempt`](../internal/hook/hook_test.go)、[`TestClientInboxRetryAndDeadLetter`](../internal/store/store_test.go)
-28. 钩子退出后，不论成功、失败还是超时，它的整个进程组都被杀掉并回收，不留残留进程，僵尸也算残留；退出 0 但留下进程握着 stderr 的算失败。[`TestTimeoutKillsProcessGroup`](../internal/hook/hook_test.go)、[`TestLeftoverProcessesAreKilled`](../internal/hook/hook_test.go)、[`TestResidueCountsZombies`](../internal/hook/hook_test.go)
-29. 钩子的环境变量只有显式给出的那些，client 自己的环境不带过去。[`TestEnvIsOnlyWhatIsGiven`](../internal/hook/hook_test.go)、[`TestHubAndClient`](../cmd/fednet/main_test.go)
-30. client 重启后未交付的消息继续执行，尝试次数保留；被关停打断的那次不计。[`TestResumesAfterRestart`](../internal/hook/hook_test.go)、[`TestShutdownDoesNotCountAsAttempt`](../internal/hook/hook_test.go)
-31. 已交付的行在保留期内仍去重，过了保留期才清理。[`TestClientInboxPrune`](../internal/store/store_test.go)
+27. 在 client 存活期间，每条进 inbox 的消息钩子至多成功执行一次：重复下发的不再执行，成功过的不再执行，结果写不进库时留在内存里补写、不重跑。client 死在钩子退出之后、写库之前的那条会再执行一次。[`TestRunsOncePerMessage`](../internal/hook/hook_test.go)、[`TestRetriesUntilSuccess`](../internal/hook/hook_test.go)、[`TestOutcomeKeptWhenStoreFails`](../internal/hook/hook_test.go)、[`TestHubAndClient`](../cmd/fednet/main_test.go)
+28. 失败或超时的消息留在 inbox，按逐次加倍、有上限的间隔重试；到上限转进死信，不删、不再自动重试，重复下发的也不再执行。重试记录或死信写不进库时同样不重跑，上限不会被突破；钩子没起来不算尝试。[`TestRetriesUntilSuccess`](../internal/hook/hook_test.go)、[`TestDeadLetterAtLimit`](../internal/hook/hook_test.go)、[`TestOutcomeKeptWhenStoreFails`](../internal/hook/hook_test.go)、[`TestNotRunIsNotAnAttempt`](../internal/hook/hook_test.go)、[`TestClientInboxRetryAndDeadLetter`](../internal/store/store_test.go)
+29. 钩子退出后，不论成功、失败还是超时，它的整个进程组都被杀掉并回收，不留残留进程，僵尸也算残留；退出 0 但留下进程握着 stderr 的算失败。[`TestTimeoutKillsProcessGroup`](../internal/hook/hook_test.go)、[`TestLeftoverProcessesAreKilled`](../internal/hook/hook_test.go)、[`TestResidueCountsZombies`](../internal/hook/hook_test.go)
+30. 钩子的环境变量只有显式给出的那些，client 自己的环境不带过去。[`TestEnvIsOnlyWhatIsGiven`](../internal/hook/hook_test.go)、[`TestHubAndClient`](../cmd/fednet/main_test.go)
+31. client 重启后未交付的消息继续执行，尝试次数保留；被关停打断的那次不计。[`TestResumesAfterRestart`](../internal/hook/hook_test.go)、[`TestShutdownDoesNotCountAsAttempt`](../internal/hook/hook_test.go)
+32. 已交付的行在保留期内仍去重，过了保留期才清理。[`TestClientInboxPrune`](../internal/store/store_test.go)
 
 出站与报警：
 
-32. post 发到 Slack 之后才标记已交付；发不出去的留在 inbox，它后面的不抢先发，重试时已经发出的段落不再发。[`TestFailedPostIsKeptAndRetried`](../internal/outbound/outbound_test.go)、[`TestRun`](../internal/outbound/outbound_test.go)
-33. 每条 post 发在它的线程里，开头标出来源机器；超长的拆成同一线程里的连续几条，顺序不变。永远发不出去的报警后标记已交付，不挡后面的。[`TestPostNamesTheMachine`](../internal/outbound/outbound_test.go)、[`TestLongPostIsSplit`](../internal/outbound/outbound_test.go)、[`TestSplit`](../internal/outbound/outbound_test.go)、[`TestPermanentFailureIsAlertedAndSkipped`](../internal/outbound/outbound_test.go)、[`TestWebPostReplyAndDelete`](../internal/slack/web_test.go)
-34. `open-thread` 登记归属失败时，刚发的消息被删掉，调用方收到错误。[`TestOpenThreadUndoneWhenClaimFails`](../internal/hubapi/hubapi_test.go)
-35. 每条死信报一次警，带 `msg_id` 和原因，由 hub 以那台 client 的名义报；hub 发不出去的 client 报警留到下一轮再发，不挡 post。hub 与 Slack 断开超过阈值报一次，恢复后再断再报；报警发不出去的下一轮再试。client 离线且有消息排队超过阈值时报一次警，在每个受影响的线程里说一声，回来后再离线再报。[`TestDeadLetterAlertsOnce`](../internal/hook/hook_test.go)、[`TestClientAlertIsRelayed`](../internal/outbound/outbound_test.go)、[`TestHubWithSlack`](../cmd/fednet/slack_test.go)、[`TestSlackDown`](../internal/watch/watch_test.go)、[`TestFailedAlertIsRetried`](../internal/watch/watch_test.go)、[`TestOfflineWithQueue`](../internal/watch/watch_test.go)
-36. webhook URL 不进报警的错误和日志。[`TestSend`](../internal/alert/alert_test.go)、[`TestHubWithSlack`](../cmd/fednet/slack_test.go)
+33. post 发到 Slack 之后才标记已交付；发不出去的留在 inbox，它后面的不抢先发，重试时已经发出的段落不再发。[`TestFailedPostIsKeptAndRetried`](../internal/outbound/outbound_test.go)、[`TestRun`](../internal/outbound/outbound_test.go)
+34. 每条 post 发在它的线程里，开头标出来源机器；超长的拆成同一线程里的连续几条，顺序不变。永远发不出去的报警后标记已交付，不挡后面的。[`TestPostNamesTheMachine`](../internal/outbound/outbound_test.go)、[`TestLongPostIsSplit`](../internal/outbound/outbound_test.go)、[`TestSplit`](../internal/outbound/outbound_test.go)、[`TestPermanentFailureIsAlertedAndSkipped`](../internal/outbound/outbound_test.go)、[`TestWebPostReplyAndDelete`](../internal/slack/web_test.go)
+35. `open-thread` 登记归属失败时，刚发的消息被删掉，调用方收到错误。[`TestOpenThreadUndoneWhenClaimFails`](../internal/hubapi/hubapi_test.go)
+36. 每条死信报一次警，带 `msg_id` 和原因，由 hub 以那台 client 的名义报；hub 发不出去的 client 报警留到下一轮再发，不挡 post。hub 与 Slack 断开超过阈值报一次，恢复后再断再报；报警发不出去的下一轮再试。client 离线且有消息排队超过阈值时报一次警，在每个受影响的线程里说一声，回来后再离线再报。[`TestDeadLetterAlertsOnce`](../internal/hook/hook_test.go)、[`TestClientAlertIsRelayed`](../internal/outbound/outbound_test.go)、[`TestHubWithSlack`](../cmd/fednet/slack_test.go)、[`TestSlackDown`](../internal/watch/watch_test.go)、[`TestFailedAlertIsRetried`](../internal/watch/watch_test.go)、[`TestOfflineWithQueue`](../internal/watch/watch_test.go)
+37. webhook URL 不进报警的错误和日志。[`TestSend`](../internal/alert/alert_test.go)、[`TestHubWithSlack`](../cmd/fednet/slack_test.go)
 
 入站：
 
-37. 同一条 Slack 消息只交一次：同一个事件重投、同一条消息由另一个事件带来、或者补拉时又读到，都只入库一次、只写一次 outbox。[`TestHandleDedupsEvents`](../internal/inbound/inbound_test.go)、[`TestReceiveSlack`](../internal/store/store_test.go)
-38. 先落盘再 ack：入库、登记归属和写 outbox 在同一个事务里，事务提交了传输层才 ack，没提交就不 ack、什么都不留下；同一个事件再来照常入库，重投的 ack 但不再交。[`TestRunAcks`](../internal/inbound/inbound_test.go)、[`TestHandleFailsWhenStoreFails`](../internal/inbound/inbound_test.go)、[`TestRouteInTransaction`](../internal/route/route_test.go)
-39. 只放行用户名单上的人说的话，`/me` 也算；带 `bot_id` 的、编辑、删除、有人加入、改 topic 这些子类型都不交、也不入库。[`TestHandleFilters`](../internal/inbound/inbound_test.go)、[`TestHandleRoutes`](../internal/inbound/inbound_test.go)
-40. channel 里的顶层消息送 channel 的默认机器并登记归属，带 channel 的 purpose，读不到就不带；回复送归属机器，不带；私信里每条顶层消息都是新线程，送私信的默认机器；上传的文件只把文件名和链接列在正文末尾。[`TestHandleRoutes`](../internal/inbound/inbound_test.go)、[`TestHandleWithoutPurpose`](../internal/inbound/inbound_test.go)、[`TestHandleFiles`](../internal/inbound/inbound_test.go)、[`TestRouteDM`](../internal/route/route_test.go)
-41. 没配默认机器的 channel 或私信里的新线程不送、不登记归属，hub 的那句话作为 `post` 和记录同一个事务进 inbox，由出站发到线程里；重投不重复放；之后在那个线程里的回复不送。[`TestHandleNoMachineTellsThread`](../internal/inbound/inbound_test.go)
-42. 断线期间的消息重连后补到，顶层消息和有归属的线程里的回复都算，和实时收到的不重复，重连后实时消息先到也不漏；回复先于它的线程首条到达时，先收首条再收回复；早于回看窗口的不补；补拉没做完时下次从同一处重来，上一条连接的补拉这时做完也清不掉新连接的起点，hub 重启后从持久化的位置继续；还没看到过任何消息时不补。[`TestBackfill`](../internal/inbound/inbound_test.go)、[`TestBackfillOfOldConnectionKeepsNewStart`](../internal/inbound/inbound_test.go)、[`TestHandleReplyBeforeRoot`](../internal/inbound/inbound_test.go)、[`TestBackfillWindow`](../internal/inbound/inbound_test.go)、[`TestBackfillAfterRestart`](../internal/inbound/inbound_test.go)、[`TestBackfillRetriesFromWhereItFailed`](../internal/inbound/inbound_test.go)、[`TestRunAcks`](../internal/inbound/inbound_test.go)
-43. 连接状态报的是连着还是断着、这个状态从什么时候起，以及断了多久：连着时是 0，从第一次尝试连接起算，还没尝试过也是 0；重复报同一状态不改时间；传输层连上、断开都反映进来。[`TestStatus`](../internal/inbound/inbound_test.go)、[`TestRunAcks`](../internal/inbound/inbound_test.go)
+38. 同一条 Slack 消息只交一次：同一个事件重投、同一条消息由另一个事件带来、或者补拉时又读到，都只入库一次、只写一次 outbox。[`TestHandleDedupsEvents`](../internal/inbound/inbound_test.go)、[`TestReceiveSlack`](../internal/store/store_test.go)
+39. 先落盘再 ack：入库、登记归属和写 outbox 在同一个事务里，事务提交了传输层才 ack，没提交就不 ack、什么都不留下；同一个事件再来照常入库，重投的 ack 但不再交。[`TestRunAcks`](../internal/inbound/inbound_test.go)、[`TestHandleFailsWhenStoreFails`](../internal/inbound/inbound_test.go)、[`TestRouteInTransaction`](../internal/route/route_test.go)
+40. 只放行用户名单上的人说的话，`/me` 也算；带 `bot_id` 的、编辑、删除、有人加入、改 topic 这些子类型都不交、也不入库。[`TestHandleFilters`](../internal/inbound/inbound_test.go)、[`TestHandleRoutes`](../internal/inbound/inbound_test.go)
+41. channel 里的顶层消息送 channel 的默认机器并登记归属，带 channel 的 purpose，读不到就不带；回复送归属机器，不带；私信里每条顶层消息都是新线程，送私信的默认机器；上传的文件只把文件名和链接列在正文末尾。[`TestHandleRoutes`](../internal/inbound/inbound_test.go)、[`TestHandleWithoutPurpose`](../internal/inbound/inbound_test.go)、[`TestHandleFiles`](../internal/inbound/inbound_test.go)、[`TestRouteDM`](../internal/route/route_test.go)
+42. 没配默认机器的 channel 或私信里的新线程不送、不登记归属，hub 的那句话作为 `post` 和记录同一个事务进 inbox，由出站发到线程里；重投不重复放；之后在那个线程里的回复不送。[`TestHandleNoMachineTellsThread`](../internal/inbound/inbound_test.go)
+43. 断线期间的消息重连后补到，顶层消息和有归属的线程里的回复都算，和实时收到的不重复，重连后实时消息先到也不漏；回复先于它的线程首条到达时，先收首条再收回复；早于回看窗口的不补；补拉没做完时下次从同一处重来，上一条连接的补拉这时做完也清不掉新连接的起点，hub 重启后从持久化的位置继续；还没看到过任何消息时不补。[`TestBackfill`](../internal/inbound/inbound_test.go)、[`TestBackfillOfOldConnectionKeepsNewStart`](../internal/inbound/inbound_test.go)、[`TestHandleReplyBeforeRoot`](../internal/inbound/inbound_test.go)、[`TestBackfillWindow`](../internal/inbound/inbound_test.go)、[`TestBackfillAfterRestart`](../internal/inbound/inbound_test.go)、[`TestBackfillRetriesFromWhereItFailed`](../internal/inbound/inbound_test.go)、[`TestRunAcks`](../internal/inbound/inbound_test.go)
+44. 连接状态报的是连着还是断着、这个状态从什么时候起，以及断了多久：连着时是 0，从第一次尝试连接起算，还没尝试过也是 0；重复报同一状态不改时间；传输层连上、断开都反映进来。[`TestStatus`](../internal/inbound/inbound_test.go)、[`TestRunAcks`](../internal/inbound/inbound_test.go)
 
 接线：
 
-44. hub 的 Slack token 和 webhook URL 从文件读，去掉首尾空白；它们和 client 的凭证都不进任何日志和错误信息。Slack 拒绝 token 时 hub 退出 1。[`TestHubWithSlack`](../cmd/fednet/slack_test.go)、[`TestHubStopsWhenSlackRejectsToken`](../cmd/fednet/slack_test.go)、[`TestRun`](../cmd/fednet/main_test.go)
-45. 给了 Slack 时，人在 Slack 里发的消息送到已经连着的 client，不等它重连；agent 发的 post 发到线程里、标出机器，不等出站的轮询。没给 Slack 时 hub 只跑 HTTP 服务，post 留在 inbox。[`TestHubWithSlack`](../cmd/fednet/slack_test.go)、[`TestWakeAllPushesStoreQueued`](../internal/link/wake_test.go)、[`TestUplinkedAfterStored`](../internal/link/wake_test.go)、[`TestHubAndClient`](../cmd/fednet/main_test.go)
+45. hub 的 Slack token 和 webhook URL 从文件读，去掉首尾空白；它们和 client 的凭证都不进任何日志和错误信息。Slack 拒绝 token 时 hub 退出 1。[`TestHubWithSlack`](../cmd/fednet/slack_test.go)、[`TestHubStopsWhenSlackRejectsToken`](../cmd/fednet/slack_test.go)、[`TestRun`](../cmd/fednet/main_test.go)
+46. 给了 Slack 时，人在 Slack 里发的消息送到已经连着的 client，不等它重连；agent 发的 post 发到线程里、标出机器，不等出站的轮询。没给 Slack 时 hub 只跑 HTTP 服务，post 留在 inbox。[`TestHubWithSlack`](../cmd/fednet/slack_test.go)、[`TestWakeAllPushesStoreQueued`](../internal/link/wake_test.go)、[`TestUplinkedAfterStored`](../internal/link/wake_test.go)、[`TestHubAndClient`](../cmd/fednet/main_test.go)
 
 仓库层面：
 
-46. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
+47. 这份文件不超过 200 行。[`design-length.test.sh`](../.github/scripts/design-length.test.sh)
 
 ## 4. 接口
 
