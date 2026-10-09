@@ -23,6 +23,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/auth"
+	"github.com/Luolc/fednet/internal/handoff"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/inbound"
@@ -30,19 +31,34 @@ import (
 	"github.com/Luolc/fednet/internal/local"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/release"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	"github.com/Luolc/fednet/internal/watch"
 )
 
-// version is set at build time with -ldflags "-X main.version=...".
+// version is set at build time with -ldflags "-X main.version=v...".
 var version = "dev"
+
+// minClientVersion is the oldest release whose clients this hub serves;
+// raise it when the hub stops understanding what older clients send. A
+// client of the hub's own version is always served, "dev" included.
+const minClientVersion = "v0.1.0"
+
+// acceptVersion is link.Hub.AcceptVersion and watch.Watch.AcceptVersion.
+func acceptVersion(client string) error {
+	return release.Compatible(minClientVersion, client, version)
+}
+
+// newProcess makes the handoff.Process a hub or client runs as; tests that
+// run several in one process use handoff.None.
+var newProcess = func(timeout time.Duration) (handoff.Process, error) { return handoff.New(timeout) }
 
 const usage = `usage: fednet <command> [flags]
 
 commands:
-  hub -listen ADDR -db PATH [-config PATH]
+  hub -listen ADDR -db PATH [-config PATH] [-admin-socket PATH] [-handoff-timeout D]
       [-slack-app-token-file PATH -slack-bot-token-file PATH] [-alert-webhook-file PATH]
         run the hub; with the two Slack token files it also takes in the
         messages people post in Slack and posts the clients' posts there,
@@ -55,6 +71,11 @@ commands:
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"}}
+        the admin socket takes hub handoff; D is how long a new process may
+        take to become ready at a handoff
+  hub handoff -socket PATH [-json]
+        replace the running hub with a new process of the binary now at its
+        path, without a gap; prints the versions handed off from and to
   hub register -db PATH CLIENT-ID HASH
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
@@ -62,11 +83,14 @@ commands:
   hub reassign -db PATH FROM-ID TO-ID
         move every thread FROM-ID owns to TO-ID; prints how many moved
   client -hub URL -db PATH -credential PATH -socket PATH [-socket-group GROUP]
-         [-hook-timeout D] [-hook-env NAME]... [COMMAND [ARG]...]
+         [-hook-timeout D] [-hook-env NAME]... [-handoff-timeout D] [COMMAND [ARG]...]
         run a client on an agent machine; agents reach it through the socket,
         which only this user and the members of GROUP can connect to; COMMAND
         runs for each message received, with the event file as its last
         argument, in an environment of just PATH, HOME and each -hook-env NAME
+  client handoff -socket PATH [-json]
+        replace the running client with a new process of the binary now at
+        its path, without a gap; prints the versions handed off from and to
   client post -socket PATH -thread KEY [-json] [--] TEXT
         post TEXT to a thread; prints the msg_id once the client has queued it;
         put -- before a TEXT that starts with -
@@ -190,6 +214,8 @@ func hubCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return hubRevoke(ctx, args[1:])
 		case "reassign":
 			return hubReassign(ctx, args[1:], stdout)
+		case "handoff":
+			return handoffCommand(ctx, "fednet hub handoff", args[1:], stdout)
 		}
 	}
 	return hubServe(ctx, args, stdout)
@@ -312,16 +338,21 @@ func readSecret(path string) (string, error) {
 	return s, nil
 }
 
-// hubServe runs the hub until ctx is done. It prints the address it listens
-// on, so that -listen with port 0 is usable. With the Slack tokens it also
-// runs the inbound and outbound sides and, with the webhook, the alerts;
-// when the Socket Mode connection fails for good, the HTTP server fails,
-// or ctx is done, everything stops.
+// hubServe runs the hub until ctx is done, or until a handoff has put a
+// new process in its place. It prints the address it listens on, so that
+// -listen with port 0 is usable. With the Slack tokens it also runs the
+// inbound and outbound sides and, with the webhook, the alerts; when the
+// Socket Mode connection fails for good, the HTTP server fails, or ctx is
+// done, everything stops. After a handoff it stops the same way, once the
+// requests in hand are answered; the predecessor's sides run until it has
+// exited, so this process starts them only then.
 func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet hub", flag.ContinueOnError)
 	listen := fs.String("listen", "", "address to listen on, such as 127.0.0.1:8080 (required)")
 	dbPath := fs.String("db", "", "hub database file (required)")
 	configPath := fs.String("config", "", "hub config file; without one, no client may open threads")
+	adminSocket := fs.String("admin-socket", "", "unix socket that takes hub handoff; without one the hub cannot hand off")
+	handoffTimeout := fs.Duration("handoff-timeout", handoff.DefaultTimeout, "how long a new process may take to become ready at a handoff")
 	appTokenPath := fs.String("slack-app-token-file", "", "file holding the Slack app-level token, for Socket Mode")
 	botTokenPath := fs.String("slack-bot-token-file", "", "file holding the Slack bot token, for the Web API")
 	webhookPath := fs.String("alert-webhook-file", "", "file holding the URL of the Slack incoming webhook for alerts; read only with the Slack token files")
@@ -373,14 +404,26 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	defer st.Close()
 	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval}
 	hub := &link.Hub{
-		Store:    st,
-		Identify: (&auth.Authenticator{Store: st}).Identify,
-		Answer:   (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
-		Uplinked: poster.Nudge,
+		Store:         st,
+		Identify:      (&auth.Authenticator{Store: st}).Identify,
+		AcceptVersion: acceptVersion,
+		Answer:        (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
+		Uplinked:      poster.Nudge,
 	}
-	ln, err := net.Listen("tcp", *listen)
+	proc, err := newProcess(*handoffTimeout)
 	if err != nil {
 		return err
+	}
+	ln, err := proc.ListenTCP(*listen)
+	if err != nil {
+		return err
+	}
+	var admin net.Listener
+	if *adminSocket != "" {
+		if admin, err = proc.ListenUnix(*adminSocket, ""); err != nil {
+			ln.Close()
+			return err
+		}
 	}
 	fmt.Fprintf(stdout, "listening on %s\n", ln.Addr())
 	srv := &http.Server{Handler: hub.Handler(), ReadHeaderTimeout: 10 * time.Second}
@@ -389,11 +432,30 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	adminServed := make(chan error, 1)
+	if admin == nil {
+		adminServed <- nil
+	} else {
+		go func() { adminServed <- (&local.Server{Handoff: proc.Handoff, Version: version}).Serve(ctx, admin) }()
+	}
 	var wg sync.WaitGroup
 	failed := make(chan error, 1)
-	if sl == nil {
-		slog.Info("hub: Slack not configured, serving the clients only")
-	} else {
+	ready := make(chan error, 1)
+	wg.Go(func() {
+		if err := proc.Ready(); err != nil {
+			ready <- err
+			return
+		}
+		if err := proc.WaitForParent(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("hub: the predecessor misbehaved on exit", "err", err)
+		}
+		if sl == nil {
+			slog.Info("hub: Slack not configured, serving the clients only")
+			return
+		}
 		r := &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
@@ -408,20 +470,34 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 		wg.Go(func() { poster.Run(ctx) })
 		if webhook == nil {
 			slog.Warn("hub: no alert webhook, alerts are only logged")
-		} else {
-			w := &watch.Watch{
-				Store: st, Slack: sl, Link: r, Online: hub.Online, Alert: webhook,
-				SlackDown: time.Duration(cfg.Alerts.SlackDown), Offline: time.Duration(cfg.Alerts.OfflineQueued),
-			}
-			wg.Go(func() { w.Run(ctx) })
+			return
 		}
-	}
-	stopped := false
+		w := &watch.Watch{
+			Store: st, Slack: sl, Link: r, Online: hub.Online, AcceptVersion: acceptVersion, Alert: webhook,
+			SlackDown: time.Duration(cfg.Alerts.SlackDown), Offline: time.Duration(cfg.Alerts.OfflineQueued),
+		}
+		wg.Go(func() { w.Run(ctx) })
+	})
+	stopped, handedOff := false, false
 	select {
 	case err = <-served:
 		stopped = true
 	case err = <-failed:
+	case err = <-ready:
 	case <-ctx.Done():
+	case <-proc.Exit():
+		handedOff = true
+	}
+	if handedOff {
+		// The successor accepts from now on; what this process has in hand
+		// it answers first, the handoff request among it.
+		admin.Close()
+	} else {
+		proc.Stop()
+		cancel()
+	}
+	if aerr := <-adminServed; !handedOff && err == nil {
+		err = aerr
 	}
 	cancel()
 	// The downlink connections are hijacked WebSockets, which Shutdown
@@ -528,6 +604,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientUsers(ctx, args[1:], stdout)
 		case "dm":
 			return clientDM(ctx, args[1:], stdout)
+		case "handoff":
+			return handoffCommand(ctx, "fednet client handoff", args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -537,8 +615,11 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 var hookEnv = []string{"PATH", "HOME"}
 
 // clientServe keeps the link to the hub up and answers the agents on the
-// socket until ctx is done. Downlink messages land in the inbox, and the
-// hook command, if given, hands each one to the agent.
+// socket until ctx is done, or until a handoff has put a new process in its
+// place. Downlink messages land in the inbox, and the hook command, if
+// given, hands each one to the agent. The predecessor's link and hook run
+// until it has exited, so this process starts them only then; the socket
+// it serves from the start.
 func clientServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("fednet client", flag.ContinueOnError)
 	hubURL := fs.String("hub", "", "hub base URL, such as http://fednet-hub:8080 (required)")
@@ -547,6 +628,7 @@ func clientServe(ctx context.Context, args []string) error {
 	socket := fs.String("socket", "", "unix socket for the agents (required)")
 	group := fs.String("socket-group", "", "group whose members may use the socket")
 	hookTimeout := fs.Duration("hook-timeout", hook.DefaultTimeout, "how long one run of the hook may take")
+	handoffTimeout := fs.Duration("handoff-timeout", handoff.DefaultTimeout, "how long a new process may take to become ready at a handoff")
 	env := hookEnv
 	fs.Func("hook-env", "environment variable to pass to the hook (repeatable)", func(name string) error {
 		env = append(env, name)
@@ -568,7 +650,11 @@ func clientServe(ctx context.Context, args []string) error {
 	}
 	defer st.Close()
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
-	ln, err := local.Listen(*socket, *group)
+	proc, err := newProcess(*handoffTimeout)
+	if err != nil {
+		return err
+	}
+	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err
 	}
@@ -576,23 +662,106 @@ func clientServe(ctx context.Context, args []string) error {
 	defer cancel()
 	served := make(chan error, 1)
 	go func() {
-		served <- (&local.Server{Post: c.Post, Request: c.Request}).Serve(ctx, ln)
-		cancel()
+		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version}).Serve(ctx, ln)
 	}()
-	hooked := make(chan struct{})
-	if fs.NArg() == 0 {
-		close(hooked)
-	} else {
-		h := &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c)}
-		c.Received = h.Nudge
-		go func() {
-			defer close(hooked)
-			h.Run(ctx)
-		}()
+	ready := make(chan error, 1)
+	linked := make(chan struct{})
+	go func() {
+		defer close(linked)
+		if err := proc.Ready(); err != nil {
+			ready <- err
+			return
+		}
+		if err := proc.WaitForParent(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("client: the predecessor misbehaved on exit", "err", err)
+		}
+		hooked := make(chan struct{})
+		if fs.NArg() == 0 {
+			close(hooked)
+		} else {
+			h := &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c)}
+			c.Received = h.Nudge
+			go func() {
+				defer close(hooked)
+				h.Run(ctx)
+			}()
+		}
+		c.Run(ctx)
+		<-hooked
+	}()
+	stopped, handedOff := false, false
+	select {
+	case err = <-served:
+		stopped = true
+	case err = <-ready:
+	case <-ctx.Done():
+	case <-proc.Exit():
+		handedOff = true
 	}
-	c.Run(ctx)
-	err = <-served
-	<-hooked
+	if handedOff {
+		// The successor accepts from now on; what this process has in hand
+		// it answers first, the handoff request among it.
+		ln.Close()
+	} else {
+		proc.Stop()
+		cancel()
+	}
+	if !stopped {
+		if serr := <-served; !handedOff && err == nil {
+			err = serr
+		}
+	}
+	cancel()
+	<-linked
+	return err
+}
+
+// handoffCommand asks the daemon on the socket to hand off to a new
+// process, waits for the new process to answer on the socket, and prints
+// the versions handed off from and to. A handoff that failed is an error:
+// the old process is still serving.
+func handoffCommand(ctx context.Context, name string, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" {
+		return usageError(name + ": -socket is required")
+	}
+	old, err := do(ctx, *socket, local.Request{Cmd: local.Handoff})
+	if err != nil {
+		return err
+	}
+	// The old process stops accepting once it has answered; until then a
+	// request may still reach it.
+	var now local.Response
+	for deadline := time.Now().Add(local.Timeout); now.PID == 0 || now.PID == old.PID; {
+		if now, err = do(ctx, *socket, local.Request{Cmd: local.Version}); err != nil {
+			return fmt.Errorf("the new process does not answer on %s: %w", *socket, err)
+		}
+		if now.PID != old.PID {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the old process (pid %d) still answers on %s", old.PID, *socket)
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(struct {
+			From local.Response `json:"from"`
+			To   local.Response `json:"to"`
+		}{old, now})
+	}
+	_, err = fmt.Fprintf(stdout, "handed off from %s (pid %d) to %s (pid %d)\n", old.Version, old.PID, now.Version, now.PID)
 	return err
 }
 

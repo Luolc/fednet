@@ -27,8 +27,13 @@ const (
 	RequestPath = "/request"
 )
 
-// ClientHeader carries the client's id on every request to the hub.
-const ClientHeader = "Fednet-Client"
+// Headers on every request to the hub.
+const (
+	// ClientHeader carries the client's id.
+	ClientHeader = "Fednet-Client"
+	// VersionHeader carries the client's version.
+	VersionHeader = "Fednet-Version"
+)
 
 // MaxPayload is the largest payload either link carries. Send and Post
 // refuse anything larger, so a queued message always fits the frame and

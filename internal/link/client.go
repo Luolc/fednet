@@ -157,9 +157,14 @@ func (c *Client) downlink(ctx context.Context) error {
 	defer cancel()
 	url := "ws" + strings.TrimPrefix(c.Hub, "http") + DownlinkPath
 	dctx, cancelDial := context.WithTimeout(ctx, c.timeout())
-	conn, _, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: c.httpClient(), HTTPHeader: c.header()})
+	conn, res, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: c.httpClient(), HTTPHeader: c.header()})
 	cancelDial()
 	if err != nil {
+		if res != nil && res.StatusCode == http.StatusUpgradeRequired {
+			// Dial keeps the first part of the body: the hub's reason.
+			reason, _ := io.ReadAll(res.Body)
+			return fmt.Errorf("the hub does not serve this client's version, upgrade it: %s", strings.TrimSpace(string(reason)))
+		}
 		return err
 	}
 	defer conn.CloseNow()

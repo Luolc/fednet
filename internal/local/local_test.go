@@ -296,7 +296,8 @@ func TestListenConcurrent(t *testing.T) {
 			<-start
 			ln, err := Listen(path, "")
 			if err != nil {
-				ln = nil
+				results <- nil
+				return
 			}
 			results <- ln
 		}()

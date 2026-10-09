@@ -2,6 +2,7 @@ package watch
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -218,5 +219,49 @@ func TestOfflineWithQueue(t *testing.T) {
 	f.check()
 	if len(f.hook.got()) != 2 || len(f.told(t1)) != 2 {
 		t.Fatalf("after going offline again: alerts %q, told %q; want a second alert and notice", f.hook.got(), f.told(t1))
+	}
+}
+
+// A client seen at a version the hub does not serve is alerted once, again
+// at another such version, and not once it runs a served one.
+func TestOutdatedClient(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	f.w.AcceptVersion = func(v string) error {
+		if v != "v2" {
+			return errors.New(v + " is older than v2")
+		}
+		return nil
+	}
+	if err := f.w.Store.Register(ctx, "workstation", []byte("hash")); err != nil {
+		t.Fatal(err)
+	}
+	f.online["workstation"] = true
+	// Never connected: no version to judge.
+	f.check()
+	if got := f.hook.got(); len(got) != 0 {
+		t.Fatalf("alerts = %q, want none", got)
+	}
+	steps := []struct {
+		version string
+		want    int
+	}{
+		{"v1", 1},
+		{"v1", 1},
+		{"v0", 2},
+		{"v2", 2},
+		{"v1", 3},
+	}
+	for i, s := range steps {
+		if err := f.w.Store.SetVersion(ctx, "workstation", s.version); err != nil {
+			t.Fatal(err)
+		}
+		f.check()
+		if got := f.hook.got(); len(got) != s.want {
+			t.Fatalf("step %d (%s): %d alerts %q, want %d", i, s.version, len(got), got, s.want)
+		}
+	}
+	if got := f.hook.got()[0]; !strings.Contains(got, "workstation runs v1") || !strings.Contains(got, "older than v2") {
+		t.Fatalf("alert %q does not name the client, its version and the reason", got)
 	}
 }

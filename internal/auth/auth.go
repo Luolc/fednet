@@ -22,9 +22,6 @@ import (
 	"github.com/Luolc/fednet/internal/store"
 )
 
-// VersionHeader carries the client's version on every request to the hub.
-const VersionHeader = "Fednet-Version"
-
 // secretBytes is the entropy of a credential: 256 bits.
 const secretBytes = 32
 
@@ -59,8 +56,8 @@ func hash(secret string) []byte {
 // hub. The client id goes in link.ClientHeader, set by the link.
 func (c Credential) Header(version string) http.Header {
 	return http.Header{
-		"Authorization": {"Bearer " + c.Secret},
-		VersionHeader:   {version},
+		"Authorization":    {"Bearer " + c.Secret},
+		link.VersionHeader: {version},
 	}
 }
 
@@ -132,7 +129,7 @@ func (a *Authenticator) Identify(r *http.Request) (string, error) {
 	if subtle.ConstantTimeCompare(hash(secret), reg.SecretHash) != 1 {
 		return "", fmt.Errorf("auth: wrong credential for client %q", id)
 	}
-	if v := r.Header.Get(VersionHeader); v != reg.Version {
+	if v := r.Header.Get(link.VersionHeader); v != reg.Version {
 		if err := a.Store.SetVersion(r.Context(), id, v); err != nil {
 			return "", err
 		}

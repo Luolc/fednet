@@ -16,6 +16,7 @@
 | Slack app-level token | `-slack-app-token-file` | Socket Mode 用。 |
 | Slack bot token | `-slack-bot-token-file` | Web API 用。 |
 | 报警的 incoming webhook URL | `-alert-webhook-file` | 只放在 hub 上。 |
+| 管理 socket | `-admin-socket` | 收 `fednet hub handoff`。单元模板放在 `RuntimeDirectory` 下。 |
 
 三个凭证文件各放一个凭证，首尾的空白 (包括末尾换行) 读的时候去掉。fednet 只从这几个文件读凭证，不读环境变量，也不把凭证写进日志和错误信息；文件由部署方提供，单元模板用 `LoadCredential=` 把它们交给服务。
 
@@ -30,3 +31,17 @@ sudo -u fednet fednet hub register -db /var/lib/fednet-hub/hub.db CLIENT-ID HASH
 ```
 
 client 那边不需要 webhook：钩子放弃的消息由 client 经上行告诉 hub，由 hub 报警。
+
+## 升级
+
+先升 client，再升 hub：新版本的 client 要能连旧版本的 hub，反过来不保证。hub 不给版本过旧的 client 派消息，消息留在它的 outbox 里，报警里会说明是哪台、跑的什么版本。
+
+在 hub 机器上，把新的二进制放到 `/usr/local/bin/fednet`，然后：
+
+```sh
+sudo systemctl reload fednet-hub
+```
+
+它经管理 socket 执行 `fednet hub handoff`：新进程起来、接过端口和 socket 之后，旧进程处理完手上的请求再退出，client 的连接会断一次、自己重连。新进程起不来时 reload 失败，旧进程照常服务，原因在 `journalctl -u fednet-hub` 里。改了单元文件、或者新版本的数据库迁移旧版本写不了的，用 `systemctl restart`。
+
+agent 机器上的 client 由本机的 agent 执行 `fednet client handoff -socket <socket>`，走同一套机制。

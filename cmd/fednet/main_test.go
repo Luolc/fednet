@@ -41,6 +41,8 @@ func TestRun(t *testing.T) {
 		{"read-thread through a missing socket", []string{"client", "read-thread", "-socket", "/nonexistent/fednet.sock", "C1/1"}, 4, "", "no such file"},
 		{"open-thread without a channel", []string{"client", "open-thread", "-socket", "x", "hello"}, 2, "", "-socket, -channel and a non-empty TEXT are required"},
 		{"threads without a socket", []string{"client", "threads"}, 2, "", "-socket is required"},
+		{"client handoff without a socket", []string{"client", "handoff"}, 2, "", "-socket is required"},
+		{"hub handoff through a missing socket", []string{"hub", "handoff", "-socket", "/nonexistent/admin.sock"}, 4, "", "no such file"},
 		{"hub with a missing config", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-config", "/nonexistent/hub.json"}, 1, "", "no such file"},
 		{"hub with one Slack token", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-slack-bot-token-file", "/dev/null"}, 2, "", "give both -slack-app-token-file and -slack-bot-token-file"},
 		{"hub with an empty token file", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-slack-app-token-file", "/dev/null", "-slack-bot-token-file", "/dev/null"}, 1, "", "/dev/null is empty"},
