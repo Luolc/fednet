@@ -38,6 +38,9 @@ type Process interface {
 	// predecessor, which then exits. Listeners are to be taken before it;
 	// inherited ones not taken are closed by it.
 	Ready() error
+	// HasParent reports whether this process is the successor of a
+	// handoff: then a predecessor serves until it reports ready.
+	HasParent() bool
 	// WaitForParent returns once the predecessor has exited, at once when
 	// there is none. What must run in one process at a time starts after
 	// it.
@@ -156,6 +159,8 @@ func (l *Live) Ready() error {
 	return l.upg.Ready()
 }
 
+func (l *Live) HasParent() bool { return l.upg.HasParent() }
+
 func (l *Live) WaitForParent(ctx context.Context) error { return l.upg.WaitForParent(ctx) }
 
 func (l *Live) Handoff(context.Context) error {
@@ -201,6 +206,8 @@ func (None) ListenTCP(addr string) (net.Listener, error) { return net.Listen("tc
 func (None) ListenUnix(path, group string) (net.Listener, error) { return local.Listen(path, group) }
 
 func (None) Ready() error { return nil }
+
+func (None) HasParent() bool { return false }
 
 func (None) WaitForParent(context.Context) error { return nil }
 

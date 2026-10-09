@@ -472,8 +472,22 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		})
 	}
 	// Ready before the predecessor is told to go: a failure here means
-	// this process exits and the predecessor stays.
-	if err := proc.Ready(); err != nil {
+	// this process exits and the predecessor stays. A successor with Slack
+	// is ready only once its own connection is up: a token Slack rejects
+	// must fail the handoff, not the service.
+	err = nil
+	if r != nil && proc.HasParent() {
+		select {
+		case <-r.Up():
+		case err = <-failed:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	}
+	if err == nil {
+		err = proc.Ready()
+	}
+	if err != nil {
 		cancel()
 		<-adminServed
 		srv.Close()

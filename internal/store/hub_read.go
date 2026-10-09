@@ -9,13 +9,22 @@ type Uplink struct {
 	// Client is the client the message came from; empty for a message
 	// stored before the hub recorded senders.
 	Client string
+	// PartsSent is how many parts of the message, split for Slack, are in
+	// Slack already.
+	PartsSent int
+}
+
+// SetPartsSent records that the first n parts of msgID are in Slack.
+func (in HubInbox) SetPartsSent(ctx context.Context, msgID string, n int) error {
+	_, err := in.db.ExecContext(ctx, "UPDATE inbox SET parts_sent = ? WHERE msg_id = ?", n, msgID)
+	return err
 }
 
 // UndeliveredFrom returns the messages not yet marked delivered, oldest
 // first, each with the client it came from.
 func (in HubInbox) UndeliveredFrom(ctx context.Context) ([]Uplink, error) {
 	rows, err := in.db.QueryContext(ctx,
-		"SELECT msg_id, payload, client_id FROM inbox WHERE delivered = 0 ORDER BY rowid")
+		"SELECT msg_id, payload, client_id, parts_sent FROM inbox WHERE delivered = 0 ORDER BY rowid")
 	if err != nil {
 		return nil, err
 	}
@@ -23,7 +32,7 @@ func (in HubInbox) UndeliveredFrom(ctx context.Context) ([]Uplink, error) {
 	var us []Uplink
 	for rows.Next() {
 		var u Uplink
-		if err := rows.Scan(&u.MsgID, &u.Payload, &u.Client); err != nil {
+		if err := rows.Scan(&u.MsgID, &u.Payload, &u.Client, &u.PartsSent); err != nil {
 			return nil, err
 		}
 		us = append(us, u)

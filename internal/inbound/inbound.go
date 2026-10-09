@@ -86,6 +86,9 @@ type Receiver struct {
 	mu        sync.Mutex
 	connected bool
 	since     time.Time
+	// up is closed by the first Connected.
+	up     chan struct{}
+	upOnce sync.Once
 	// epoch is the store's BackfillEpoch as of this Receiver's last
 	// Connected: a backfill clears the start it read only if the store's
 	// epoch is still this one, so that a backfill of the connection
@@ -240,7 +243,20 @@ func (r *Receiver) Connected(ctx context.Context) error {
 		return err
 	}
 	r.epoch = epoch
+	r.upOnce.Do(func() { r.up = make(chan struct{}) })
+	select {
+	case <-r.up:
+	default:
+		close(r.up)
+	}
 	return nil
+}
+
+// Up returns a channel that is closed once the connection to Slack has
+// come up for the first time.
+func (r *Receiver) Up() <-chan struct{} {
+	r.upOnce.Do(func() { r.up = make(chan struct{}) })
+	return r.up
 }
 
 // Backfill reads from Slack what the hub may have missed and takes it in

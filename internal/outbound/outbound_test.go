@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 // flaky is a Slack API whose PostReply fails while fail is above zero,
@@ -41,6 +43,7 @@ func (f *flaky) PostReply(ctx context.Context, channel, ts, machine, text string
 type fixture struct {
 	t      *testing.T
 	st     *store.Hub
+	path   string
 	fake   *slack.Fake
 	slack  *flaky
 	p      *Poster
@@ -52,7 +55,8 @@ type fixture struct {
 // thread, the fixture's thread, in channel C1.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	st, err := store.OpenHub(t.Context(), filepath.Join(t.TempDir(), "hub.db"))
+	path := filepath.Join(t.TempDir(), "hub.db")
+	st, err := store.OpenHub(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +68,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	fl := &flaky{API: fake}
-	return &fixture{t: t, st: st, fake: fake, slack: fl, p: &Poster{Store: st, Slack: fl}, thread: slack.ThreadKey("C1", ts)}
+	return &fixture{t: t, st: st, path: path, fake: fake, slack: fl, p: &Poster{Store: st, Slack: fl}, thread: slack.ThreadKey("C1", ts)}
 }
 
 // put stores a post of text to thread from client in the hub's inbox and
@@ -321,14 +325,102 @@ func TestStopTakesNoMorePosts(t *testing.T) {
 	}
 }
 
-// stopDuring calls Stop on the poster while posting.
+// The parts of a split post already in Slack are recorded as they go: a
+// Poster that takes the inbox over after a Stop in the middle of a failing
+// post, or after the hub died there, posts only the parts not yet out.
+func TestSplitProgressSurvivesStop(t *testing.T) {
+	f := newFixture(t)
+	f.p.MaxChars = 4
+	f.p.Interval = time.Hour
+	f.put("workstation", f.thread, "abcdefgh")
+	// The first part goes out, the second fails; Stop lands then.
+	f.slack.API = &failSecond{API: f.fake}
+	stopper := &stopDuring{API: f.slack.API, p: f.p, after: 2}
+	f.slack.API = stopper
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.p.Run(t.Context())
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+	if got := texts(f.replies()); !slices.Equal(got, []string{"abcd"}) {
+		t.Fatalf("thread after the stop = %q, want the first part", got)
+	}
+	next := &Poster{Store: f.st, Slack: f.fake, MaxChars: 4}
+	if err := next.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := texts(f.replies()); !slices.Equal(got, []string{"abcd", "efgh"}) {
+		t.Fatalf("thread after the next Poster = %q, want each part once", got)
+	}
+	if got := f.undelivered(); len(got) != 0 {
+		t.Fatalf("undelivered = %v, want none", got)
+	}
+}
+
+// A part's record the store refuses is retried until it is taken; the
+// part is not posted again meanwhile, nor by the next Poster.
+func TestPartRecordIsRetried(t *testing.T) {
+	f := newFixture(t)
+	f.p.MaxChars = 4
+	f.p.Interval = 20 * time.Millisecond
+	f.put("workstation", f.thread, "abcdefgh")
+	db, err := sql.Open("sqlite", f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.ExecContext(t.Context(), "CREATE TRIGGER fail BEFORE UPDATE OF parts_sent ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END"); err != nil {
+		t.Fatal(err)
+	}
+	passed := make(chan error, 1)
+	go func() { passed <- f.p.Pass(t.Context()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(f.replies()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the first part")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-passed:
+		t.Fatalf("Pass returned %v with the part unrecorded", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := db.ExecContext(t.Context(), "DROP TRIGGER fail"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-passed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pass did not return once the store took the record")
+	}
+	if got := texts(f.replies()); !slices.Equal(got, []string{"abcd", "efgh"}) {
+		t.Fatalf("thread = %q, want each part once", got)
+	}
+}
+
+// stopDuring calls Stop on the poster while posting: on the first post,
+// or on the after-th.
 type stopDuring struct {
 	slack.API
-	p *Poster
+	p     *Poster
+	after int
+	n     int
 }
 
 func (s *stopDuring) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
-	s.p.Stop()
+	s.n++
+	if s.n >= s.after {
+		s.p.Stop()
+	}
 	return s.API.PostReply(ctx, channel, ts, machine, text)
 }
 

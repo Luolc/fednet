@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -22,8 +23,10 @@ import (
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/handoff"
 	"github.com/Luolc/fednet/internal/hook"
+	"github.com/Luolc/fednet/internal/inbound"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/local"
+	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -699,5 +702,75 @@ func TestHubHandoffFailsWhenSystemdIsGone(t *testing.T) {
 	}
 	if code := old.wait(t); code != 0 {
 		t.Fatalf("the hub exited %d, want 0", code)
+	}
+}
+
+// successor is a Process with a predecessor that records whether Ready was
+// called; it cannot hand off itself.
+type successor struct {
+	handoff.None
+	ready atomic.Bool
+}
+
+func (s *successor) HasParent() bool { return true }
+
+func (s *successor) Ready() error {
+	s.ready.Store(true)
+	return nil
+}
+
+// A new hub with Slack reports ready only once its own connection is up:
+// one whose token Slack rejects exits without reporting, so the handoff
+// fails and the old hub stays; one that connects reports after that.
+func TestHubReadyWaitsForSlack(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		fail     error
+		wantCode int
+	}{
+		{"rejected", errors.New("invalid auth"), 1},
+		{"connected", nil, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			proc := &successor{}
+			prev := newProcess
+			newProcess = func(time.Duration) (handoff.Process, error) { return proc, nil }
+			t.Cleanup(func() { newProcess = prev })
+			dir := t.TempDir()
+			flags, _ := fakeSlack(t, dir, &slack.Fake{}, nil)
+			connected := make(chan struct{})
+			runInbound = func(ctx context.Context, _ string, r *inbound.Receiver, _ time.Duration) error {
+				// Slack answers after a while, as it does.
+				time.Sleep(50 * time.Millisecond)
+				if tt.fail != nil {
+					return tt.fail
+				}
+				if err := r.Connected(ctx); err != nil {
+					return err
+				}
+				close(connected)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			var stdout, stderr syncBuffer
+			stop := start(t, append([]string{"hub", "-listen", "127.0.0.1:0", "-db", filepath.Join(dir, "hub.db")}, flags...), &stdout, &stderr)
+			if tt.fail == nil {
+				select {
+				case <-connected:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the hub did not connect to Slack")
+				}
+				waitFor(t, "ready after the connection", func() bool { return proc.ready.Load() })
+			} else {
+				// The hub exits on its own, not on the test's stop.
+				waitFor(t, "the hub to report the rejection", func() bool { return strings.Contains(stderr.String(), tt.fail.Error()) })
+			}
+			if code := stop(); code != tt.wantCode {
+				t.Fatalf("hub exited %d, want %d; stderr %q", code, tt.wantCode, stderr.String())
+			}
+			if tt.fail != nil && proc.ready.Load() {
+				t.Fatal("the hub reported ready although Slack rejected its token")
+			}
+		})
 	}
 }
