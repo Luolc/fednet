@@ -2,6 +2,7 @@ package slack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -249,5 +250,54 @@ func TestWebKeepsTokenOutOfErrors(t *testing.T) {
 		} else if strings.Contains(err.Error(), testToken) {
 			t.Errorf("error %q contains the token", err)
 		}
+	}
+}
+
+func TestWebPostReplyAndDelete(t *testing.T) {
+	ctx := context.Background()
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "chat.postMessage":
+			return 200, `{"ok":true,"channel":"C1","ts":"1.5"}`
+		case "chat.delete":
+			if r.form.Get("ts") == "9.9" {
+				return 200, `{"ok":false,"error":"message_not_found"}`
+			}
+			return 200, `{"ok":true,"channel":"C1","ts":"` + r.form.Get("ts") + `"}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	if got, err := w.PostReply(ctx, "C1", "1.1", "workstation", "the build is fixed"); err != nil || got != "1.5" {
+		t.Fatalf("PostReply = %q, %v; want 1.5", got, err)
+	}
+	if err := w.Delete(ctx, "C1", "1.5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Delete(ctx, "C1", "9.9"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete of a message Slack does not know = %v, want ErrNotFound", err)
+	}
+
+	rs, _ := ts.got()
+	post := rs[0].form
+	if rs[0].method != "chat.postMessage" || post.Get("channel") != "C1" || post.Get("thread_ts") != "1.1" || post.Get("text") != "the build is fixed" {
+		t.Fatalf("PostReply sent %s %v", rs[0].method, post)
+	}
+	var blocks []struct {
+		Type     string `json:"type"`
+		Text     any    `json:"text"`
+		Elements []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"elements"`
+	}
+	if err := json.Unmarshal([]byte(post.Get("blocks")), &blocks); err != nil {
+		t.Fatalf("blocks %q: %v", post.Get("blocks"), err)
+	}
+	if len(blocks) != 2 || blocks[0].Type != "context" || len(blocks[0].Elements) != 1 || blocks[0].Elements[0].Text != "workstation" ||
+		blocks[1].Type != "markdown" || blocks[1].Text != "the build is fixed" {
+		t.Fatalf("blocks = %s, want a context block naming the machine, then the text", post.Get("blocks"))
+	}
+	if rs[1].method != "chat.delete" || rs[1].form.Get("channel") != "C1" || rs[1].form.Get("ts") != "1.5" {
+		t.Fatalf("Delete sent %s %v", rs[1].method, rs[1].form)
 	}
 }

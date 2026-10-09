@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -94,6 +95,9 @@ type Runner struct {
 	// Retention is how long delivered messages are kept in the inbox for
 	// dedup before they are pruned. Zero means DefaultRetention.
 	Retention time.Duration
+	// Alert, if not nil, gets one alert for each message moved to the dead
+	// letters.
+	Alert *alert.Webhook
 
 	// nudge has a buffer of one, so a Nudge is kept until Run looks.
 	nudge     chan struct{}
@@ -255,6 +259,14 @@ func (r *Runner) record(ctx context.Context, o outcome) error {
 			return fmt.Errorf("bury %s: %w", q.MsgID, err)
 		}
 		slog.Error("hook: dead letter", "msg_id", q.MsgID, "attempts", attempts, "err", o.err)
+		if r.Alert != nil {
+			// The message is buried once, so it is alerted once; an alert
+			// that fails is logged, not retried.
+			text := fmt.Sprintf("dead letter: msg_id %s after %d attempts: %v", q.MsgID, attempts, o.err)
+			if err := r.Alert.Send(ctx, text); err != nil {
+				slog.Warn("hook: alert", "msg_id", q.MsgID, "err", err)
+			}
+		}
 		return nil
 	}
 	delay := retry.delay(attempts)

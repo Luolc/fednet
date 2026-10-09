@@ -189,6 +189,34 @@ type hubConfig struct {
 	// Users maps the Slack user id of each person fednet serves to a name
 	// for the agents, which may be empty.
 	Users map[string]string `json:"users"`
+	// Alerts sets the thresholds of the hub's alerts; a field left out
+	// keeps the watch package's default.
+	Alerts struct {
+		// SlackDown is how long the hub may be cut off from Slack.
+		SlackDown duration `json:"slack_down"`
+		// OfflineQueued is how long a message may wait for an offline
+		// client.
+		OfflineQueued duration `json:"offline_queued"`
+	} `json:"alerts"`
+}
+
+// duration is a time.Duration written in JSON as a string such as "5m".
+type duration time.Duration
+
+func (d *duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	if v <= 0 {
+		return fmt.Errorf("duration %q is not positive", s)
+	}
+	*d = duration(v)
+	return nil
 }
 
 // readHubConfig reads the config file at path. An unknown field is an

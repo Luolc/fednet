@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -272,6 +275,57 @@ func TestDeadLetterAtLimit(t *testing.T) {
 	waitFor(t, "m2 among the dead letters", func() bool { return len(f.deadLetters()) == 2 })
 	if runs := len(f.lines("runs")); runs != 2*testRetry.Attempts {
 		t.Fatalf("hook ran %d times, want %d", runs, 2*testRetry.Attempts)
+	}
+}
+
+// Each dead letter is alerted once, with its msg_id and reason; a webhook
+// that fails is logged without its URL.
+func TestDeadLetterAlertsOnce(t *testing.T) {
+	const secret = "/services/T000/B000/s3cr3tw3bh00kpath"
+	var mu sync.Mutex
+	var alerts []string
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m struct{ Text string }
+		json.NewDecoder(r.Body).Decode(&m)
+		// Slow enough that a dead letter is on disk well before its alert
+		// has arrived.
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		alerts = append(alerts, m.Text)
+		mu.Unlock()
+	}))
+	defer hook.Close()
+	got := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(alerts)
+	}
+
+	f := newFixture(t, `echo "no agent here" >&2; exit 1`)
+	f.r.Alert = &alert.Webhook{URL: hook.URL + secret, From: "workstation"}
+	f.run()
+	f.put("m1", `{"t":"x"}`)
+	waitFor(t, "m1 among the dead letters", func() bool { return len(f.deadLetters()) == 1 })
+	f.put("m1", `{"t":"again"}`)
+	f.put("m2", `{"t":"y"}`)
+	waitFor(t, "m2 among the dead letters", func() bool { return len(f.deadLetters()) == 2 })
+	// The alert goes out after the dead letter is written.
+	waitFor(t, "the alert for m2", func() bool { return len(got()) >= 2 })
+	a := got()
+	if len(a) != 2 || !strings.Contains(a[0], "[workstation]") || !strings.Contains(a[0], "m1") ||
+		!strings.Contains(a[0], "no agent here") || !strings.Contains(a[1], "m2") {
+		t.Fatalf("alerts = %q, want one for m1 then one for m2, each with the machine and the reason", a)
+	}
+
+	hook.Close()
+	f.put("m3", `{"t":"z"}`)
+	waitFor(t, "m3 among the dead letters", func() bool { return len(f.deadLetters()) == 3 })
+	waitFor(t, "the failed alert for m3 in the log", func() bool {
+		return strings.Contains(f.logs.String(), `msg="hook: alert" msg_id=m3`)
+	})
+	logs := f.logs.String()
+	if strings.Contains(logs, "s3cr3t") {
+		t.Fatalf("log contains the webhook URL:\n%s", logs)
 	}
 }
 
