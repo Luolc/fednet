@@ -47,7 +47,8 @@ type Process interface {
 	WaitForParent(ctx context.Context) error
 	// Handoff starts the successor and returns once it is ready, or with
 	// why it is not: then it has been killed and this process goes on. The
-	// error carries what the successor reported with Report.
+	// error carries what the successor reported with Report. Asked before
+	// this process's own Ready, it first waits for that.
 	Handoff(ctx context.Context) error
 	// Report tells the predecessor why this process failed to start, for
 	// its Handoff to return. After Ready, or without a predecessor, it does
@@ -63,12 +64,23 @@ type Process interface {
 
 // Live is the Process backed by tableflip.
 type Live struct {
-	upg *tableflip.Upgrader
+	upg     *tableflip.Upgrader
+	timeout time.Duration
+	// ready is closed once tableflip has been told this process is ready:
+	// it refuses a handoff before that.
+	ready chan struct{}
 	// reports is where a successor writes its Report; reportTo is the
 	// predecessor's end of its pipe, nil once Ready or without one.
 	reports  *os.File
 	reportTo *os.File
 }
+
+// Hooks for the tests: readying runs in Ready between telling systemd and
+// telling tableflip, awaitingReady when a Handoff has to wait for Ready.
+var readying, awaitingReady = func() {}, func() {}
+
+// errNotReady is how tableflip refuses a handoff before Ready.
+const errNotReady = "process is not ready yet"
 
 // reportName is the name under which the report pipe is passed on.
 const reportName = "report"
@@ -79,11 +91,14 @@ const maxReport = 4 << 10
 // New returns the Live process. Only one per OS process can exist; timeout
 // is how long a successor gets to become ready, DefaultTimeout when zero.
 func New(timeout time.Duration) (*Live, error) {
+	if timeout == 0 {
+		timeout = DefaultTimeout
+	}
 	upg, err := tableflip.New(tableflip.Options{UpgradeTimeout: timeout})
 	if err != nil {
 		return nil, err
 	}
-	l := &Live{upg: upg}
+	l := &Live{upg: upg, timeout: timeout, ready: make(chan struct{})}
 	if l.reportTo, err = upg.File(reportName); err != nil {
 		return nil, err
 	}
@@ -152,19 +167,35 @@ func (l *Live) Ready() error {
 	if err := notify(state); err != nil {
 		return err
 	}
+	readying()
 	if l.reportTo != nil {
 		l.reportTo.Close()
 		l.reportTo = nil
 	}
-	return l.upg.Ready()
+	err := l.upg.Ready()
+	close(l.ready)
+	return err
 }
 
 func (l *Live) HasParent() bool { return l.upg.HasParent() }
 
 func (l *Live) WaitForParent(ctx context.Context) error { return l.upg.WaitForParent(ctx) }
 
-func (l *Live) Handoff(context.Context) error {
+// Handoff asked for before Ready, as by a reload just after the service
+// started, waits for it as long as a successor would get.
+func (l *Live) Handoff(ctx context.Context) error {
+	deadline := time.Now().Add(l.timeout)
+	// Once stopped, Upgrade answers with tableflip's own error.
+	if err := awaitReady(ctx, l.ready, l.upg.Exit(), time.After(l.timeout), l.timeout); err != nil {
+		return err
+	}
 	err := l.upg.Upgrade()
+	// tableflip picks at random between Ready and a request it has both of,
+	// and refuses the request when it picks that first; asked again, it
+	// soon takes Ready.
+	for err != nil && err.Error() == errNotReady && time.Now().Before(deadline) {
+		err = l.upg.Upgrade()
+	}
 	if err == nil {
 		return nil
 	}
@@ -175,6 +206,26 @@ func (l *Live) Handoff(context.Context) error {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(buf[:n])))
 	}
 	return err
+}
+
+// awaitReady returns nil once ready or stopped is closed, or an error once
+// ctx is done or expired fires, after timeout.
+func awaitReady(ctx context.Context, ready, stopped <-chan struct{}, expired <-chan time.Time, timeout time.Duration) error {
+	select {
+	case <-ready:
+		return nil
+	default:
+	}
+	awaitingReady()
+	select {
+	case <-ready:
+	case <-stopped:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-expired:
+		return fmt.Errorf("handoff: this process did not become ready within %s", timeout)
+	}
+	return nil
 }
 
 func (l *Live) Report(err error) {
