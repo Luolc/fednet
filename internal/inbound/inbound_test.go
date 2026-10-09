@@ -1362,3 +1362,121 @@ func TestRunAcksCommands(t *testing.T) {
 		t.Fatalf("run returned %v, want context.Canceled", err)
 	}
 }
+
+// Once a reply has handed a thread over, the thread's first message,
+// which mentioned nobody, coming again (redelivered, or read by a
+// backfill) is still chatter: not sent, not recorded.
+func TestHandleChatterRootAfterReplyHandsOver(t *testing.T) {
+	ctx := t.Context()
+	r, f := newReceiver(t)
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: "chatter root"})
+	handle(t, r, root)
+	ask := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "take this", ThreadTS: root.TS})
+	handle(t, r, ask)
+	handle(t, r, root)
+	got := queued(t, r.Store, "workstation")
+	if len(got) != 1 || got[0].TS != ask.TS {
+		t.Fatalf("queued = %+v, want the mention alone", got)
+	}
+	fresh, err := r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: "C1", TS: root.TS}, func(*store.Hub) error { return nil })
+	if err != nil || !fresh {
+		t.Fatalf("the chatter root was recorded (fresh = %v, %v)", fresh, err)
+	}
+}
+
+// A first mention posted while the hub was away is backfilled whether
+// the thread's first message mentioned the bot (the thread is owned) or
+// not (it is not, and the backfill finds the thread by its latest
+// reply); a thread started before the window is not read.
+func TestBackfillFirstMentionInThread(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		root slack.Message
+		want bool
+	}{
+		{"chatter root", slack.Message{User: "U1", Text: "chatter"}, true},
+		{"mentioned root", slack.Message{User: "U1", Text: hey + "first"}, true},
+		{"root before the window", slack.Message{TS: slackTS(epoch.Add(-2 * DefaultWindow)), User: "U1", Text: "long ago"}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r, f := newReceiver(t)
+			root := post(t, f, "C1", tt.root)
+			handle(t, r, root)
+			// A later message is the latest seen, so the backfill's start
+			// is after the thread's first message.
+			handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: hey + "seed"}))
+			r.Disconnected()
+			ask := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "offline ask", ThreadTS: root.TS})
+			connected(t, r)
+			runBackfill(t, r)
+			var got []string
+			for _, m := range queued(t, r.Store, "workstation") {
+				got = append(got, m.TS)
+			}
+			if found := slices.Contains(got, ask.TS); found != tt.want {
+				t.Fatalf("the mention posted while away was backfilled: %v, want %v (queued %v)", found, tt.want, got)
+			}
+			if _, err := r.Store.Owner(t.Context(), "C1/"+root.TS); (err == nil) != tt.want {
+				t.Fatalf("Owner after the backfill: err = %v, want owned %v", err, tt.want)
+			}
+		})
+	}
+}
+
+// purposeGate is a Slack whose Purpose waits, each call, until the test
+// releases it: entered gets a channel to close for each call.
+type purposeGate struct {
+	slack.API
+	entered chan chan struct{}
+}
+
+func (g *purposeGate) Purpose(ctx context.Context, channel string) (string, error) {
+	release := make(chan struct{})
+	select {
+	case g.entered <- release:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	select {
+	case <-release:
+		return g.API.Purpose(ctx, channel)
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// Two mentions in a thread nobody handed over yet, handled at once: both
+// read Slack before either is queued, but only the one queued first hands
+// the thread over; the other is a reply, with no history.
+func TestHandleConcurrentFirstMentions(t *testing.T) {
+	r, f := newReceiver(t)
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: "chatter"})
+	handle(t, r, root)
+	first := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first", ThreadTS: root.TS})
+	second := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "second", ThreadTS: root.TS})
+	g := &purposeGate{API: f, entered: make(chan chan struct{})}
+	r.Slack = g
+	done := make(chan error, 2)
+	go func() { done <- r.Handle(t.Context(), first) }()
+	release1 := <-g.entered
+	go func() { done <- r.Handle(t.Context(), second) }()
+	release2 := <-g.entered
+	close(release1)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	close(release2)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got := queued(t, r.Store, "workstation")
+	if len(got) != 2 || got[0].TS != first.TS || got[1].TS != second.TS {
+		t.Fatalf("queued = %+v, want first then second", got)
+	}
+	if got[0].Trigger != payload.Mention || got[0].History == nil || got[0].Context == "" {
+		t.Fatalf("the first = %+v, want a mention with history and context", got[0])
+	}
+	if got[1].Trigger != payload.Reply || got[1].History != nil || got[1].Context != "" {
+		t.Fatalf("the second = %+v, want a reply without history or context", got[1])
+	}
+}

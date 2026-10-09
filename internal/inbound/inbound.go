@@ -144,7 +144,12 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		thread = slack.ThreadKey(ev.Channel, ev.TS)
 	}
 	mentioned := !ev.IM && slack.Mentions(ev.Text, r.Bot)
-	owned, err := r.owned(ctx, thread)
+	if !ev.IM && ev.ThreadTS == "" && !mentioned {
+		// Chatter in a channel: not the agents' business, whatever its
+		// thread later becomes.
+		return nil
+	}
+	owned, err := hasOwner(ctx, r.Store, thread)
 	if err != nil {
 		return err
 	}
@@ -165,32 +170,43 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 				return err
 			}
 			before = ms
-			if owned, err = r.owned(ctx, thread); err != nil {
+			if owned, err = hasOwner(ctx, r.Store, thread); err != nil {
 				return err
 			}
 		}
 	}
-	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.Users[ev.User], TS: ev.TS, Files: files(ev.Files)}
-	m.Text = text(ev, r.History.messageChars())
-	switch {
-	case ev.IM:
-		m.Trigger = payload.DM
-	case owned:
-		m.Trigger = payload.Reply
-	case mentioned:
-		m.Trigger = payload.Mention
-		m.Context = r.purpose(ctx, ev.Channel)
-		m.History = r.history(ev, thread, before)
-	default:
+	if !ev.IM && !owned && !mentioned {
+		// A reply in a thread nobody handed over: not taken in.
 		return nil
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return err
+	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.Users[ev.User], TS: ev.TS, Files: files(ev.Files)}
+	m.Text = text(ev, r.History.messageChars())
+	// What a mention carries is read outside the transaction; whether the
+	// message is the one that hands the thread over is decided inside it,
+	// on the ownership as of then.
+	var purpose string
+	var history *payload.History
+	if !ev.IM && !owned {
+		purpose, history = r.purpose(ctx, ev.Channel), r.history(ev, thread, before)
 	}
 	_, err = r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
 		rt := route.New(tx, r.Route)
-		var err error
+		owned, err := hasOwner(ctx, tx, thread)
+		if err != nil {
+			return err
+		}
+		switch {
+		case ev.IM:
+			m.Trigger = payload.DM
+		case owned:
+			m.Trigger = payload.Reply
+		default:
+			m.Trigger, m.Context, m.History = payload.Mention, purpose, history
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
 		switch {
 		case m.Trigger == payload.Mention:
 			_, err = rt.RouteNew(ctx, ev.Channel, thread, b)
@@ -272,9 +288,9 @@ func (r *Receiver) purpose(ctx context.Context, channel string) string {
 	return p
 }
 
-// owned reports whether thread has an owner.
-func (r *Receiver) owned(ctx context.Context, thread string) (bool, error) {
-	_, err := r.Store.Owner(ctx, thread)
+// hasOwner reports whether thread has an owner in h.
+func hasOwner(ctx context.Context, h *store.Hub, thread string) (bool, error) {
+	_, err := h.Owner(ctx, thread)
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
 	}
@@ -358,7 +374,8 @@ func (r *Receiver) Backfill(ctx context.Context) error {
 		return err
 	}
 	now := r.now()
-	if floor := slackTS(now.Add(-r.window())); slack.CompareTS(from, floor) < 0 {
+	floor := slackTS(now.Add(-r.window()))
+	if slack.CompareTS(from, floor) < 0 {
 		from = floor
 	}
 	convs, err := r.Slack.Conversations(ctx)
@@ -366,7 +383,7 @@ func (r *Receiver) Backfill(ctx context.Context) error {
 		return fmt.Errorf("inbound: backfill: %w", err)
 	}
 	for _, c := range convs {
-		if err := r.backfill(ctx, c, from); err != nil {
+		if err := r.backfill(ctx, c, from, floor); err != nil {
 			return fmt.Errorf("inbound: backfill %s: %w", c.ID, err)
 		}
 	}
@@ -379,22 +396,33 @@ func (r *Receiver) Backfill(ctx context.Context) error {
 	return err
 }
 
-// backfill takes in what c has after from.
-func (r *Receiver) backfill(ctx context.Context, c slack.Conversation, from string) error {
-	ms, err := r.Slack.History(ctx, c.ID, from)
+// backfill takes in what c has after from: the messages that are not
+// replies, and the replies in the threads that may have something for the
+// agents, which are the owned threads and those, started since floor,
+// that got a reply after from (a mention in a thread nobody handed over
+// yet is one). The history is read from floor for the latter; what it
+// holds before from was seen live.
+func (r *Receiver) backfill(ctx context.Context, c slack.Conversation, from, floor string) error {
+	ms, err := r.Slack.History(ctx, c.ID, floor)
 	if err != nil {
 		return err
-	}
-	for _, m := range ms {
-		if err := r.Handle(ctx, Event{Channel: c.ID, IM: c.IM, Message: m}); err != nil {
-			return err
-		}
 	}
 	threads, err := r.Store.ThreadsIn(ctx, c.ID)
 	if err != nil {
 		return err
 	}
-	for _, t := range threads {
+	for _, m := range ms {
+		if slack.CompareTS(m.TS, from) > 0 {
+			if err := r.Handle(ctx, Event{Channel: c.ID, IM: c.IM, Message: m}); err != nil {
+				return err
+			}
+		}
+		if slack.CompareTS(m.LatestReply, from) > 0 {
+			threads = append(threads, slack.ThreadKey(c.ID, m.TS))
+		}
+	}
+	slices.Sort(threads)
+	for _, t := range slices.Compact(threads) {
 		_, ts, _ := slack.ParseThreadKey(t)
 		rs, err := r.Slack.Replies(ctx, c.ID, ts)
 		if errors.Is(err, slack.ErrNotFound) {

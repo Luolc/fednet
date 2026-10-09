@@ -100,7 +100,7 @@ func TestWeb(t *testing.T) {
 			return 200, `{"ok":true,"channel":{"id":"D1"}}`
 		case "conversations.history":
 			if r.form.Get("cursor") == "" {
-				return 200, `{"ok":true,"messages":[{"ts":"2.3","user":"U2","text":"newest","thread_ts":"2.3","reply_count":1},{"ts":"2.2","bot_id":"B1","subtype":"bot_message","text":"from a bot"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
+				return 200, `{"ok":true,"messages":[{"ts":"2.3","user":"U2","text":"newest","thread_ts":"2.3","reply_count":1,"latest_reply":"2.4"},{"ts":"2.2","bot_id":"B1","subtype":"bot_message","text":"from a bot"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
 			}
 			return 200, `{"ok":true,"messages":[{"ts":"2.1","user":"U1","text":"oldest","subtype":"file_share","files":[{"name":"a.txt","mimetype":"text/plain","size":12,"permalink":"https://example.invalid/a"}]}],"has_more":false}`
 		case "users.conversations":
@@ -150,7 +150,7 @@ func TestWeb(t *testing.T) {
 	wantHistory := []Message{
 		{TS: "2.1", User: "U1", Text: "oldest", SubType: "file_share", Files: []File{{Name: "a.txt", Mimetype: "text/plain", Size: 12, URL: "https://example.invalid/a"}}},
 		{TS: "2.2", Text: "from a bot", BotID: "B1", SubType: "bot_message"},
-		{TS: "2.3", User: "U2", Text: "newest"},
+		{TS: "2.3", User: "U2", Text: "newest", LatestReply: "2.4"},
 	}
 	if !reflect.DeepEqual(hs, wantHistory) {
 		t.Errorf("History = %+v, want %+v", hs, wantHistory)

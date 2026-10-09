@@ -114,7 +114,7 @@ func (w *Web) Replies(ctx context.Context, channel, ts string) ([]Message, error
 // message a machine posted (see PostReply) has the machine's name in a
 // context block before the text; that is read back as Machine.
 func message(m slackgo.Message) Message {
-	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType, Machine: machine(m)}
+	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType, LatestReply: m.LatestReply, Machine: machine(m)}
 	if m.ThreadTimestamp != m.Timestamp {
 		out.ThreadTS = m.ThreadTimestamp
 	}

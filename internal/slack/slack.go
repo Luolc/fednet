@@ -37,6 +37,10 @@ type Message struct {
 	SubType string `json:"subtype,omitempty"`
 	// Files are the files uploaded with the message.
 	Files []File `json:"files,omitempty"`
+	// LatestReply is the ts of the latest reply in the thread the message
+	// starts, as History reports it; empty when it has none, and on a
+	// message Replies returns.
+	LatestReply string `json:"latest_reply,omitempty"`
 	// Machine is the machine named above the text of a message a machine
 	// posted through PostReply; empty for any other message.
 	Machine string `json:"machine,omitempty"`
@@ -388,7 +392,13 @@ func (f *Fake) History(_ context.Context, channel, oldest string) ([]Message, er
 	var ms []Message
 	for _, ts := range slices.SortedFunc(maps.Keys(c.threads), CompareTS) {
 		if CompareTS(ts, oldest) > 0 {
-			ms = append(ms, c.threads[ts][0])
+			m := c.threads[ts][0]
+			for _, reply := range c.threads[ts][1:] {
+				if CompareTS(reply.TS, m.LatestReply) > 0 {
+					m.LatestReply = reply.TS
+				}
+			}
+			ms = append(ms, m)
 		}
 	}
 	return ms, nil
