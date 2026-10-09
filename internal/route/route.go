@@ -43,7 +43,11 @@ func New(hub *store.Hub, cfg Config) *Router {
 func (r *Router) RouteNew(ctx context.Context, channel, thread string, payload []byte) (string, error) {
 	def, ok := r.cfg.Defaults[channel]
 	if !ok {
-		return "", ErrNoMachine
+		client, err := r.RouteReply(ctx, thread, payload)
+		if errors.Is(err, ErrNoOwner) {
+			return "", ErrNoMachine
+		}
+		return client, err
 	}
 	client, _, err := r.hub.ClaimAndEnqueue(ctx, thread, def, payload)
 	return client, err

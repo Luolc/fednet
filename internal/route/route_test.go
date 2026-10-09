@@ -91,6 +91,12 @@ func TestRoute(t *testing.T) {
 		t.Fatalf("Owner(t2) err = %v, want ErrNotFound", err)
 	}
 
+	// A redelivered first message still reaches the owner after its channel
+	// lost its default machine.
+	if got := routeNew(t, r, "dev", "t1", "redelivered"); got != "workstation" {
+		t.Fatalf("redelivered first message of t1 went to %q, want the owner workstation", got)
+	}
+
 	// A reply in a thread with no owner goes nowhere, not to the default machine.
 	if _, err := r.RouteReply(ctx, "t3", []byte("x")); !errors.Is(err, ErrNoOwner) {
 		t.Fatalf("RouteReply in a thread with no owner: err = %v, want ErrNoOwner", err)
@@ -98,8 +104,8 @@ func TestRoute(t *testing.T) {
 	if _, err := h.Owner(ctx, "t3"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Owner(t3) err = %v, want ErrNotFound", err)
 	}
-	if got := queued(t, h, "workstation"); len(got) != 1 {
-		t.Fatalf("queued for workstation = %v, want only [after]", got)
+	if got := queued(t, h, "workstation"); len(got) != 2 || got[1] != "redelivered" {
+		t.Fatalf("queued for workstation = %v, want [after redelivered]", got)
 	}
 }
 
