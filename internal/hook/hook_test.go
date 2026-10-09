@@ -8,8 +8,10 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -779,18 +781,22 @@ func TestNotRunIsNotAnAttempt(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		fault func(t *testing.T, f *fixture) (undo func())
+		// child runs the case in a child process: its fault is a process
+		// resource limit, which would otherwise also stop the test
+		// framework from writing its own files.
+		child bool
 	}{
-		{"command not found", func(t *testing.T, f *fixture) func() {
+		{name: "command not found", fault: func(t *testing.T, f *fixture) func() {
 			command := f.r.Command
 			f.r.Command = []string{filepath.Join(f.dir, "missing-hook")}
 			return func() { f.r.Command = command }
 		}},
-		{"event directory missing", func(t *testing.T, f *fixture) func() {
+		{name: "event directory missing", fault: func(t *testing.T, f *fixture) func() {
 			dir := f.r.Dir
 			f.r.Dir = filepath.Join(f.dir, "missing")
 			return func() { f.r.Dir = dir }
 		}},
-		{"event file write fails", func(t *testing.T, f *fixture) func() {
+		{name: "event file write fails", fault: func(t *testing.T, f *fixture) func() {
 			// The event file is created, then its write fails: this
 			// process may not write files longer than a few bytes.
 			var before syscall.Rlimit
@@ -809,9 +815,13 @@ func TestNotRunIsNotAnAttempt(t *testing.T) {
 				}
 				signal.Reset(syscall.SIGXFSZ)
 			}
-		}},
+		}, child: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.child && os.Getenv(notRunChildEnv) == "" {
+				runNotRunChild(t)
+				return
+			}
 			f := newFixture(t, `echo run >> "$DIR/runs"; exit 0`)
 			f.r.Retry = Retry{Min: time.Hour, Max: time.Hour, Attempts: 1}
 			f.put("m1", `{"t":"x"}`)
@@ -843,5 +853,27 @@ func TestNotRunIsNotAnAttempt(t *testing.T) {
 				t.Fatalf("after the cause is gone: delivered %v, runs %d; want true, 1", f.delivered("m1"), len(f.lines("runs")))
 			}
 		})
+	}
+}
+
+const notRunChildEnv = "FEDNET_HOOK_TEST_CHILD"
+
+// runNotRunChild runs the calling subtest again in a child process, which
+// starts without the test log file, and fails t unless it ran and passed.
+func runNotRunChild(t *testing.T) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), exe, "-test.v", "-test.run", "^"+regexp.QuoteMeta(t.Name())+"$")
+	cmd.Env = append(os.Environ(), notRunChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child: %v\n%s", err, out)
+	}
+	// A pattern that matches nothing also exits 0.
+	if !strings.Contains(string(out), "--- PASS: "+t.Name()+" ") {
+		t.Fatalf("child did not run %s:\n%s", t.Name(), out)
 	}
 }
