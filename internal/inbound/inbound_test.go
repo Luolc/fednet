@@ -224,6 +224,26 @@ func TestHandleDedupsEvents(t *testing.T) {
 	}
 }
 
+// Two hubs on the same database, as during a handoff, both get the same
+// event: it is queued once. Each has its own connection and its own
+// memory; only the database is shared.
+func TestHandleDedupsAcrossInstances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.db")
+	r1, _ := newReceiver(t)
+	r1.Store = openHub(t, path)
+	r2, _ := newReceiver(t)
+	r2.Store = openHub(t, path)
+	handle(t, r1, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r2, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r2, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	handle(t, r1, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	for i, r := range []*Receiver{r1, r2} {
+		if got := texts(t, r.Store, "workstation"); !slices.Equal(got, []string{"first", "reply"}) {
+			t.Fatalf("texts seen by hub %d = %q, want [first reply]", i+1, got)
+		}
+	}
+}
+
 // A message is recorded, and queued, before Handle returns, so that the
 // event is acked only after that; when the record fails, Handle fails, and
 // nothing is queued.

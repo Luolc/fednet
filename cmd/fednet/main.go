@@ -344,9 +344,11 @@ func readSecret(path string) (string, error) {
 // inbound and outbound sides and, with the webhook, the alerts; when the
 // Socket Mode connection fails for good, the HTTP server fails, or ctx is
 // done, everything stops. After a handoff it stops the same way, once the
-// requests in hand are answered; the predecessor's sides run until it has
-// exited, so this process starts them only then.
-func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
+// requests in hand are answered. As the successor of a handoff it opens
+// its own Socket Mode connection at once, but starts the outbound side and
+// the alerts only once the predecessor has exited: they run in one
+// process at a time.
+func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	fs := flag.NewFlagSet("fednet hub", flag.ContinueOnError)
 	listen := fs.String("listen", "", "address to listen on, such as 127.0.0.1:8080 (required)")
 	dbPath := fs.String("db", "", "hub database file (required)")
@@ -365,9 +367,18 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	if (*appTokenPath == "") != (*botTokenPath == "") {
 		return usageError("fednet hub: give both -slack-app-token-file and -slack-bot-token-file, or neither")
 	}
+	proc, err := newProcess(*handoffTimeout)
+	if err != nil {
+		return err
+	}
+	// Why this process did not start goes to the predecessor, if any.
+	defer func() {
+		if err != nil {
+			proc.Report(err)
+		}
+	}()
 	var cfg hubConfig
 	if *configPath != "" {
-		var err error
 		if cfg, err = readHubConfig(*configPath); err != nil {
 			return err
 		}
@@ -384,7 +395,6 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 		if f.path == "" {
 			continue
 		}
-		var err error
 		if *f.v, err = readSecret(f.path); err != nil {
 			return err
 		}
@@ -409,10 +419,6 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 		AcceptVersion: acceptVersion,
 		Answer:        (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
 		Uplinked:      poster.Nudge,
-	}
-	proc, err := newProcess(*handoffTimeout)
-	if err != nil {
-		return err
 	}
 	ln, err := proc.ListenTCP(*listen)
 	if err != nil {
@@ -440,23 +446,11 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	var wg sync.WaitGroup
 	failed := make(chan error, 1)
-	ready := make(chan error, 1)
-	wg.Go(func() {
-		if err := proc.Ready(); err != nil {
-			ready <- err
-			return
-		}
-		if err := proc.WaitForParent(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			slog.Warn("hub: the predecessor misbehaved on exit", "err", err)
-		}
-		if sl == nil {
-			slog.Info("hub: Slack not configured, serving the clients only")
-			return
-		}
-		r := &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Stored: func() {
+	var r *inbound.Receiver
+	if sl == nil {
+		slog.Info("hub: Slack not configured, serving the clients only")
+	} else {
+		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -467,7 +461,36 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 				failed <- fmt.Errorf("slack socket mode: %w", err)
 			}
 		})
-		wg.Go(func() { poster.Run(ctx) })
+	}
+	// Ready before the predecessor is told to go: a failure here means
+	// this process exits and the predecessor stays.
+	if err := proc.Ready(); err != nil {
+		cancel()
+		<-adminServed
+		srv.Close()
+		<-served
+		wg.Wait()
+		return err
+	}
+	// posted is closed once the outbound side has stopped, or will never
+	// start.
+	posted := make(chan struct{})
+	wg.Go(func() {
+		if err := proc.WaitForParent(ctx); err != nil {
+			if ctx.Err() != nil {
+				close(posted)
+				return
+			}
+			slog.Warn("hub: the predecessor misbehaved on exit", "err", err)
+		}
+		if sl == nil {
+			close(posted)
+			return
+		}
+		wg.Go(func() {
+			defer close(posted)
+			poster.Run(ctx)
+		})
 		if webhook == nil {
 			slog.Warn("hub: no alert webhook, alerts are only logged")
 			return
@@ -483,21 +506,24 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	case err = <-served:
 		stopped = true
 	case err = <-failed:
-	case err = <-ready:
 	case <-ctx.Done():
 	case <-proc.Exit():
 		handedOff = true
 	}
 	if handedOff {
-		// The successor accepts from now on; what this process has in hand
-		// it answers first, the handoff request among it.
+		// The successor accepts from now on. What this process has in hand
+		// it finishes first: the requests, the handoff request among them,
+		// and the post with Slack, which the successor must not post again.
 		admin.Close()
+		<-adminServed
+		poster.Stop()
+		<-posted
 	} else {
 		proc.Stop()
 		cancel()
-	}
-	if aerr := <-adminServed; !handedOff && err == nil {
-		err = aerr
+		if aerr := <-adminServed; err == nil {
+			err = aerr
+		}
 	}
 	cancel()
 	// The downlink connections are hijacked WebSockets, which Shutdown
@@ -620,7 +646,7 @@ var hookEnv = []string{"PATH", "HOME"}
 // given, hands each one to the agent. The predecessor's link and hook run
 // until it has exited, so this process starts them only then; the socket
 // it serves from the start.
-func clientServe(ctx context.Context, args []string) error {
+func clientServe(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("fednet client", flag.ContinueOnError)
 	hubURL := fs.String("hub", "", "hub base URL, such as http://fednet-hub:8080 (required)")
 	dbPath := fs.String("db", "", "client database file (required)")
@@ -640,6 +666,16 @@ func clientServe(ctx context.Context, args []string) error {
 	if *hubURL == "" || *dbPath == "" || *credPath == "" || *socket == "" {
 		return usageError("fednet client: -hub, -db, -credential and -socket are required")
 	}
+	proc, err := newProcess(*handoffTimeout)
+	if err != nil {
+		return err
+	}
+	// Why this process did not start goes to the predecessor, if any.
+	defer func() {
+		if err != nil {
+			proc.Report(err)
+		}
+	}()
 	cred, err := auth.Read(*credPath)
 	if err != nil {
 		return err
@@ -650,10 +686,6 @@ func clientServe(ctx context.Context, args []string) error {
 	}
 	defer st.Close()
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
-	proc, err := newProcess(*handoffTimeout)
-	if err != nil {
-		return err
-	}
 	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err
@@ -664,26 +696,33 @@ func clientServe(ctx context.Context, args []string) error {
 	go func() {
 		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version}).Serve(ctx, ln)
 	}()
-	ready := make(chan error, 1)
+	// Ready before the predecessor is told to go: a failure here means
+	// this process exits and the predecessor stays.
+	if err := proc.Ready(); err != nil {
+		cancel()
+		<-served
+		return err
+	}
+	var h *hook.Runner
+	if fs.NArg() > 0 {
+		h = &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c)}
+		c.Received = h.Nudge
+	}
+	// hooked is closed once the hook has stopped, or will never start.
+	hooked := make(chan struct{})
 	linked := make(chan struct{})
 	go func() {
 		defer close(linked)
-		if err := proc.Ready(); err != nil {
-			ready <- err
-			return
-		}
 		if err := proc.WaitForParent(ctx); err != nil {
 			if ctx.Err() != nil {
+				close(hooked)
 				return
 			}
 			slog.Warn("client: the predecessor misbehaved on exit", "err", err)
 		}
-		hooked := make(chan struct{})
-		if fs.NArg() == 0 {
+		if h == nil {
 			close(hooked)
 		} else {
-			h := &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout, Retry: hookRetry, Alert: uplinkAlert(c)}
-			c.Received = h.Nudge
 			go func() {
 				defer close(hooked)
 				h.Run(ctx)
@@ -696,22 +735,27 @@ func clientServe(ctx context.Context, args []string) error {
 	select {
 	case err = <-served:
 		stopped = true
-	case err = <-ready:
 	case <-ctx.Done():
 	case <-proc.Exit():
 		handedOff = true
 	}
 	if handedOff {
-		// The successor accepts from now on; what this process has in hand
-		// it answers first, the handoff request among it.
+		// The successor accepts from now on. What this process has in hand
+		// it finishes first: the requests, the handoff request among them,
+		// and the run of the hook, which the successor must not run again.
 		ln.Close()
+		<-served
+		if h != nil {
+			h.Stop()
+		}
+		<-hooked
 	} else {
 		proc.Stop()
 		cancel()
-	}
-	if !stopped {
-		if serr := <-served; !handedOff && err == nil {
-			err = serr
+		if !stopped {
+			if serr := <-served; err == nil {
+				err = serr
+			}
 		}
 	}
 	cancel()

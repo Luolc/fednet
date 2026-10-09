@@ -57,6 +57,9 @@ type Poster struct {
 
 	nudge     chan struct{}
 	nudgeOnce sync.Once
+	// stop is closed by Stop.
+	stop     chan struct{}
+	stopOnce sync.Once
 	// sent counts the parts of a split post already in Slack, by msg_id,
 	// so a retry does not post them again. It lives in memory: a hub that
 	// restarts in the middle of a post posts its first parts again.
@@ -92,7 +95,7 @@ func (p *Poster) Nudge() {
 
 // Run posts the inbox until ctx is done. It must be called once.
 func (p *Poster) Run(ctx context.Context) {
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !p.stopping() {
 		if err := p.Pass(ctx); err != nil && ctx.Err() == nil {
 			slog.Warn("outbound: post", "err", err)
 		}
@@ -101,8 +104,35 @@ func (p *Poster) Run(ctx context.Context) {
 		case <-p.nudgeCh():
 		case <-t.C:
 		case <-ctx.Done():
+		case <-p.stopCh():
 		}
 		t.Stop()
+	}
+}
+
+func (p *Poster) stopCh() chan struct{} {
+	p.stopOnce.Do(func() { p.stop = make(chan struct{}) })
+	return p.stop
+}
+
+// Stop makes Run return once the post in hand, if any, is out and marked,
+// taking no further one; unlike ctx it interrupts nothing. It is for
+// handing the inbox to another process. It may be called more than once.
+func (p *Poster) Stop() {
+	p.stopOnce.Do(func() { p.stop = make(chan struct{}) })
+	select {
+	case <-p.stop:
+	default:
+		close(p.stop)
+	}
+}
+
+func (p *Poster) stopping() bool {
+	select {
+	case <-p.stopCh():
+		return true
+	default:
+		return false
 	}
 }
 
@@ -117,6 +147,9 @@ func (p *Poster) Pass(ctx context.Context) error {
 		return err
 	}
 	for _, u := range us {
+		if p.stopping() {
+			return nil
+		}
 		if text, ok := alertText(u); ok {
 			if err := p.relay(ctx, u.Client, text); err != nil {
 				// Left in the inbox for the next pass; an alert has no

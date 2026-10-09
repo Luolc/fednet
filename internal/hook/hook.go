@@ -105,6 +105,9 @@ type Runner struct {
 	// it, and runs nothing else until it has, so the hook never runs again
 	// for a message whose outcome is known.
 	unsaved *outcome
+	// stop is closed by Stop.
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // outcome is what one run of the hook ended in: err nil means it exited 0.
@@ -154,14 +157,41 @@ func (r *Runner) Nudge() {
 	}
 }
 
+func (r *Runner) stopCh() chan struct{} {
+	r.stopOnce.Do(func() { r.stop = make(chan struct{}) })
+	return r.stop
+}
+
+// Stop makes Run return once the run of the hook in hand, if any, has
+// ended and its outcome is recorded, taking no further message; unlike
+// ctx it interrupts nothing. It is for handing the inbox to another
+// process. It may be called more than once.
+func (r *Runner) Stop() {
+	r.stopOnce.Do(func() { r.stop = make(chan struct{}) })
+	select {
+	case <-r.stop:
+	default:
+		close(r.stop)
+	}
+}
+
+func (r *Runner) stopping() bool {
+	select {
+	case <-r.stopCh():
+		return true
+	default:
+		return false
+	}
+}
+
 // Run runs the hook for every undelivered message as it becomes due, until
-// ctx is done. It must be called once. A run of the hook that ctx
+// ctx is done or Stop is called. It must be called once. A run of the hook that ctx
 // interrupts is not counted as an attempt; the message is tried again by
 // the next Run. An outcome the store refuses to record is kept and retried
 // before anything else runs; one that is still unrecorded when ctx is done
 // is lost, and the next Run runs the hook again for that message.
 func (r *Runner) Run(ctx context.Context) {
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !r.stopping() {
 		wait, err := r.pass(ctx)
 		if err != nil {
 			slog.Warn("hook: store", "err", err)
@@ -180,6 +210,7 @@ func (r *Runner) Run(ctx context.Context) {
 		case <-r.nudgeCh():
 		case <-due:
 		case <-ctx.Done():
+		case <-r.stopCh():
 		}
 		if timer != nil {
 			timer.Stop()
@@ -207,7 +238,7 @@ func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
 	wait := time.Duration(-1)
 	ran := false
 	for _, q := range qs {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || r.stopping() {
 			return 0, nil
 		}
 		if d := q.NextAttempt.Sub(now); d > 0 {

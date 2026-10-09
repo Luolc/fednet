@@ -43,8 +43,13 @@ type Process interface {
 	// it.
 	WaitForParent(ctx context.Context) error
 	// Handoff starts the successor and returns once it is ready, or with
-	// why it is not: then it has been killed and this process goes on.
+	// why it is not: then it has been killed and this process goes on. The
+	// error carries what the successor reported with Report.
 	Handoff(ctx context.Context) error
+	// Report tells the predecessor why this process failed to start, for
+	// its Handoff to return. After Ready, or without a predecessor, it does
+	// nothing.
+	Report(err error)
 	// Exit is closed once a successor is ready: this process stops taking
 	// connections and exits.
 	Exit() <-chan struct{}
@@ -56,7 +61,17 @@ type Process interface {
 // Live is the Process backed by tableflip.
 type Live struct {
 	upg *tableflip.Upgrader
+	// reports is where a successor writes its Report; reportTo is the
+	// predecessor's end of its pipe, nil once Ready or without one.
+	reports  *os.File
+	reportTo *os.File
 }
+
+// reportName is the name under which the report pipe is passed on.
+const reportName = "report"
+
+// maxReport bounds a report: it must fit the pipe, and an error is short.
+const maxReport = 4 << 10
 
 // New returns the Live process. Only one per OS process can exist; timeout
 // is how long a successor gets to become ready, DefaultTimeout when zero.
@@ -65,7 +80,26 @@ func New(timeout time.Duration) (*Live, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Live{upg: upg}, nil
+	l := &Live{upg: upg}
+	if l.reportTo, err = upg.File(reportName); err != nil {
+		return nil, err
+	}
+	// The pipe every successor of this process reports into. This process
+	// keeps a write end of it too (in the upgrader, to be passed on), so a
+	// read never sees EOF: Handoff reads what is there once the successor
+	// is gone.
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := upg.AddFile(reportName, w); err != nil {
+		r.Close()
+		w.Close()
+		return nil, err
+	}
+	w.Close()
+	l.reports = r
+	return l, nil
 }
 
 func (l *Live) ListenTCP(addr string) (net.Listener, error) {
@@ -115,12 +149,41 @@ func (l *Live) Ready() error {
 	if err := notify(state); err != nil {
 		return err
 	}
+	if l.reportTo != nil {
+		l.reportTo.Close()
+		l.reportTo = nil
+	}
 	return l.upg.Ready()
 }
 
 func (l *Live) WaitForParent(ctx context.Context) error { return l.upg.WaitForParent(ctx) }
 
-func (l *Live) Handoff(context.Context) error { return l.upg.Upgrade() }
+func (l *Live) Handoff(context.Context) error {
+	err := l.upg.Upgrade()
+	if err == nil {
+		return nil
+	}
+	// The successor is gone; whatever it reported is in the pipe.
+	l.reports.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, maxReport)
+	if n, _ := l.reports.Read(buf); n > 0 {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(buf[:n])))
+	}
+	return err
+}
+
+func (l *Live) Report(err error) {
+	if l.reportTo == nil {
+		return
+	}
+	msg := err.Error()
+	if len(msg) > maxReport {
+		msg = msg[:maxReport]
+	}
+	l.reportTo.Write([]byte(msg))
+	l.reportTo.Close()
+	l.reportTo = nil
+}
 
 func (l *Live) Exit() <-chan struct{} { return l.upg.Exit() }
 
@@ -142,6 +205,8 @@ func (None) Ready() error { return nil }
 func (None) WaitForParent(context.Context) error { return nil }
 
 func (None) Handoff(context.Context) error { return ErrNone }
+
+func (None) Report(error) {}
 
 // Exit is never closed.
 func (None) Exit() <-chan struct{} { return nil }

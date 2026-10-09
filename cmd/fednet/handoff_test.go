@@ -355,8 +355,8 @@ func TestClientHandoffFailsWhenNewProcessCannotStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, _, stderr := handoffThrough(t, "client", socket)
-	if code != 1 || !strings.Contains(stderr, "exited") {
-		t.Fatalf("handoff exited %d with %q, want 1 and the child's exit", code, stderr)
+	if code != 1 || !strings.Contains(stderr, "exited") || !strings.Contains(stderr, "readable by group or others") {
+		t.Fatalf("handoff exited %d with %q, want 1, the child's exit and its reason", code, stderr)
 	}
 	if got := versionThrough(t, socket); got.PID != old.cmd.Process.Pid {
 		t.Fatalf("version through the socket = %+v, want pid %d", got, old.cmd.Process.Pid)
@@ -560,8 +560,8 @@ func TestHubHandoffFailsWhenNewProcessCannotStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, _, stderr := handoffThrough(t, "hub", admin)
-	if code != 1 || !strings.Contains(stderr, "exited") {
-		t.Fatalf("handoff exited %d with %q, want 1 and the child's exit", code, stderr)
+	if code != 1 || !strings.Contains(stderr, "exited") || !strings.Contains(stderr, "hub.json") {
+		t.Fatalf("handoff exited %d with %q, want 1, the child's exit and its reason", code, stderr)
 	}
 	if got := versionThrough(t, admin); got.PID != old.cmd.Process.Pid {
 		t.Fatalf("version through the admin socket = %+v, want pid %d", got, old.cmd.Process.Pid)
@@ -573,6 +573,126 @@ func TestHubHandoffFailsWhenNewProcessCannotStart(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("GET %s without a credential: %s, want 401 from the old hub", link.DownlinkPath, res.Status)
+	}
+	if err := old.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if code := old.wait(t); code != 0 {
+		t.Fatalf("the hub exited %d, want 0", code)
+	}
+}
+
+// A handoff lets the run of the hook in hand end: the old client exits only
+// once the hook has, with the message marked delivered, and the new client
+// does not run the hook for it again.
+func TestClientHandoffWaitsForTheHook(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	hs := openHubStore(t, filepath.Join(dir, "hub.db"))
+	hub := &link.Hub{Store: hs, Identify: (&auth.Authenticator{Store: hs}).Identify}
+	srv := httptest.NewServer(hub.Handler())
+	t.Cleanup(func() {
+		hub.Close()
+		srv.Close()
+	})
+	credPath := filepath.Join(dir, "credential")
+	newCredential(t, hs, "workstation", credPath)
+	socket := filepath.Join(dir, "fednet.sock")
+	script := filepath.Join(dir, "hook.sh")
+	events := filepath.Join(dir, "events")
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The hook records the event, then waits until the test lets it go.
+	body := "#!/bin/sh\ncat \"$1\" >> \"$FEDNET_TEST_EVENTS\" && echo >> \"$FEDNET_TEST_EVENTS\" && cat \"$FEDNET_TEST_FIFO\" > /dev/null\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release := func() {
+		t.Helper()
+		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+	}
+	old := startDaemon(t, []string{"client", "-hub", srv.URL, "-db", filepath.Join(dir, "client.db"), "-credential", credPath,
+		"-socket", socket, "-handoff-timeout", "10s", "-hook-timeout", "1m", "-hook-env", "FEDNET_TEST_EVENTS", "-hook-env", "FEDNET_TEST_FIFO",
+		"/bin/sh", script},
+		"FEDNET_TEST_EVENTS="+events, "FEDNET_TEST_FIFO="+fifo)
+	waitFor(t, "the client's socket", func() bool {
+		_, err := os.Stat(socket)
+		return err == nil
+	})
+	first, err := hub.Send(ctx, "workstation", []byte(`{"type":"test","text":"first"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the hook to start", func() bool { return len(hookEvents(t, events)) == 1 })
+
+	code, res, stderr := handoffThrough(t, "client", socket)
+	if code != 0 {
+		t.Fatalf("handoff exited %d: %s", code, stderr)
+	}
+	defer terminate(t, res.To.PID)
+	// The new client serves, but the old one is still here, in the hook.
+	if processGone(old.cmd.Process.Pid) {
+		t.Fatal("the old client exited while its hook was running")
+	}
+	if got := hookEvents(t, events); len(got) != 1 {
+		t.Fatalf("hook events after the handoff = %v, want just the first run", got)
+	}
+	release()
+	if code := old.wait(t); code != 0 {
+		t.Fatalf("the old client exited %d, want 0", code)
+	}
+	second, err := hub.Send(ctx, "workstation", []byte(`{"type":"test","text":"second"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the hook for the second message", func() bool { return len(hookEvents(t, events)) >= 2 })
+	release()
+	if got := hookEvents(t, events); !slices.Equal(got, []string{first.MsgID, second.MsgID}) {
+		t.Fatalf("hook events = %v, want %v: each message once", got, []string{first.MsgID, second.MsgID})
+	}
+}
+
+// A new hub that cannot report ready, here because systemd's notification
+// socket is gone, fails the handoff and leaves the old hub, and its admin
+// socket, in place.
+func TestHubHandoffFailsWhenSystemdIsGone(t *testing.T) {
+	dir := t.TempDir()
+	notifyPath := filepath.Join(dir, "notify")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: notifyPath, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := freePort(t)
+	admin := filepath.Join(dir, "admin.sock")
+	old := startDaemon(t, []string{"hub", "-listen", addr, "-db", filepath.Join(dir, "hub.db"), "-admin-socket", admin, "-handoff-timeout", "10s"},
+		"NOTIFY_SOCKET="+notifyPath)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil || string(buf[:n]) != "READY=1\n" {
+		t.Fatalf("systemd got %q, %v; want READY=1", buf[:n], err)
+	}
+	waitFor(t, "the admin socket", func() bool {
+		_, err := os.Stat(admin)
+		return err == nil
+	})
+	// systemd's socket goes away: the new process cannot report ready.
+	conn.Close()
+	if err := os.Remove(notifyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	code, _, stderr := handoffThrough(t, "hub", admin)
+	if code != 1 || !strings.Contains(stderr, "notify systemd") {
+		t.Fatalf("handoff exited %d with %q, want 1 and the notify failure", code, stderr)
+	}
+	if got := versionThrough(t, admin); got.PID != old.cmd.Process.Pid {
+		t.Fatalf("version through the admin socket = %+v, want pid %d", got, old.cmd.Process.Pid)
 	}
 	if err := old.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)

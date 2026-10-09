@@ -470,6 +470,44 @@ func TestShutdownDoesNotCountAsAttempt(t *testing.T) {
 	}
 }
 
+// Stop lets the run of the hook in hand end and records it, and takes no
+// further message: the next Run, in another process, runs only that one.
+func TestStopWaitsForTheHook(t *testing.T) {
+	f := newFixture(t, `echo $$ > "$DIR/self"; sleep 0.3`)
+	f.r.Timeout = time.Minute
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(ctx)
+	}()
+	f.put("m1", `{"t":"x"}`)
+	f.put("m2", `{"t":"y"}`)
+	var self int
+	waitFor(t, "the hook to start", func() bool {
+		var ok bool
+		self, ok = f.pid("self")
+		return ok
+	})
+	f.r.Stop()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+	if left(self) {
+		t.Fatalf("hook %d is left (state %q) after Run returned", self, state(t, self))
+	}
+	if !f.delivered("m1") {
+		t.Fatal("m1 is not marked delivered: the run in hand was not recorded")
+	}
+	qs := f.queued()
+	if len(qs) != 1 || qs[0].MsgID != "m2" || qs[0].Attempts != 0 {
+		t.Fatalf("queued after Stop = %+v, want m2 untouched", qs)
+	}
+}
+
 func TestRetryDelay(t *testing.T) {
 	r := Retry{Min: time.Second, Max: 10 * time.Second, Attempts: 5}
 	for attempts, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 4: 8 * time.Second, 5: 10 * time.Second, 40: 10 * time.Second} {

@@ -294,6 +294,44 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// Stop makes Run return without taking another post; the one in hand goes
+// out and is marked first.
+func TestStopTakesNoMorePosts(t *testing.T) {
+	f := newFixture(t)
+	f.p.Interval = time.Hour
+	first := f.put("workstation", f.thread, "first")
+	second := f.put("workstation", f.thread, "second")
+	// Stop lands while the first post is with Slack.
+	f.slack.API = &stopDuring{API: f.fake, p: f.p}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.p.Run(t.Context())
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+	if got := texts(f.replies()); !slices.Equal(got, []string{"first"}) {
+		t.Fatalf("thread = %q, want just the post in hand", got)
+	}
+	if got := f.undelivered(); !slices.Equal(got, []string{second}) {
+		t.Fatalf("undelivered = %v, want just %s; %s must be marked", got, second, first)
+	}
+}
+
+// stopDuring calls Stop on the poster while posting.
+type stopDuring struct {
+	slack.API
+	p *Poster
+}
+
+func (s *stopDuring) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
+	s.p.Stop()
+	return s.API.PostReply(ctx, channel, ts, machine, text)
+}
+
 // An alert a client raised goes to the webhook as from that client, once.
 // One the webhook does not take stays in the inbox for the next pass, and
 // the posts behind it still go out.
