@@ -40,6 +40,9 @@ type Client struct {
 	Timeout time.Duration
 	// HTTPClient is used for both links. Nil means http.DefaultClient.
 	HTTPClient *http.Client
+	// Received, if set, is called after a downlink message is stored in
+	// the inbox, before it is acked. It must not block.
+	Received func()
 
 	// nudge has a buffer of one, so a Post is noticed even while the uplink
 	// loop is busy.
@@ -193,6 +196,9 @@ func (c *Client) receive(ctx context.Context, conn *websocket.Conn) error {
 		}
 		if _, err := c.Store.Inbox.Put(ctx, store.Message{MsgID: d.MsgID, Payload: d.Payload}); err != nil {
 			return err
+		}
+		if c.Received != nil {
+			c.Received()
 		}
 		if err := wsjson.Write(ctx, conn, ack{Seq: d.Seq}); err != nil {
 			return err

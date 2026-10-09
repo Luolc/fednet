@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Luolc/fednet/internal/auth"
+	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -34,8 +35,10 @@ commands:
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
         retire a client: its credential stops working
-  client -hub URL -db PATH -credential PATH
-        run a client on an agent machine
+  client -hub URL -db PATH -credential PATH [-hook-timeout D] [-hook-env NAME]... [COMMAND [ARG]...]
+        run a client on an agent machine; COMMAND runs for each message received,
+        with the event file as its last argument, in an environment of just
+        PATH, HOME and each -hook-env NAME
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   version
@@ -91,13 +94,14 @@ type usageError string
 func (e usageError) Error() string { return string(e) }
 
 // parseFlags parses args with fs and checks for exactly want positional
-// arguments. A flag error is already reported by fs.
+// arguments; want < 0 allows any number. A flag error is already reported
+// by fs.
 func parseFlags(fs *flag.FlagSet, args []string, want int) error {
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args); err != nil {
 		return usageError(fs.Name() + ": " + err.Error())
 	}
-	if fs.NArg() != want {
+	if want >= 0 && fs.NArg() != want {
 		return usageError(fmt.Sprintf("%s: want %d arguments, got %d", fs.Name(), want, fs.NArg()))
 	}
 	return nil
@@ -207,14 +211,24 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 	return clientServe(ctx, args)
 }
 
+// hookEnv is the client's environment variables that the hook always gets.
+var hookEnv = []string{"PATH", "HOME"}
+
 // clientServe keeps the link to the hub up until ctx is done. Downlink
-// messages land in the inbox; nothing hands them on yet.
+// messages land in the inbox, and the hook command, if given, hands each
+// one to the agent.
 func clientServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("fednet client", flag.ContinueOnError)
 	hubURL := fs.String("hub", "", "hub base URL, such as http://fednet-hub:8080 (required)")
 	dbPath := fs.String("db", "", "client database file (required)")
 	credPath := fs.String("credential", "", "credential file written by client init (required)")
-	if err := parseFlags(fs, args, 0); err != nil {
+	hookTimeout := fs.Duration("hook-timeout", hook.DefaultTimeout, "how long one run of the hook may take")
+	env := hookEnv
+	fs.Func("hook-env", "environment variable to pass to the hook (repeatable)", func(name string) error {
+		env = append(env, name)
+		return nil
+	})
+	if err := parseFlags(fs, args, -1); err != nil {
 		return err
 	}
 	if *hubURL == "" || *dbPath == "" || *credPath == "" {
@@ -230,8 +244,32 @@ func clientServe(ctx context.Context, args []string) error {
 	}
 	defer st.Close()
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
+	if fs.NArg() == 0 {
+		c.Run(ctx)
+		return nil
+	}
+	h := &hook.Runner{Store: st, Command: fs.Args(), Env: passEnv(env), Timeout: *hookTimeout}
+	c.Received = h.Nudge
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.Run(ctx)
+	}()
 	c.Run(ctx)
+	<-done
 	return nil
+}
+
+// passEnv returns the named variables of this process's environment, as
+// KEY=VALUE, skipping the ones not set.
+func passEnv(names []string) []string {
+	env := []string{}
+	for _, name := range names {
+		if v, ok := os.LookupEnv(name); ok {
+			env = append(env, name+"="+v)
+		}
+	}
+	return env
 }
 
 // clientInit creates the credential file and prints the client id and the
