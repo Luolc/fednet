@@ -2,17 +2,23 @@ package inbound
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	slackgo "github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 
+	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/route"
@@ -142,7 +148,7 @@ func TestHandleRoutes(t *testing.T) {
 		{Type: payload.Inbound, Thread: "C2/1.1", Text: "reply", User: "U1", TS: "1.2"},
 		{Type: payload.Inbound, Thread: "C2/1.1", Text: "shrugs", User: "U1", TS: "1.3"},
 	}
-	if !slices.Equal(got, want) {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("queued for datamachine = %+v, want %+v", got, want)
 	}
 
@@ -164,7 +170,7 @@ func TestHandleRoutes(t *testing.T) {
 		{Type: payload.Inbound, Thread: "D1/2.2", Text: "again", User: "U1", TS: "2.2"},
 		{Type: payload.Inbound, Thread: "D1/2.1", Text: "more", User: "U1", TS: "2.3"},
 	}
-	if !slices.Equal(got, want) {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("queued for workstation = %+v, want %+v", got, want)
 	}
 
@@ -186,7 +192,7 @@ func TestHandleWithoutPurpose(t *testing.T) {
 	handle(t, r, message("Ev1", "C1", "1.1", "", "first"))
 	got := queued(t, r.Store, "workstation")
 	want := []payload.Message{{Type: payload.Inbound, Thread: "C1/1.1", Text: "first", User: "U1", TS: "1.1"}}
-	if !slices.Equal(got, want) {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("queued when the purpose cannot be read = %+v, want %+v", got, want)
 	}
 }
@@ -778,6 +784,117 @@ func TestRunAcks(t *testing.T) {
 	waitFor(t, "the gap to be backfilled", func() bool { return len(texts(t, r.Store, "workstation")) == 2 })
 	if got, want := texts(t, r.Store, "workstation"), []string{"first\nfile: a.txt https://example.invalid/a", "in the gap"}; !slices.Equal(got, want) {
 		t.Fatalf("texts after the backfill = %q, want %q", got, want)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run returned %v, want context.Canceled", err)
+	}
+}
+
+// clickEvent is a Socket Mode event carrying a press on a card's button,
+// as slack-go parses it, in the envelope with id.
+func clickEvent(t *testing.T, envelope, actionID, approvalID, ts, user string, bot bool) socketmode.Event {
+	t.Helper()
+	var cb slackgo.InteractionCallback
+	body := `{"type":"block_actions","user":{"id":"` + user + `","is_bot":` + strconv.FormatBool(bot) + `},"container":{"type":"message","message_ts":"` + ts + `","channel_id":"C9"},` +
+		`"actions":[{"action_id":"` + actionID + `","block_id":"approval:` + approvalID + `","type":"button","value":"` + approvalID + `","action_ts":"1.6"}]}`
+	if err := json.Unmarshal([]byte(body), &cb); err != nil {
+		t.Fatal(err)
+	}
+	return socketmode.Event{Type: socketmode.EventTypeInteractive, Data: cb, Request: &socketmode.Request{Type: socketmode.RequestTypeInteractive, EnvelopeID: envelope}}
+}
+
+// slowUpdate is a Fake whose UpdateCard never returns.
+type slowUpdate struct{ *slack.Fake }
+
+func (slowUpdate) UpdateCard(ctx context.Context, _, _ string, _ slack.Card) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// Through the transport: a click on a card is acked once the approval is
+// decided and its outcome queued, without waiting for Slack to update the
+// card; a click that does not count, or from a block that is not the
+// card's, is acked too; without approvals a click is acked and dropped.
+func TestRunAcksClicks(t *testing.T) {
+	r, f := newReceiver(t)
+	f.AddChannel("C9", "approvals")
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Slack takes its time updating cards; the acks must not wait for it.
+	r.Approvals = &approval.Flow{Store: r.Store, Slack: slowUpdate{f}, Key: priv, Channel: "C9", Approvers: []string{"U1"}, Now: r.Now}
+	id, err := r.Approvals.Request(t.Context(), "workstation", "ops-exec", "", "delete b", []byte(`{"b":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tss, _ := f.Cards("C9")
+	cardTS := tss[0]
+	tr := newFakeTransport()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
+
+	// Someone not on the approver list: acked, nothing decided.
+	tr.send(t, clickEvent(t, "env1", slack.ApproveAction, id, cardTS, "U2", false))
+	if ack := tr.ack(2 * time.Second); ack != "env1" {
+		t.Fatalf("ack = %q, want env1", ack)
+	}
+	if got := queued(t, r.Store, "workstation"); len(got) != 0 {
+		t.Fatalf("queued after a click that does not count = %+v, want nothing", got)
+	}
+	if err := r.Approvals.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := f.Whispers("U2"); len(w) != 1 {
+		t.Fatalf("U2 was told %q, want one hint", w)
+	}
+	// The approver, but from a block that is not the card's: not a click.
+	ev := clickEvent(t, "env1b", slack.ApproveAction, id, cardTS, "U1", false)
+	cb := ev.Data.(slackgo.InteractionCallback)
+	cb.ActionCallback.BlockActions[0].BlockID = "elsewhere"
+	ev.Data = cb
+	tr.send(t, ev)
+	if ack := tr.ack(2 * time.Second); ack != "env1b" {
+		t.Fatalf("ack = %q, want env1b", ack)
+	}
+	if got := queued(t, r.Store, "workstation"); len(got) != 0 {
+		t.Fatalf("queued after a click from another block = %+v, want nothing", got)
+	}
+	// The approver: acked once the outcome is queued.
+	tr.send(t, clickEvent(t, "env2", slack.ApproveAction, id, cardTS, "U1", false))
+	if ack := tr.ack(2 * time.Second); ack != "env2" {
+		t.Fatalf("ack = %q, want env2", ack)
+	}
+	got := queued(t, r.Store, "workstation")
+	if len(got) != 1 || got[0].Type != payload.Approval || got[0].ApprovalID != id || got[0].Outcome != payload.Approved || got[0].Approver != "U1" {
+		t.Fatalf("queued when the ack arrived = %+v, want the approved outcome of %s", got, id)
+	}
+	// An interaction that is not a button press is acked at once.
+	tr.send(t, socketmode.Event{Type: socketmode.EventTypeInteractive, Data: slackgo.InteractionCallback{Type: slackgo.InteractionTypeViewSubmission}, Request: &socketmode.Request{EnvelopeID: "env3"}})
+	if ack := tr.ack(2 * time.Second); ack != "env3" {
+		t.Fatalf("ack of a non-button interaction = %q, want env3", ack)
+	}
+	// The store is gone: no ack.
+	r.Store.Close()
+	tr.send(t, clickEvent(t, "env4", slack.RejectAction, id, cardTS, "U1", false))
+	if ack := tr.ack(200 * time.Millisecond); ack != "" {
+		t.Fatalf("acked %q although the click could not be applied", ack)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run returned %v, want context.Canceled", err)
+	}
+
+	// Without approvals, a click is acked and dropped.
+	r, _ = newReceiver(t)
+	tr = newFakeTransport()
+	ctx, cancel = context.WithCancel(t.Context())
+	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
+	tr.send(t, clickEvent(t, "env5", slack.ApproveAction, id, cardTS, "U1", false))
+	if ack := tr.ack(2 * time.Second); ack != "env5" {
+		t.Fatalf("ack without approvals = %q, want env5", ack)
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {

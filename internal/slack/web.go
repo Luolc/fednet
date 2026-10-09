@@ -215,6 +215,91 @@ func (w *Web) SetPurpose(ctx context.Context, channel, purpose string) error {
 	})
 }
 
+// PostCard posts the card's blocks; the summary is the message's plain
+// text, for notifications.
+func (w *Web) PostCard(ctx context.Context, channel string, c Card) (string, error) {
+	var ts string
+	err := w.call(ctx, "chat.postMessage", func() (err error) {
+		_, ts, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionText(c.Summary, false), slackgo.MsgOptionBlocks(blocks(c)...))
+		return err
+	})
+	return ts, err
+}
+
+func (w *Web) UpdateCard(ctx context.Context, channel, ts string, c Card) error {
+	return w.call(ctx, "chat.update", func() error {
+		_, _, _, err := w.c.UpdateMessageContext(ctx, channel, ts, slackgo.MsgOptionText(c.Summary, false), slackgo.MsgOptionBlocks(blocks(c)...))
+		return err
+	})
+}
+
+func (w *Web) Whisper(ctx context.Context, channel, user, text string) error {
+	return w.call(ctx, "chat.postEphemeral", func() error {
+		_, err := w.c.PostEphemeralContext(ctx, channel, user, slackgo.MsgOptionText(text, false))
+		return err
+	})
+}
+
+// blocks lays the card out: a header, the summary, the parameters in
+// preformatted blocks (one each chunk of ParamBlocks, which the caller
+// has checked fit), who asks and when it expires, then the buttons while
+// it waits or how it ended once decided. What the agent wrote (summary,
+// parameters, agent, requester) goes in plain text and preformatted
+// blocks, which Slack shows as they are; only the card's own labels, the
+// approver (from the hub's list) and the dates use Slack's markup. Times
+// are Slack date tokens, which each reader sees in their own time zone.
+func blocks(c Card) []slackgo.Block {
+	plain := func(s string) *slackgo.TextBlockObject {
+		return slackgo.NewTextBlockObject(slackgo.PlainTextType, s, false, false)
+	}
+	mrkdwn := func(s string) *slackgo.TextBlockObject {
+		return slackgo.NewTextBlockObject(slackgo.MarkdownType, s, false, false)
+	}
+	bs := []slackgo.Block{
+		slackgo.NewHeaderBlock(plain("审批请求")),
+		slackgo.NewSectionBlock(mrkdwn("*做什么*"), nil, nil),
+		slackgo.NewSectionBlock(plain(c.Summary), nil, nil),
+		slackgo.NewSectionBlock(mrkdwn("*参数*"), nil, nil),
+	}
+	chunks, _ := ParamBlocks(c.Params)
+	for i, chunk := range chunks {
+		bs = append(bs, slackgo.NewRichTextBlock(fmt.Sprintf("params:%d", i),
+			&slackgo.RichTextPreformatted{Type: slackgo.RTEPreformatted, Elements: []slackgo.RichTextSectionElement{slackgo.NewRichTextSectionTextElement(chunk, nil)}}))
+	}
+	who := []*slackgo.TextBlockObject{mrkdwn("*机器* (hub 认证)"), plain(c.Machine), mrkdwn("*agent* (自报)"), plain(c.Agent)}
+	if c.Requester != "" {
+		who = append(who, mrkdwn("*代谁* (agent 自报，不参与校验)"), plain(c.Requester))
+	}
+	bs = append(bs,
+		slackgo.NewSectionBlock(nil, who, nil),
+		slackgo.NewSectionBlock(nil, []*slackgo.TextBlockObject{mrkdwn("*过期*\n" + date(c.Expires)), mrkdwn("*编号*\n" + c.ID)}, nil),
+	)
+	if c.Outcome == "" {
+		return append(bs, slackgo.NewActionBlock(CardBlockID(c.ID),
+			slackgo.NewButtonBlockElement(ApproveAction, c.ID, plain("批准")).WithStyle(slackgo.StylePrimary),
+			slackgo.NewButtonBlockElement(RejectAction, c.ID, plain("拒绝")).WithStyle(slackgo.StyleDanger),
+		))
+	}
+	return append(bs, slackgo.NewSectionBlock(mrkdwn(outcomeText(c)), nil, nil))
+}
+
+// outcomeText says how a decided card ended, in one line.
+func outcomeText(c Card) string {
+	switch c.Outcome {
+	case "approved":
+		return "✅ *已批准* <@" + c.Approver + "> " + date(c.DecidedAt)
+	case "rejected":
+		return "⛔ *已拒绝* <@" + c.Approver + "> " + date(c.DecidedAt)
+	default:
+		return "⌛ *已过期* " + date(c.DecidedAt)
+	}
+}
+
+// date writes t as a Slack date token, with an RFC 3339 fallback.
+func date(t time.Time) string {
+	return fmt.Sprintf("<!date^%d^{date_short_pretty} {time}|%s>", t.Unix(), t.UTC().Format(time.RFC3339))
+}
+
 // DM opens the direct message conversation with user, or finds the one
 // already open, and posts text in it.
 func (w *Web) DM(ctx context.Context, user, text string) error {

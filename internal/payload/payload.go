@@ -4,6 +4,8 @@
 // write them with this package.
 package payload
 
+import "encoding/json"
+
 // Types of message.
 const (
 	// Post is a message an agent posts to a thread.
@@ -14,6 +16,16 @@ const (
 	// Alert is an alert a client raises, such as a dead letter, for the
 	// hub to send to the alerts webhook, which only the hub knows.
 	Alert = "alert"
+	// Approval is the outcome of an approval an agent requested, sent down
+	// to the client that requested it.
+	Approval = "approval"
+)
+
+// Outcomes of an approval, for Message.Outcome.
+const (
+	Approved = "approved"
+	Rejected = "rejected"
+	Expired  = "expired"
 )
 
 // Message is a decoded payload. Type is always set; which other fields are
@@ -36,4 +48,16 @@ type Message struct {
 	// with the inbound message that starts a thread in it; empty for a
 	// reply, a direct message, or when the hub could not read it.
 	Context string `json:"context,omitempty"`
+	// ApprovalID, Agent and Outcome are set on an approval outcome: which
+	// approval, the agent that requested it, and Approved, Rejected or
+	// Expired. Text is then the summary the request gave.
+	ApprovalID string `json:"approval_id,omitempty"`
+	Agent      string `json:"agent,omitempty"`
+	Outcome    string `json:"outcome,omitempty"`
+	// Approver is the Slack user id of the person who approved or
+	// rejected; empty when the approval expired.
+	Approver string `json:"approver,omitempty"`
+	// Approval is, on an approved outcome, the signed approval document
+	// as `fednet approval verify` reads it, to be written to a file as is.
+	Approval json.RawMessage `json:"approval,omitempty"`
 }

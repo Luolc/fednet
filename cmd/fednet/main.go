@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Luolc/fednet/internal/alert"
+	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/hubapi"
@@ -44,17 +46,22 @@ const usage = `usage: fednet <command> [flags]
 commands:
   hub -listen ADDR -db PATH [-config PATH]
       [-slack-app-token-file PATH -slack-bot-token-file PATH] [-alert-webhook-file PATH]
+      [-approval-key-file PATH]
         run the hub; with the two Slack token files it also takes in the
         messages people post in Slack and posts the clients' posts there,
-        and with the webhook file it sends alerts; each file holds one
+        with the webhook file it sends alerts, and with the approval key
+        (an Ed25519 private key, PKCS#8 PEM) it runs approvals: posts the
+        cards and signs what the approvers approve; each file holds one
         credential; the JSON config file says, for each channel, which
         client takes the threads people start in it and which clients may
-        open threads in it, which client takes direct messages, and lists
-        the Slack users fednet serves, each with a name for the agents,
-        which may be empty:
+        open threads in it, which client takes direct messages, lists the
+        Slack users fednet serves, each with a name for the agents, which
+        may be empty, and names the channel approval cards go to and the
+        users, from that list, who may approve:
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
-         "alerts": {"slack_down": "5m", "offline_queued": "10m"}}
+         "alerts": {"slack_down": "5m", "offline_queued": "10m"},
+         "approvals": {"channel": "C456", "approvers": ["U123"]}}
   hub register -db PATH CLIENT-ID HASH
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
@@ -86,6 +93,13 @@ commands:
         print the user list: each user's Slack id and name
   client dm -socket PATH -user USER-ID [-json] [--] TEXT
         send TEXT as a direct message to a user on the user list
+  client request-approval -socket PATH -agent NAME -action FILE [-requester USER-ID] [-json] [--] TEXT
+        ask for approval of an action: TEXT says what it does, FILE holds
+        its parameters as JSON, NAME is the agent that will act; prints the
+        approval id once the hub has posted the card; the outcome comes as
+        a message of type approval through the hook, signed when approved;
+        an action the card cannot show whole is refused; -requester is a
+        note on the card, not checked
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   approval verify -pubkey PATH -approval PATH -action PATH -machine CLIENT-ID -agent NAME -used PATH
@@ -231,6 +245,14 @@ type hubConfig struct {
 		// client.
 		OfflineQueued duration `json:"offline_queued"`
 	} `json:"alerts"`
+	// Approvals is about approval cards.
+	Approvals struct {
+		// Channel is where the cards go.
+		Channel string `json:"channel"`
+		// Approvers are the Slack user ids of the people who may decide;
+		// each must be on Users.
+		Approvers []string `json:"approvers"`
+	} `json:"approvals"`
 }
 
 // duration is a time.Duration written in JSON as a string such as "5m".
@@ -270,6 +292,11 @@ func readHubConfig(path string) (hubConfig, error) {
 	if err := d.Decode(&struct{}{}); err != io.EOF {
 		return hubConfig{}, fmt.Errorf("%s: more than one JSON value", path)
 	}
+	for _, u := range cfg.Approvals.Approvers {
+		if _, ok := cfg.Users[u]; !ok {
+			return hubConfig{}, fmt.Errorf("%s: approver %s is not on the user list", path, u)
+		}
+	}
 	return cfg, nil
 }
 
@@ -305,6 +332,8 @@ var (
 var (
 	hookRetry        hook.Retry
 	outboundInterval time.Duration
+	approvalInterval time.Duration
+	approvalTTL      time.Duration
 )
 
 // readSecret reads the credential in the file at path, without the white
@@ -334,6 +363,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	appTokenPath := fs.String("slack-app-token-file", "", "file holding the Slack app-level token, for Socket Mode")
 	botTokenPath := fs.String("slack-bot-token-file", "", "file holding the Slack bot token, for the Web API")
 	webhookPath := fs.String("alert-webhook-file", "", "file holding the URL of the Slack incoming webhook for alerts; read only with the Slack token files")
+	keyPath := fs.String("approval-key-file", "", "file holding the Ed25519 private key that signs approvals, PKCS#8 PEM; without it no approval can be requested")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
@@ -355,6 +385,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 		*webhookPath = ""
 	}
 	var appToken, botToken, webhookURL string
+	var err error
 	for _, f := range []struct {
 		path string
 		v    *string
@@ -362,7 +393,6 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 		if f.path == "" {
 			continue
 		}
-		var err error
 		if *f.v, err = readSecret(f.path); err != nil {
 			return err
 		}
@@ -375,6 +405,12 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	if webhookURL != "" {
 		webhook = &alert.Webhook{URL: webhookURL, From: inbound.HubName}
 	}
+	var key ed25519.PrivateKey
+	if *keyPath != "" {
+		if key, err = approval.ReadPrivateKey(*keyPath); err != nil {
+			return err
+		}
+	}
 	st, err := store.OpenHub(ctx, *dbPath)
 	if err != nil {
 		return err
@@ -384,9 +420,19 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	hub := &link.Hub{
 		Store:    st,
 		Identify: (&auth.Authenticator{Store: st}).Identify,
-		Answer:   (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users}).Answer,
 		Uplinked: poster.Nudge,
 	}
+	// Without the key, or without Slack, the hub runs no approvals: a
+	// request is refused rather than left waiting for a card that cannot
+	// be posted or a signature that cannot be made.
+	var approvals *approval.Flow
+	if key != nil && sl != nil {
+		approvals = &approval.Flow{
+			Store: st, Slack: sl, Key: key, Channel: cfg.Approvals.Channel, Approvers: cfg.Approvals.Approvers,
+			TTL: approvalTTL, Interval: approvalInterval, Stored: hub.WakeAll,
+		}
+	}
+	hub.Answer = (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals}).Answer
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -403,7 +449,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r := &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Stored: func() {
+		r := &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Approvals: approvals, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -415,6 +461,11 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) error {
 			}
 		})
 		wg.Go(func() { poster.Run(ctx) })
+		if approvals == nil {
+			slog.Info("hub: no approval key, approvals are off")
+		} else {
+			wg.Go(func() { approvals.Run(ctx) })
+		}
 		if webhook == nil {
 			slog.Warn("hub: no alert webhook, alerts are only logged")
 		} else {
@@ -537,6 +588,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientUsers(ctx, args[1:], stdout)
 		case "dm":
 			return clientDM(ctx, args[1:], stdout)
+		case "request-approval":
+			return clientRequestApproval(ctx, args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -849,6 +902,36 @@ func clientDM(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	return json.NewEncoder(stdout).Encode(res)
+}
+
+// clientRequestApproval asks the hub for approval of an action and prints
+// the approval id. The action file goes to the hub byte for byte: its
+// hash is what the approval will be signed over.
+func clientRequestApproval(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client request-approval", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	agent := fs.String("agent", "", "the agent that will act (required)")
+	actionPath := fs.String("action", "", "file holding the action's parameters as JSON (required)")
+	requester := fs.String("requester", "", "Slack id of the person the agent asks on behalf of, shown on the card as the agent's own word")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || *agent == "" || *actionPath == "" || fs.Arg(0) == "" {
+		return usageError("fednet client request-approval: -socket, -agent, -action and a non-empty TEXT are required")
+	}
+	action, err := os.ReadFile(*actionPath)
+	if err != nil {
+		return err
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.RequestApproval, Agent: *agent, Requester: *requester, Action: action, Text: fs.Arg(0)})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.ApprovalID)
+	return err
 }
 
 // clientInit creates the credential file and prints the client id and the
