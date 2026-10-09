@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -264,3 +265,59 @@ func (c *Client) send(ctx context.Context, m store.Message) error {
 	}
 	return nil
 }
+
+// Request sends req to the hub and returns the hub's answer. Unlike Post it
+// queues nothing: when the hub cannot be reached, or does not answer within
+// the timeout, it fails at once with an error that wraps ErrUnreachable. A
+// refusal comes back as an error that wraps ErrBadRequest, ErrDenied or
+// ErrNotFound; a request the hub does not accept the credential for wraps
+// ErrDenied.
+func (c *Client) Request(ctx context.Context, req []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Hub+RequestPath, bytes.NewReader(req))
+	if err != nil {
+		return nil, err
+	}
+	hreq.Header = c.header()
+	hreq.Header.Set("Content-Type", "application/json")
+	res, err := c.httpClient().Do(hreq)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxAnswerBytes))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	msg := strings.TrimSpace(string(body))
+	switch res.StatusCode {
+	case http.StatusOK:
+		return body, nil
+	case http.StatusUnauthorized:
+		return nil, refusal{ErrDenied, "the hub did not accept this client's credential"}
+	}
+	for _, f := range refusals {
+		if res.StatusCode == f.status {
+			return nil, refusal{f.err, msg}
+		}
+	}
+	return nil, fmt.Errorf("hub replied %s: %s", res.Status, msg)
+}
+
+// Refuse returns the error with which Hub.Answer refuses a request: kind is
+// ErrBadRequest, ErrDenied or ErrNotFound, and the message goes back to the
+// client.
+func Refuse(kind error, format string, args ...any) error {
+	return refusal{kind, fmt.Sprintf(format, args...)}
+}
+
+// refusal is a request the hub refused: it wraps the kind of refusal and
+// reads as the hub's message.
+type refusal struct {
+	kind error
+	msg  string
+}
+
+func (r refusal) Error() string { return r.msg }
+func (r refusal) Unwrap() error { return r.kind }
