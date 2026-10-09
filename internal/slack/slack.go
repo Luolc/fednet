@@ -37,13 +37,29 @@ type Message struct {
 	SubType string `json:"subtype,omitempty"`
 	// Files are the files uploaded with the message.
 	Files []File `json:"files,omitempty"`
+	// Machine is the machine named above the text of a message a machine
+	// posted through PostReply; empty for any other message.
+	Machine string `json:"machine,omitempty"`
 }
 
 // File is a file uploaded with a message.
 type File struct {
 	Name string `json:"name"`
+	// Mimetype and Size are what Slack reports of the file; Size is in
+	// bytes.
+	Mimetype string `json:"mimetype,omitempty"`
+	Size     int    `json:"size,omitempty"`
 	// URL is the file's permalink, which opens it in Slack.
 	URL string `json:"url"`
+}
+
+// Mentions reports whether text mentions user, as Slack writes a mention
+// in a message's text: <@ID> or <@ID|name>.
+func Mentions(text, user string) bool {
+	if user == "" {
+		return false
+	}
+	return strings.Contains(text, "<@"+user+">") || strings.Contains(text, "<@"+user+"|")
 }
 
 // Conversation is a channel or a direct message conversation.
@@ -55,6 +71,8 @@ type Conversation struct {
 
 // API is what the hub needs from Slack.
 type API interface {
+	// Self returns the Slack user id of the bot the token belongs to.
+	Self(ctx context.Context) (string, error)
 	// Replies returns the messages of the thread that starts at ts in
 	// channel, the first message included, oldest first.
 	Replies(ctx context.Context, channel, ts string) ([]Message, error)
@@ -271,6 +289,10 @@ func splitTS(ts string) (sec, usec int64) {
 	return sec, usec
 }
 
+// FakeBot is the user id of the Fake's bot: Self returns it, and Post,
+// PostReply and PostCard post as it.
+const FakeBot = "fednet"
+
 // Fake is an API kept in memory, for tests. Its zero value has no
 // channels; AddChannel adds one.
 type Fake struct {
@@ -384,9 +406,11 @@ func (f *Fake) Conversations(context.Context) ([]Conversation, error) {
 	return cs, nil
 }
 
-// Post posts as the user "fednet".
+func (f *Fake) Self(context.Context) (string, error) { return FakeBot, nil }
+
+// Post posts as the bot.
 func (f *Fake) Post(_ context.Context, channel, text string) (string, error) {
-	return f.Start(channel, "fednet", text)
+	return f.Start(channel, FakeBot, text)
 }
 
 // Start posts text from user in channel as a new message, which starts a
@@ -395,8 +419,8 @@ func (f *Fake) Start(channel, user, text string) (string, error) {
 	return f.Add(channel, Message{User: user, Text: text})
 }
 
-// PostReply posts as the user "fednet" and records machine, which Machine
-// returns.
+// PostReply posts as the bot, naming machine as Web does, and records
+// machine, which Machine returns.
 func (f *Fake) PostReply(_ context.Context, channel, ts, machine, text string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -404,7 +428,7 @@ func (f *Fake) PostReply(_ context.Context, channel, ts, machine, text string) (
 	if !ok || c.threads[ts] == nil {
 		return "", ErrNotFound
 	}
-	m := Message{TS: f.next(), User: "fednet", Text: text}
+	m := Message{TS: f.next(), User: FakeBot, Text: text, Machine: machine}
 	c.threads[ts] = append(c.threads[ts], m)
 	if f.machines == nil {
 		f.machines = make(map[string]string)
@@ -483,14 +507,14 @@ func (f *Fake) DMs(user string) []string {
 	return append([]string(nil), f.dms[user]...)
 }
 
-// PostCard posts the card as a message from the user "fednet" whose text
-// is the card's summary, and keeps the card for Card. Like Slack, it
-// refuses a card of more than maxBlocks blocks, as Web would lay it out.
+// PostCard posts the card as a message from the bot whose text is the
+// card's summary, and keeps the card for Card. Like Slack, it refuses a
+// card of more than maxBlocks blocks, as Web would lay it out.
 func (f *Fake) PostCard(_ context.Context, channel string, c Card) (string, error) {
 	if err := fits(c); err != nil {
 		return "", err
 	}
-	ts, err := f.Add(channel, Message{User: "fednet", Text: c.Summary})
+	ts, err := f.Add(channel, Message{User: FakeBot, Text: c.Summary})
 	if err != nil {
 		return "", err
 	}

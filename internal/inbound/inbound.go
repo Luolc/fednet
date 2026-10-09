@@ -80,6 +80,12 @@ type Receiver struct {
 	// Users is the user list: only messages from people on it are taken
 	// in.
 	Users map[string]string
+	// Bot is the Slack user id of the hub's bot: a message in a channel
+	// hands its thread to a client only if it mentions the bot. Empty
+	// means no message does.
+	Bot string
+	// History bounds the thread history a Mention carries.
+	History Limits
 	// Window is how far back a backfill reads at most; zero means
 	// DefaultWindow.
 	Window time.Duration
@@ -118,27 +124,65 @@ type Receiver struct {
 // returns once that has committed; the caller then acks the event. A
 // message recorded before is not queued again. A reply in a thread the hub
 // does not know is preceded by the thread's first message, read from
-// Slack, when that is recent enough for a backfill to read; a reply whose
-// thread still has no owner is recorded and dropped. A new thread no
-// machine takes is recorded too, with a post from the hub saying so put in
-// the hub's inbox for the outbound side to deliver. An error means
-// nothing was recorded, and the event must not be acked.
+// Slack, when that is recent enough for a backfill to read.
+//
+// What is handed on: every message in a direct message conversation; a
+// reply in a thread that has an owner; and a message in a channel that
+// mentions the bot, whose thread then gets the channel's default machine
+// as its owner and, when the thread had messages before, their history.
+// A message in a channel that mentions nobody and whose thread has no
+// owner is not the agents' business and is not even recorded. A mention
+// in a channel no machine takes is recorded, with a post from the hub
+// saying so put in the hub's inbox for the outbound side to deliver. An
+// error means nothing was recorded, and the event must not be acked.
 func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	if !r.wanted(ev) {
 		return nil
-	}
-	if ev.ThreadTS != "" {
-		if err := r.rootFirst(ctx, ev); err != nil {
-			return err
-		}
 	}
 	thread := slack.ThreadKey(ev.Channel, ev.ThreadTS)
 	if ev.ThreadTS == "" {
 		thread = slack.ThreadKey(ev.Channel, ev.TS)
 	}
-	m := payload.Message{Type: payload.Inbound, Thread: thread, Text: text(ev), User: ev.User, TS: ev.TS}
-	if ev.ThreadTS == "" && !ev.IM {
+	mentioned := !ev.IM && slack.Mentions(ev.Text, r.Bot)
+	owned, err := r.owned(ctx, thread)
+	if err != nil {
+		return err
+	}
+	// A reply in a thread the hub does not know: the thread is read once,
+	// to take in its first message first and, on a mention, for the
+	// history. A mention goes even when the thread cannot be read.
+	var before []slack.Message
+	if ev.ThreadTS != "" && !owned {
+		ms, err := r.Slack.Replies(ctx, ev.Channel, ev.ThreadTS)
+		switch {
+		case errors.Is(err, slack.ErrNotFound):
+		case err != nil && mentioned:
+			slog.Warn("inbound: reading the thread of a mention, sending without its history", "thread", thread, "err", err)
+		case err != nil:
+			return fmt.Errorf("inbound: reading the thread of a reply: %w", err)
+		default:
+			if err := r.rootFirst(ctx, ev, ms); err != nil {
+				return err
+			}
+			before = ms
+			if owned, err = r.owned(ctx, thread); err != nil {
+				return err
+			}
+		}
+	}
+	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.Users[ev.User], TS: ev.TS, Files: files(ev.Files)}
+	m.Text = text(ev, r.History.messageChars())
+	switch {
+	case ev.IM:
+		m.Trigger = payload.DM
+	case owned:
+		m.Trigger = payload.Reply
+	case mentioned:
+		m.Trigger = payload.Mention
 		m.Context = r.purpose(ctx, ev.Channel)
+		m.History = r.history(ev, thread, before)
+	default:
+		return nil
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -148,12 +192,12 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		rt := route.New(tx, r.Route)
 		var err error
 		switch {
-		case ev.ThreadTS != "":
-			_, err = rt.RouteReply(ctx, thread, b)
-		case ev.IM:
+		case m.Trigger == payload.Mention:
+			_, err = rt.RouteNew(ctx, ev.Channel, thread, b)
+		case ev.IM && ev.ThreadTS == "":
 			_, err = rt.RouteNewDM(ctx, thread, b)
 		default:
-			_, err = rt.RouteNew(ctx, ev.Channel, thread, b)
+			_, err = rt.RouteReply(ctx, thread, b)
 		}
 		switch {
 		case errors.Is(err, route.ErrNoMachine):
@@ -193,16 +237,27 @@ func (r *Receiver) wanted(ev Event) bool {
 	return ok
 }
 
-// text is the message's text with its files listed after it, one a line.
-func text(ev Event) string {
+// text is the message's text, cut to max characters, with its files
+// listed after it, one a line.
+func text(ev Event, max int) string {
 	lines := make([]string, 0, 1+len(ev.Files))
 	if ev.Text != "" {
-		lines = append(lines, ev.Text)
+		t, _ := clip(ev.Text, max)
+		lines = append(lines, t)
 	}
 	for _, f := range ev.Files {
 		lines = append(lines, "file: "+f.Name+" "+f.URL)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// files is the metadata of fs for the payload.
+func files(fs []slack.File) []payload.File {
+	var out []payload.File
+	for _, f := range fs {
+		out = append(out, payload.File{Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.URL})
+	}
+	return out
 }
 
 // purpose returns channel's purpose, the context a new thread carries, or
@@ -217,24 +272,22 @@ func (r *Receiver) purpose(ctx context.Context, channel string) string {
 	return p
 }
 
-// rootFirst takes in the first message of ev's thread before ev when the
-// hub does not know the thread: the reply may have arrived before the
-// message that started the thread, as when Slack redelivers what was in
-// flight at a disconnection. The first message is read from Slack and
-// taken in only if a backfill could read it, that is if it is within
-// Window; an older thread is one the hub never had.
-func (r *Receiver) rootFirst(ctx context.Context, ev Event) error {
-	_, err := r.Store.Owner(ctx, slack.ThreadKey(ev.Channel, ev.ThreadTS))
-	if !errors.Is(err, store.ErrNotFound) {
-		return err
+// owned reports whether thread has an owner.
+func (r *Receiver) owned(ctx context.Context, thread string) (bool, error) {
+	_, err := r.Store.Owner(ctx, thread)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
 	}
-	ms, err := r.Slack.Replies(ctx, ev.Channel, ev.ThreadTS)
-	if errors.Is(err, slack.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inbound: reading the thread of a reply: %w", err)
-	}
+	return err == nil, err
+}
+
+// rootFirst takes in the first message of ev's thread, ms as Slack gives
+// the thread, before ev: the reply may have arrived before the message
+// that started the thread, as when Slack redelivers what was in flight at
+// a disconnection. The first message is taken in only if a backfill could
+// read it, that is if it is within Window; an older thread is one the hub
+// never had.
+func (r *Receiver) rootFirst(ctx context.Context, ev Event, ms []slack.Message) error {
 	if len(ms) == 0 || ms[0].TS != ev.ThreadTS || slack.CompareTS(ms[0].TS, slackTS(r.now().Add(-r.window()))) <= 0 {
 		return nil
 	}

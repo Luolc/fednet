@@ -33,6 +33,10 @@ var epoch = time.Unix(1700000000, 0)
 
 var users = map[string]string{"U1": "maintainer", "U2": ""}
 
+// hey mentions the bot, as a message that hands its thread to an agent
+// must.
+const hey = "<@" + slack.FakeBot + "> "
+
 func openHub(t *testing.T, path string) *store.Hub {
 	t.Helper()
 	h, err := store.OpenHub(t.Context(), path)
@@ -58,6 +62,7 @@ func newReceiver(t *testing.T) (*Receiver, *slack.Fake) {
 		Slack: f,
 		Route: route.Config{Defaults: map[string]string{"C1": "workstation", "C2": "datamachine"}, DM: "workstation"},
 		Users: users,
+		Bot:   slack.FakeBot,
 		Now:   func() time.Time { return epoch.Add(time.Hour) },
 	}
 	return r, f
@@ -81,7 +86,8 @@ func queued(t *testing.T, h *store.Hub, client string) []payload.Message {
 	return ms
 }
 
-// texts returns the texts of the inbound messages queued for client.
+// texts returns the texts of the inbound messages queued for client, the
+// mention of the bot left off.
 func texts(t *testing.T, h *store.Hub, client string) []string {
 	t.Helper()
 	var ts []string
@@ -89,7 +95,7 @@ func texts(t *testing.T, h *store.Hub, client string) []string {
 		if m.Type != payload.Inbound {
 			t.Fatalf("queued for %s: type %q, want %q", client, m.Type, payload.Inbound)
 		}
-		ts = append(ts, m.Text)
+		ts = append(ts, strings.TrimPrefix(m.Text, hey))
 	}
 	return ts
 }
@@ -131,10 +137,17 @@ func TestHandleRoutes(t *testing.T) {
 	r, _ := newReceiver(t)
 	h := r.Store
 
-	// A new thread in a channel goes to the channel's default machine,
-	// with the channel's purpose; a reply in it goes to the owner, without,
-	// even after the default changed.
-	handle(t, r, message("Ev1", "C2", "1.1", "", "first"))
+	// A message in a channel that mentions nobody is not the agents'
+	// business: it goes nowhere and its thread gets no owner. One that
+	// mentions the bot hands its thread to the channel's default machine,
+	// with the channel's purpose and the sender's name; a reply in it goes
+	// to the owner, mention or not, without the purpose, even after the
+	// default changed.
+	handle(t, r, message("Ev0", "C2", "1.0", "", "just chatting"))
+	if _, err := h.Owner(ctx, "C2/1.0"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Owner(C2/1.0) after a message that mentions nobody: err = %v, want ErrNotFound", err)
+	}
+	handle(t, r, message("Ev1", "C2", "1.1", "", hey+"first"))
 	if owner, err := h.Owner(ctx, "C2/1.1"); err != nil || owner != "datamachine" {
 		t.Fatalf("Owner(C2/1.1) = %q, %v; want datamachine", owner, err)
 	}
@@ -143,42 +156,276 @@ func TestHandleRoutes(t *testing.T) {
 	me := message("Ev3", "C2", "1.3", "1.1", "shrugs")
 	me.SubType = "me_message"
 	handle(t, r, me)
+	handle(t, r, message("Ev4", "C2", "1.4", "1.1", hey+"again"))
 	got := queued(t, h, "datamachine")
 	want := []payload.Message{
-		{Type: payload.Inbound, Thread: "C2/1.1", Text: "first", User: "U1", TS: "1.1", Context: "the data channel"},
-		{Type: payload.Inbound, Thread: "C2/1.1", Text: "reply", User: "U1", TS: "1.2"},
-		{Type: payload.Inbound, Thread: "C2/1.1", Text: "shrugs", User: "U1", TS: "1.3"},
+		{Type: payload.Inbound, Thread: "C2/1.1", Text: hey + "first", User: "U1", UserName: "maintainer", TS: "1.1", Context: "the data channel", Trigger: payload.Mention},
+		{Type: payload.Inbound, Thread: "C2/1.1", Text: "reply", User: "U1", UserName: "maintainer", TS: "1.2", Trigger: payload.Reply},
+		{Type: payload.Inbound, Thread: "C2/1.1", Text: "shrugs", User: "U1", UserName: "maintainer", TS: "1.3", Trigger: payload.Reply},
+		{Type: payload.Inbound, Thread: "C2/1.1", Text: hey + "again", User: "U1", UserName: "maintainer", TS: "1.4", Trigger: payload.Reply},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("queued for datamachine = %+v, want %+v", got, want)
 	}
 
-	// Each message that is not a reply in a direct message conversation
-	// starts a thread for the DM machine, with no context; a reply in it
-	// follows the owner.
-	dm := message("Ev4", "D1", "2.1", "", "psst")
+	// Every message in a direct message conversation goes to the DM
+	// machine, mention or not: each that is not a reply starts a thread,
+	// with no context; a reply follows the owner.
+	dm := message("Ev5", "D1", "2.1", "", "psst")
 	dm.IM = true
 	handle(t, r, dm)
-	dm = message("Ev5", "D1", "2.2", "", "again")
+	dm = message("Ev6", "D1", "2.2", "", "again")
 	dm.IM = true
 	handle(t, r, dm)
-	reply := message("Ev6", "D1", "2.3", "2.1", "more")
+	reply := message("Ev7", "D1", "2.3", "2.1", "more")
 	reply.IM = true
 	handle(t, r, reply)
 	got = queued(t, h, "workstation")
 	want = []payload.Message{
-		{Type: payload.Inbound, Thread: "D1/2.1", Text: "psst", User: "U1", TS: "2.1"},
-		{Type: payload.Inbound, Thread: "D1/2.2", Text: "again", User: "U1", TS: "2.2"},
-		{Type: payload.Inbound, Thread: "D1/2.1", Text: "more", User: "U1", TS: "2.3"},
+		{Type: payload.Inbound, Thread: "D1/2.1", Text: "psst", User: "U1", UserName: "maintainer", TS: "2.1", Trigger: payload.DM},
+		{Type: payload.Inbound, Thread: "D1/2.2", Text: "again", User: "U1", UserName: "maintainer", TS: "2.2", Trigger: payload.DM},
+		{Type: payload.Inbound, Thread: "D1/2.1", Text: "more", User: "U1", UserName: "maintainer", TS: "2.3", Trigger: payload.DM},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("queued for workstation = %+v, want %+v", got, want)
 	}
 
-	// A reply in a thread Slack does not know goes nowhere.
-	handle(t, r, message("Ev7", "C2", "3.2", "3.1", "orphan"))
-	if n := len(all(t, h)); n != 6 {
-		t.Fatalf("%d queued after an orphan reply, want 6", n)
+	// A reply that mentions nobody in a thread with no owner goes nowhere,
+	// whether or not Slack knows the thread.
+	handle(t, r, message("Ev8", "C2", "1.5", "1.0", "still chatting"))
+	handle(t, r, message("Ev9", "C2", "3.2", "3.1", "orphan"))
+	if n := len(all(t, h)); n != 7 {
+		t.Fatalf("%d queued after replies in threads with no owner, want 7", n)
+	}
+}
+
+// A mention in a thread that has no owner hands the thread over with the
+// messages before it, the thread's first message included, and the
+// purpose; later replies carry no history. A machine's own reply is
+// named by its machine and has no user.
+func TestHandleMentionInThread(t *testing.T) {
+	ctx := t.Context()
+	r, f := newReceiver(t)
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: "CI is red again"})
+	handle(t, r, root)
+	post(t, f, "C1", slack.Message{User: "U2", Text: "which job?", ThreadTS: root.TS})
+	if _, err := f.PostReply(ctx, "C1", root.TS, "datamachine", "not me"); err != nil {
+		t.Fatal(err)
+	}
+	withFile := post(t, f, "C1", slack.Message{User: "U1", Text: "this one", ThreadTS: root.TS, SubType: "file_share", Files: []slack.File{{Name: "ci.png", Mimetype: "image/png", Size: 183204, URL: "https://example.invalid/ci.png"}}})
+	handle(t, r, withFile)
+	if _, err := r.Store.Owner(ctx, "C1/"+root.TS); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Owner before any mention: err = %v, want ErrNotFound", err)
+	}
+	ask := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "have a look", ThreadTS: root.TS})
+	handle(t, r, ask)
+	later := post(t, f, "C1", slack.Message{User: "U2", Text: "thanks", ThreadTS: root.TS})
+	handle(t, r, later)
+	got := queued(t, r.Store, "workstation")
+	thread := "C1/" + root.TS
+	want := []payload.Message{
+		{Type: payload.Inbound, Thread: thread, Text: hey + "have a look", User: "U1", UserName: "maintainer", TS: ask.TS, Context: "repo: fednet", Trigger: payload.Mention, History: &payload.History{
+			Total: 4, Included: 4, Omitted: 0,
+			Messages: []payload.HistoryMessage{
+				{TS: root.TS, User: "U1", Name: "maintainer", Text: "CI is red again", Files: []payload.File{}},
+				{TS: "1700000000.100002", User: "U2", Name: "", Text: "which job?", Files: []payload.File{}},
+				{TS: "1700000000.100003", User: "", Name: "fednet (datamachine)", Text: "not me", Files: []payload.File{}},
+				{TS: withFile.TS, User: "U1", Name: "maintainer", Text: "this one", Files: []payload.File{{Name: "ci.png", Mimetype: "image/png", Size: 183204, URL: "https://example.invalid/ci.png"}}},
+			},
+			ReadMore: "fednet client read-thread -socket <socket> " + thread,
+		}},
+		{Type: payload.Inbound, Thread: thread, Text: "thanks", User: "U2", TS: later.TS, Trigger: payload.Reply},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("queued for workstation = %s, want %s", pretty(t, got), pretty(t, want))
+	}
+	// Sent down, every message of the history has its fields, files and
+	// truncated included, even when empty; the reply has no history.
+	ds, err := r.Store.Outbox.After(ctx, "workstation", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type sentHistory struct {
+		History *struct {
+			Messages []map[string]json.RawMessage `json:"messages"`
+		} `json:"history"`
+	}
+	var sent []sentHistory
+	for _, d := range ds {
+		var m sentHistory
+		if err := json.Unmarshal(d.Payload, &m); err != nil {
+			t.Fatal(err)
+		}
+		sent = append(sent, m)
+	}
+	if sent[0].History == nil || sent[1].History != nil {
+		t.Fatalf("histories sent = %+v, want one on the mention only", sent)
+	}
+	for i, m := range sent[0].History.Messages {
+		for _, key := range []string{"ts", "user", "name", "text", "truncated", "files"} {
+			if _, ok := m[key]; !ok {
+				t.Errorf("history message %d lacks %q: %v", i, key, m)
+			}
+		}
+	}
+}
+
+// pretty writes v as indented JSON.
+func pretty(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.MarshalIndent(v, "", " ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// countingReplies is a Slack that counts the calls to Replies.
+type countingReplies struct {
+	slack.API
+	calls int
+}
+
+func (c *countingReplies) Replies(ctx context.Context, channel, ts string) ([]slack.Message, error) {
+	c.calls++
+	return c.API.Replies(ctx, channel, ts)
+}
+
+// A mention on a thread's first message carries no history, there being
+// nothing before it, and does not read the thread.
+func TestHandleMentionOnRootReadsNoThread(t *testing.T) {
+	r, f := newReceiver(t)
+	c := &countingReplies{API: f}
+	r.Slack = c
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
+	handle(t, r, root)
+	got := queued(t, r.Store, "workstation")
+	if len(got) != 1 || got[0].History != nil || got[0].Trigger != payload.Mention {
+		t.Fatalf("queued = %+v, want one mention without history", got)
+	}
+	if c.calls != 0 {
+		t.Fatalf("Replies was called %d times for a mention on a first message, want 0", c.calls)
+	}
+}
+
+// noReplies is a Slack whose Replies fails.
+type noReplies struct{ slack.API }
+
+func (noReplies) Replies(context.Context, string, string) ([]slack.Message, error) {
+	return nil, errors.New("flaky")
+}
+
+// When the thread cannot be read, the mention goes anyway, without a
+// history and with its text as it is.
+func TestHandleMentionWithoutHistory(t *testing.T) {
+	r, f := newReceiver(t)
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: "chatter"})
+	handle(t, r, root)
+	r.Slack = noReplies{f}
+	ask := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "look", ThreadTS: root.TS})
+	handle(t, r, ask)
+	got := queued(t, r.Store, "workstation")
+	want := []payload.Message{{Type: payload.Inbound, Thread: "C1/" + root.TS, Text: hey + "look", User: "U1", UserName: "maintainer", TS: ask.TS, Context: "repo: fednet", Trigger: payload.Mention}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("queued when the thread cannot be read = %+v, want %+v", got, want)
+	}
+	if owner, err := r.Store.Owner(t.Context(), "C1/"+root.TS); err != nil || owner != "workstation" {
+		t.Fatalf("Owner = %q, %v; want workstation", owner, err)
+	}
+}
+
+// The history holds the latest messages within the limits: at most
+// MaxMessages, their texts adding up to at most MaxChars, the latest one
+// always, each text cut to MaxMessageChars; the trigger's text is cut the
+// same way. Characters, not bytes, are counted.
+func TestHistoryLimits(t *testing.T) {
+	r, f := newReceiver(t)
+	r.History = Limits{MaxMessages: 3, MaxChars: 10, MaxMessageChars: 4}
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: "ab"})
+	handle(t, r, root)
+	for _, text := range []string{"cd", "二三四五六", "gh", "ij"} {
+		post(t, f, "C1", slack.Message{User: "U2", Text: text, ThreadTS: root.TS})
+	}
+	ask := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "一二三四五", ThreadTS: root.TS})
+	handle(t, r, ask)
+	got := queued(t, r.Store, "workstation")
+	if len(got) != 1 || got[0].History == nil {
+		t.Fatalf("queued = %+v, want one mention with a history", got)
+	}
+	if got[0].Text != hey[:4]+TruncatedMark {
+		t.Fatalf("the trigger's text = %q, want it cut to 4 characters", got[0].Text)
+	}
+	h := got[0].History
+	var texts []string
+	for _, m := range h.Messages {
+		texts = append(texts, m.Text)
+	}
+	// Of the 5 before, at most 3: "ij", "gh" fit (4 characters); the
+	// cut "二三四五六" would take the total to 4+4+len(mark), over 10.
+	if h.Total != 5 || h.Included != 2 || h.Omitted != 3 || !slices.Equal(texts, []string{"gh", "ij"}) {
+		t.Fatalf("history = %s, want the latest 2 of 5", pretty(t, h))
+	}
+	// With room for the characters but not for more messages, the count
+	// is what stops.
+	r.History = Limits{MaxMessages: 2, MaxChars: 1000, MaxMessageChars: 1000}
+	root = post(t, f, "C1", slack.Message{User: "U1", Text: "one"})
+	handle(t, r, root)
+	post(t, f, "C1", slack.Message{User: "U2", Text: "two", ThreadTS: root.TS})
+	post(t, f, "C1", slack.Message{User: "U2", Text: "three", ThreadTS: root.TS})
+	ask = post(t, f, "C1", slack.Message{User: "U1", Text: hey + "count", ThreadTS: root.TS})
+	handle(t, r, ask)
+	got = queued(t, r.Store, "workstation")
+	if len(got) != 2 || got[1].History == nil {
+		t.Fatalf("queued = %+v, want a second mention with a history", got)
+	}
+	h = got[1].History
+	texts = nil
+	for _, m := range h.Messages {
+		texts = append(texts, m.Text)
+	}
+	if h.Total != 3 || h.Included != 2 || h.Omitted != 1 || !slices.Equal(texts, []string{"two", "three"}) {
+		t.Fatalf("history under the message limit = %s, want the latest 2 of 3", pretty(t, h))
+	}
+
+	// With room for more messages but not for the characters, the latest
+	// one is included anyway, cut.
+	r.History = Limits{MaxMessages: 3, MaxChars: 1, MaxMessageChars: 4}
+	root = post(t, f, "C1", slack.Message{User: "U1", Text: "ab"})
+	handle(t, r, root)
+	post(t, f, "C1", slack.Message{User: "U2", Text: "二三四五六", ThreadTS: root.TS})
+	ask = post(t, f, "C1", slack.Message{User: "U1", Text: hey + "once more", ThreadTS: root.TS})
+	handle(t, r, ask)
+	got = queued(t, r.Store, "workstation")
+	if len(got) != 3 || got[2].History == nil {
+		t.Fatalf("queued = %+v, want a third mention with a history", got)
+	}
+	h = got[2].History
+	if h.Total != 2 || h.Included != 1 || len(h.Messages) != 1 || h.Messages[0].Text != "二三四五"+TruncatedMark || !h.Messages[0].Truncated {
+		t.Fatalf("history over the character limit = %s, want the latest message alone, cut", pretty(t, h))
+	}
+}
+
+// Replies in a thread an agent opened go to it without a mention, as
+// replies, with no history.
+func TestHandleRepliesInAgentThread(t *testing.T) {
+	ctx := t.Context()
+	r, f := newReceiver(t)
+	ts, err := f.Post(ctx, "C2", "I opened this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Store.Claim(ctx, "C2/"+ts, "workstation"); err != nil {
+		t.Fatal(err)
+	}
+	reply := post(t, f, "C2", slack.Message{User: "U1", Text: "noted", ThreadTS: ts})
+	handle(t, r, reply)
+	got := queued(t, r.Store, "workstation")
+	want := []payload.Message{{Type: payload.Inbound, Thread: "C2/" + ts, Text: "noted", User: "U1", UserName: "maintainer", TS: reply.TS, Trigger: payload.Reply}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("queued for the agent's thread = %+v, want %+v", got, want)
+	}
+	if n := len(queued(t, r.Store, "datamachine")); n != 0 {
+		t.Fatalf("%d queued for the channel's default machine, want 0", n)
 	}
 }
 
@@ -190,9 +437,9 @@ func (noPurpose) Purpose(context.Context, string) (string, error) { return "", e
 func TestHandleWithoutPurpose(t *testing.T) {
 	r, f := newReceiver(t)
 	r.Slack = noPurpose{f}
-	handle(t, r, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
 	got := queued(t, r.Store, "workstation")
-	want := []payload.Message{{Type: payload.Inbound, Thread: "C1/1.1", Text: "first", User: "U1", TS: "1.1"}}
+	want := []payload.Message{{Type: payload.Inbound, Thread: "C1/1.1", Text: hey + "first", User: "U1", UserName: "maintainer", TS: "1.1", Trigger: payload.Mention}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("queued when the purpose cannot be read = %+v, want %+v", got, want)
 	}
@@ -200,9 +447,9 @@ func TestHandleWithoutPurpose(t *testing.T) {
 
 func TestHandleFiles(t *testing.T) {
 	r, _ := newReceiver(t)
-	ev := message("Ev1", "C1", "1.1", "", "see these")
+	ev := message("Ev1", "C1", "1.1", "", hey+"see these")
 	ev.SubType = "file_share"
-	ev.Files = []slack.File{{Name: "a.txt", URL: "https://example.invalid/a"}, {Name: "b c.png", URL: "https://example.invalid/b"}}
+	ev.Files = []slack.File{{Name: "a.txt", Mimetype: "text/plain", Size: 12, URL: "https://example.invalid/a"}, {Name: "b c.png", URL: "https://example.invalid/b"}}
 	handle(t, r, ev)
 	ev = message("Ev2", "C1", "1.2", "1.1", "")
 	ev.Files = []slack.File{{Name: "d.log", URL: "https://example.invalid/d"}}
@@ -214,16 +461,27 @@ func TestHandleFiles(t *testing.T) {
 	if got := texts(t, r.Store, "workstation"); !slices.Equal(got, want) {
 		t.Fatalf("texts = %q, want %q", got, want)
 	}
+	// The files' metadata goes along too.
+	got := queued(t, r.Store, "workstation")
+	wantFiles := [][]payload.File{
+		{{Name: "a.txt", Mimetype: "text/plain", Size: 12, URL: "https://example.invalid/a"}, {Name: "b c.png", URL: "https://example.invalid/b"}},
+		{{Name: "d.log", URL: "https://example.invalid/d"}},
+	}
+	for i, m := range got {
+		if !reflect.DeepEqual(m.Files, wantFiles[i]) {
+			t.Fatalf("files of message %d = %+v, want %+v", i, m.Files, wantFiles[i])
+		}
+	}
 }
 
 func TestHandleDedupsEvents(t *testing.T) {
 	r, _ := newReceiver(t)
 	// Slack redelivers an event it got no ack for; the same message may
 	// also come under another event id, and later from history.
-	handle(t, r, message("Ev1", "C1", "1.1", "", "first"))
-	handle(t, r, message("Ev1", "C1", "1.1", "", "first"))
-	handle(t, r, message("Ev2", "C1", "1.1", "", "first"))
-	handle(t, r, message("", "C1", "1.1", "", "first"))
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
+	handle(t, r, message("Ev2", "C1", "1.1", "", hey+"first"))
+	handle(t, r, message("", "C1", "1.1", "", hey+"first"))
 	handle(t, r, message("Ev3", "C1", "1.2", "1.1", "reply"))
 	handle(t, r, message("Ev3", "C1", "1.2", "1.1", "reply"))
 	if got := texts(t, r.Store, "workstation"); !slices.Equal(got, []string{"first", "reply"}) {
@@ -240,8 +498,8 @@ func TestHandleDedupsAcrossInstances(t *testing.T) {
 	r1.Store = openHub(t, path)
 	r2, _ := newReceiver(t)
 	r2.Store = openHub(t, path)
-	handle(t, r1, message("Ev1", "C1", "1.1", "", "first"))
-	handle(t, r2, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r1, message("Ev1", "C1", "1.1", "", hey+"first"))
+	handle(t, r2, message("Ev1", "C1", "1.1", "", hey+"first"))
 	handle(t, r2, message("Ev2", "C1", "1.2", "1.1", "reply"))
 	handle(t, r1, message("Ev2", "C1", "1.2", "1.1", "reply"))
 	for i, r := range []*Receiver{r1, r2} {
@@ -259,7 +517,7 @@ func TestHandleFailsWhenStoreFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.db")
 	r, _ := newReceiver(t)
 	r.Store = openHub(t, path)
-	handle(t, r, message("Ev1", "C1", "1.1", "", "first"))
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
 	r.Store.Close()
 	if err := r.Handle(ctx, message("Ev2", "C1", "1.2", "1.1", "reply")); err == nil {
 		t.Fatal("Handle with the database closed returned no error")
@@ -277,7 +535,7 @@ func TestHandleFailsWhenStoreFails(t *testing.T) {
 
 func TestHandleFilters(t *testing.T) {
 	r, _ := newReceiver(t)
-	handle(t, r, message("Ev0", "C1", "1.0", "", "first"))
+	handle(t, r, message("Ev0", "C1", "1.0", "", hey+"first"))
 	for _, tt := range []struct {
 		name string
 		edit func(ev *Event)
@@ -289,7 +547,7 @@ func TestHandleFilters(t *testing.T) {
 		{"someone joining", func(ev *Event) { ev.SubType = "channel_join" }},
 		{"a topic change", func(ev *Event) { ev.SubType = "channel_topic" }},
 	} {
-		ev := message("Ev"+tt.name, "C1", "1.1", "", tt.name)
+		ev := message("Ev"+tt.name, "C1", "1.1", "", hey+tt.name)
 		tt.edit(&ev)
 		handle(t, r, ev)
 		ev = message("Ev"+tt.name+" reply", "C1", "1.2", "1.0", tt.name)
@@ -300,7 +558,7 @@ func TestHandleFilters(t *testing.T) {
 		t.Fatalf("texts = %q, want only [first]", got)
 	}
 	// A filtered message is not recorded, so U1 can still post with its ts.
-	handle(t, r, message("Ev1", "C1", "1.1", "", "second"))
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"second"))
 	if got := texts(t, r.Store, "workstation"); !slices.Equal(got, []string{"first", "second"}) {
 		t.Fatalf("texts = %q, want [first second]", got)
 	}
@@ -327,11 +585,16 @@ func posts(t *testing.T, h *store.Hub) []string {
 func TestHandleNoMachineTellsThread(t *testing.T) {
 	ctx := t.Context()
 	r, f := newReceiver(t)
-	ts, err := f.Start("C3", "U1", "anyone?")
+	ts, err := f.Start("C3", "U1", hey+"anyone?")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev := message("Ev1", "C3", ts, "", "anyone?")
+	// Chatter that mentions nobody is not answered.
+	handle(t, r, message("Ev0", "C3", "0.9", "", "anyone?"))
+	if got := posts(t, r.Store); len(got) != 0 {
+		t.Fatalf("hub inbox after a message that mentions nobody = %q, want nothing", got)
+	}
+	ev := message("Ev1", "C3", ts, "", hey+"anyone?")
 	handle(t, r, ev)
 	handle(t, r, ev)
 	// The hub's answer is a post in its inbox, once, that the outbound
@@ -397,9 +660,9 @@ func TestBackfill(t *testing.T) {
 	}
 
 	// Live: a thread in C1, a thread in C2, a DM thread.
-	c1 := post(t, f, "C1", slack.Message{User: "U1", Text: "c1 first"})
+	c1 := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "c1 first"})
 	handle(t, r, c1)
-	c2 := post(t, f, "C2", slack.Message{User: "U1", Text: "c2 first"})
+	c2 := post(t, f, "C2", slack.Message{User: "U1", Text: hey + "c2 first"})
 	handle(t, r, c2)
 	d1 := post(t, f, "D1", slack.Message{User: "U1", Text: "dm first"})
 	handle(t, r, d1)
@@ -410,11 +673,11 @@ func TestBackfill(t *testing.T) {
 	r.Disconnected()
 	gap := post(t, f, "C1", slack.Message{User: "U1", Text: "c1 gap reply", ThreadTS: c1.TS})
 	post(t, f, "C2", slack.Message{User: "U2", Text: "c2 gap reply", ThreadTS: c2.TS})
-	post(t, f, "C2", slack.Message{User: "U1", Text: "c2 gap thread"})
+	post(t, f, "C2", slack.Message{User: "U1", Text: hey + "c2 gap thread"})
 	post(t, f, "D1", slack.Message{User: "U1", Text: "dm gap reply", ThreadTS: d1.TS})
 	post(t, f, "D1", slack.Message{User: "U1", Text: "dm gap thread"})
-	post(t, f, "C1", slack.Message{User: "U1", Text: "bot", BotID: "B1"})
-	post(t, f, "C1", slack.Message{User: "U9", Text: "stranger"})
+	post(t, f, "C1", slack.Message{User: "U1", Text: hey + "bot", BotID: "B1"})
+	post(t, f, "C1", slack.Message{User: "U9", Text: hey + "stranger"})
 	// Reconnected: Slack redelivers the event in flight when the
 	// connection dropped, and a live message arrives before the backfill
 	// gets to run.
@@ -446,9 +709,9 @@ func TestBackfill(t *testing.T) {
 // first; a reply in a thread too old for a backfill still goes nowhere.
 func TestHandleReplyBeforeRoot(t *testing.T) {
 	r, f := newReceiver(t)
-	handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: "first"}))
+	handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"}))
 	r.Disconnected()
-	root := post(t, f, "C1", slack.Message{User: "U1", Text: "gap root"})
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "gap root"})
 	reply := post(t, f, "C1", slack.Message{User: "U1", Text: "gap reply", ThreadTS: root.TS})
 	connected(t, r)
 	handle(t, r, reply)
@@ -460,7 +723,7 @@ func TestHandleReplyBeforeRoot(t *testing.T) {
 	if m := queued(t, r.Store, "workstation")[1]; m.Context != "repo: fednet" {
 		t.Fatalf("the root taken in before its reply has context %q, want the channel's purpose", m.Context)
 	}
-	old := post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-2 * DefaultWindow)), User: "U1", Text: "long ago"})
+	old := post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-2 * DefaultWindow)), User: "U1", Text: hey + "long ago"})
 	handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: "late reply", ThreadTS: old.TS}))
 	if got := texts(t, r.Store, "workstation"); len(got) != 3 {
 		t.Fatalf("texts after a reply in an old thread = %q, want the 3 before", got)
@@ -471,12 +734,12 @@ func TestBackfillWindow(t *testing.T) {
 	r, f := newReceiver(t)
 	r.Window = time.Hour
 	// Seen a message two hours ago, then nothing live.
-	old := post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-2 * time.Hour)), User: "U1", Text: "seen"})
+	old := post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-2 * time.Hour)), User: "U1", Text: hey + "seen"})
 	handle(t, r, old)
 	post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-90 * time.Minute)), User: "U1", Text: "too old", ThreadTS: old.TS})
-	post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-80 * time.Minute)), User: "U1", Text: "too old too"})
+	post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-80 * time.Minute)), User: "U1", Text: hey + "too old too"})
 	post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-30 * time.Minute)), User: "U1", Text: "in the window", ThreadTS: old.TS})
-	post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-20 * time.Minute)), User: "U1", Text: "in the window too"})
+	post(t, f, "C1", slack.Message{TS: slackTS(epoch.Add(-20 * time.Minute)), User: "U1", Text: hey + "in the window too"})
 	r.Now = func() time.Time { return epoch }
 	connected(t, r)
 	runBackfill(t, r)
@@ -490,14 +753,14 @@ func TestBackfillAfterRestart(t *testing.T) {
 	r, f := newReceiver(t)
 	r.Store = openHub(t, path)
 	connected(t, r)
-	first := post(t, f, "C1", slack.Message{User: "U1", Text: "first"})
+	first := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
 	handle(t, r, first)
 	// The hub dies without a word; messages arrive; it comes back up on
 	// the same database and a live message gets in before the backfill.
 	r.Store.Close()
 	post(t, f, "C1", slack.Message{User: "U1", Text: "while down", ThreadTS: first.TS})
-	post(t, f, "C1", slack.Message{User: "U1", Text: "also while down"})
-	r = &Receiver{Store: openHub(t, path), Slack: f, Route: r.Route, Users: r.Users, Now: r.Now}
+	post(t, f, "C1", slack.Message{User: "U1", Text: hey + "also while down"})
+	r = &Receiver{Store: openHub(t, path), Slack: f, Route: r.Route, Users: r.Users, Bot: r.Bot, Now: r.Now}
 	connected(t, r)
 	handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: "live after restart", ThreadTS: first.TS}))
 	runBackfill(t, r)
@@ -528,7 +791,7 @@ func TestBackfillRetriesFromWhereItFailed(t *testing.T) {
 	r, f := newReceiver(t)
 	fl := &flaky{API: f, fails: 1}
 	r.Slack = fl
-	first := post(t, f, "C1", slack.Message{User: "U1", Text: "first"})
+	first := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
 	handle(t, r, first)
 	r.Disconnected()
 	post(t, f, "C1", slack.Message{User: "U1", Text: "in the gap", ThreadTS: first.TS})
@@ -577,7 +840,7 @@ func TestBackfillOfOldConnectionKeepsNewStart(t *testing.T) {
 		t.Run(map[bool]string{false: "old backfill finishes", true: "old backfill is cancelled"}[cancelled], func(t *testing.T) {
 			ctx := t.Context()
 			r, f := newReceiver(t)
-			handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: "first"}))
+			handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"}))
 			connected(t, r)
 			gate := &gatedHistory{API: f, entered: make(chan struct{}), release: make(chan struct{})}
 			r.Slack = gate
@@ -593,7 +856,7 @@ func TestBackfillOfOldConnectionKeepsNewStart(t *testing.T) {
 			// The old backfill has read C1; the connection drops, a reply
 			// is posted, the connection comes back and fixes its start.
 			r.Disconnected()
-			post(t, f, "C1", slack.Message{User: "U1", Text: "gap"})
+			post(t, f, "C1", slack.Message{User: "U1", Text: hey + "gap"})
 			connected(t, r)
 			if cancelled {
 				cancel()
@@ -604,7 +867,7 @@ func TestBackfillOfOldConnectionKeepsNewStart(t *testing.T) {
 				t.Fatalf("the old backfill returned %v, cancelled %v", err, cancelled)
 			}
 			r.Slack = f
-			handle(t, r, post(t, f, "C2", slack.Message{User: "U1", Text: "new live"}))
+			handle(t, r, post(t, f, "C2", slack.Message{User: "U1", Text: hey + "new live"}))
 			runBackfill(t, r)
 			if got, want := all(t, r.Store), []string{"first", "gap", "new live"}; !slices.Equal(got, want) {
 				t.Fatalf("queued = %q, want %q", got, want)
@@ -625,7 +888,7 @@ func TestBackfillOfOldProcessKeepsNewStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.db")
 	old, f := newReceiver(t)
 	old.Store = openHub(t, path)
-	handle(t, old, post(t, f, "C1", slack.Message{User: "U1", Text: "first"}))
+	handle(t, old, post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"}))
 	connected(t, old)
 	gate := &gatedHistory{API: f, entered: make(chan struct{}), release: make(chan struct{})}
 	old.Slack = gate
@@ -638,9 +901,9 @@ func TestBackfillOfOldProcessKeepsNewStart(t *testing.T) {
 	}
 	// The new process comes up and fixes its start; a message is posted
 	// that the old backfill has already read past.
-	fresh := &Receiver{Store: openHub(t, path), Slack: f, Route: old.Route, Users: old.Users, Now: old.Now}
+	fresh := &Receiver{Store: openHub(t, path), Slack: f, Route: old.Route, Users: old.Users, Bot: old.Bot, Now: old.Now}
 	connected(t, fresh)
-	post(t, f, "C1", slack.Message{User: "U1", Text: "gap"})
+	post(t, f, "C1", slack.Message{User: "U1", Text: hey + "gap"})
 	close(gate.release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -796,7 +1059,7 @@ func TestRunAcks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.db")
 	r, f := newReceiver(t)
 	r.Store = openHub(t, path)
-	root := post(t, f, "C1", slack.Message{User: "U1", Text: "first"})
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
 	tr := newFakeTransport()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -807,7 +1070,7 @@ func TestRunAcks(t *testing.T) {
 	tr.send(t, socketmode.Event{Type: socketmode.EventTypeConnected})
 	waitFor(t, "the hub to be up after the connected event", func() bool { return r.Status().Connected })
 	// A message: no ack before it is queued; acked once it is.
-	tr.send(t, messageEvent(t, "env1", "Ev1", "C1", root.TS, "", "first", true))
+	tr.send(t, messageEvent(t, "env1", "Ev1", "C1", root.TS, "", hey+"first", true))
 	if id := tr.ack(2 * time.Second); id != "env1" {
 		t.Fatalf("ack = %q, want env1", id)
 	}
@@ -815,7 +1078,7 @@ func TestRunAcks(t *testing.T) {
 		t.Fatalf("texts when the ack arrived = %q, want %q", got, want)
 	}
 	// Redelivered: acked, not queued again.
-	tr.send(t, messageEvent(t, "env2", "Ev1", "C1", root.TS, "", "first", true))
+	tr.send(t, messageEvent(t, "env2", "Ev1", "C1", root.TS, "", hey+"first", true))
 	if id := tr.ack(2 * time.Second); id != "env2" {
 		t.Fatalf("ack of the redelivery = %q, want env2", id)
 	}

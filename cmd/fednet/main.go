@@ -75,13 +75,17 @@ commands:
         open threads in it, which client takes direct messages, lists the
         Slack users fednet serves, each with a name for the agents, which
         may be empty, names the channel approval cards go to and the
-        users, from that list, who may approve, and names the users, from
-        that list, who may upgrade with /fednet upgrade and whether the
-        hub upgrades on its own when it finds a new release (default yes):
+        users, from that list, who may approve, bounds the thread history
+        a message that mentions the bot carries (how many messages, how
+        many characters in all, how many in one message before it is cut;
+        the defaults are shown), and names the users, from that list, who
+        may upgrade with /fednet upgrade and whether the hub upgrades on
+        its own when it finds a new release (default yes):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
          "approvals": {"channel": "C456", "approvers": ["U123"]},
+         "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
          "upgrade": {"admins": ["U123"], "auto": true}}
         the admin socket takes hub handoff; D is how long a new process may
         take to become ready at a handoff; the upgrade request is the file
@@ -300,6 +304,14 @@ type hubConfig struct {
 		// each must be on Users.
 		Approvers []string `json:"approvers"`
 	} `json:"approvals"`
+	// History bounds the thread history a message that mentions the bot
+	// carries, and the length of any message's text; a field left out or
+	// zero keeps the inbound package's default.
+	History struct {
+		MaxMessages     int `json:"max_messages"`
+		MaxChars        int `json:"max_chars"`
+		MaxMessageChars int `json:"max_message_chars"`
+	} `json:"history"`
 	// Upgrade is about upgrades.
 	Upgrade struct {
 		// Admins are the Slack user ids of the people who may upgrade;
@@ -362,7 +374,16 @@ func readHubConfig(path string) (hubConfig, error) {
 			return hubConfig{}, fmt.Errorf("%s: upgrade admin %s is not on the user list", path, u)
 		}
 	}
+	if h := cfg.History; h.MaxMessages < 0 || h.MaxChars < 0 || h.MaxMessageChars < 0 {
+		return hubConfig{}, fmt.Errorf("%s: history limits must not be negative", path)
+	}
 	return cfg, nil
+}
+
+// history is the limits of the thread history, as the inbound package
+// takes them.
+func (c hubConfig) history() inbound.Limits {
+	return inbound.Limits{MaxMessages: c.History.MaxMessages, MaxChars: c.History.MaxChars, MaxMessageChars: c.History.MaxMessageChars}
 }
 
 // route is the routing part of the config: which client takes new threads
@@ -484,8 +505,14 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		}
 	}
 	var sl slack.API
+	var bot string
 	if botToken != "" {
 		sl = newSlack(botToken)
+		// Which user the bot is decides which messages mention it; a
+		// hub that cannot find out serves no channel.
+		if bot, err = sl.Self(ctx); err != nil {
+			return fmt.Errorf("asking Slack which user the bot is: %w", err)
+		}
 	}
 	var webhook *alert.Webhook
 	if webhookURL != "" {
@@ -563,7 +590,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Approvals: approvals, Commands: upgrades, Stored: func() {
+		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Bot: bot, History: cfg.history(), Approvals: approvals, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
