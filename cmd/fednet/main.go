@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +38,7 @@ import (
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	"github.com/Luolc/fednet/internal/upgrade"
 	"github.com/Luolc/fednet/internal/watch"
 )
 
@@ -62,7 +64,7 @@ const usage = `usage: fednet <command> [flags]
 commands:
   hub -listen ADDR -db PATH [-config PATH] [-admin-socket PATH] [-handoff-timeout D]
       [-slack-app-token-file PATH -slack-bot-token-file PATH] [-alert-webhook-file PATH]
-      [-approval-key-file PATH]
+      [-approval-key-file PATH] [-upgrade-request PATH]
         run the hub; with the two Slack token files it also takes in the
         messages people post in Slack and posts the clients' posts there,
         with the webhook file it sends alerts, and with the approval key
@@ -72,14 +74,20 @@ commands:
         client takes the threads people start in it and which clients may
         open threads in it, which client takes direct messages, lists the
         Slack users fednet serves, each with a name for the agents, which
-        may be empty, and names the channel approval cards go to and the
-        users, from that list, who may approve:
+        may be empty, names the channel approval cards go to and the
+        users, from that list, who may approve, and names the users, from
+        that list, who may upgrade with /fednet upgrade and whether the
+        hub upgrades on its own when it finds a new release (default yes):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
-         "approvals": {"channel": "C456", "approvers": ["U123"]}}
+         "approvals": {"channel": "C456", "approvers": ["U123"]},
+         "upgrade": {"admins": ["U123"], "auto": true}}
         the admin socket takes hub handoff; D is how long a new process may
-        take to become ready at a handoff
+        take to become ready at a handoff; the upgrade request is the file
+        the hub writes to ask the machine's upgrader (fednet upgrade, run
+        by root) for a new release, without which the hub cannot upgrade
+        itself
   hub handoff -socket PATH [-json]
         replace the running hub with a new process of the binary now at its
         path, without a gap; prints the versions handed off from and to
@@ -90,11 +98,15 @@ commands:
   hub reassign -db PATH FROM-ID TO-ID
         move every thread FROM-ID owns to TO-ID; prints how many moved
   client -hub URL -db PATH -credential PATH -socket PATH [-socket-group GROUP]
-         [-hook-timeout D] [-hook-env NAME]... [-handoff-timeout D] [COMMAND [ARG]...]
+         [-hook-timeout D] [-hook-env NAME]... [-handoff-timeout D] [-upgrade-request PATH]
+         [COMMAND [ARG]...]
         run a client on an agent machine; agents reach it through the socket,
         which only this user and the members of GROUP can connect to; COMMAND
         runs for each message received, with the event file as its last
-        argument, in an environment of just PATH, HOME and each -hook-env NAME
+        argument, in an environment of just PATH, HOME and each -hook-env NAME;
+        the upgrade request is the file the client writes when the hub tells
+        it to upgrade, for the machine's upgrader (fednet upgrade, run by
+        root); without it the hub's notices are dropped
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
@@ -133,6 +145,13 @@ commands:
         it as used; exit 0 to act, 5 bad signature, 6 expired, 7 the target or
         the action differs, 8 already used, 1 a file cannot be read or the
         public key is not an ssh-ed25519 line, 2 the approval is not well formed
+  upgrade -request PATH -binary PATH -socket PATH
+        carry out the upgrade request at PATH, then delete it: download the
+        release it names for this machine from fednet's releases, check it
+        against the release's SHA256SUMS, put it at the binary's PATH in one
+        rename, and hand the hub or client answering on the socket off to
+        it; refuses a release that is not newer than what runs; for the root
+        unit that watches the request file
   version
         print the version
 `
@@ -160,6 +179,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		cmd = clientCommand
 	case "approval":
 		cmd = func(_ context.Context, args []string, stdout io.Writer) error { return approvalCommand(args, stdout) }
+	case "upgrade":
+		cmd = upgradeCommand
 	case "version":
 		fmt.Fprintln(stdout, version)
 		return 0
@@ -279,7 +300,20 @@ type hubConfig struct {
 		// each must be on Users.
 		Approvers []string `json:"approvers"`
 	} `json:"approvals"`
+	// Upgrade is about upgrades.
+	Upgrade struct {
+		// Admins are the Slack user ids of the people who may upgrade;
+		// each must be on Users.
+		Admins []string `json:"admins"`
+		// Auto, unless set to false, makes the hub look for a new release
+		// every hour and upgrade to it.
+		Auto *bool `json:"auto"`
+	} `json:"upgrade"`
 }
+
+// auto reports whether the hub upgrades on its own: yes unless the config
+// says no.
+func (c hubConfig) auto() bool { return c.Upgrade.Auto == nil || *c.Upgrade.Auto }
 
 // duration is a time.Duration written in JSON as a string such as "5m".
 type duration time.Duration
@@ -323,6 +357,11 @@ func readHubConfig(path string) (hubConfig, error) {
 			return hubConfig{}, fmt.Errorf("%s: approver %s is not on the user list", path, u)
 		}
 	}
+	for _, u := range cfg.Upgrade.Admins {
+		if _, ok := cfg.Users[u]; !ok {
+			return hubConfig{}, fmt.Errorf("%s: upgrade admin %s is not on the user list", path, u)
+		}
+	}
 	return cfg, nil
 }
 
@@ -360,7 +399,12 @@ var (
 	outboundInterval time.Duration
 	approvalInterval time.Duration
 	approvalTTL      time.Duration
+	upgradeTimings   struct{ interval, wait, poll, fetch time.Duration }
 )
+
+// releases is where the hub looks for new releases and the upgrader
+// downloads them from; tests point it at a fake.
+var releases = upgrade.GitHub
 
 // readSecret reads the credential in the file at path, without the white
 // space around it. No error quotes the contents.
@@ -397,6 +441,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	botTokenPath := fs.String("slack-bot-token-file", "", "file holding the Slack bot token, for the Web API")
 	webhookPath := fs.String("alert-webhook-file", "", "file holding the URL of the Slack incoming webhook for alerts; read only with the Slack token files")
 	keyPath := fs.String("approval-key-file", "", "file holding the Ed25519 private key that signs approvals, PKCS#8 PEM; without it no approval can be requested")
+	upgradeRequest := fs.String("upgrade-request", "", "file the hub writes to ask the machine's upgrader for a release; without it the hub cannot upgrade itself")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
@@ -475,6 +520,19 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		}
 	}
 	hub.Answer = (&hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals}).Answer
+	upgrades := &upgrade.Hub{
+		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Request: *upgradeRequest, HandedOff: proc.Exit(),
+		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Auto: cfg.auto(),
+		Interval: upgradeTimings.interval, Wait: upgradeTimings.wait, Poll: upgradeTimings.poll, Fetch: upgradeTimings.fetch,
+		Send: func(ctx context.Context, client string, payload []byte) error {
+			_, err := hub.Send(ctx, client, payload)
+			return err
+		},
+	}
+	if webhook != nil {
+		upgrades.Alert = webhook.Send
+	}
+	hub.Connected = upgrades.Connected
 	ln, err := proc.ListenTCP(*listen)
 	if err != nil {
 		return err
@@ -505,7 +563,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Approvals: approvals, Stored: func() {
+		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Approvals: approvals, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -542,16 +600,25 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		return err
 	}
 	// posted is closed once the outbound side has stopped, or will never
-	// start.
+	// start; upgraded once the upgrades have, or will never start.
 	posted := make(chan struct{})
+	upgraded := make(chan struct{})
 	wg.Go(func() {
 		if err := proc.WaitForParent(ctx); err != nil {
 			if ctx.Err() != nil {
 				close(posted)
+				close(upgraded)
 				return
 			}
 			slog.Warn("hub: the predecessor misbehaved on exit", "err", err)
 		}
+		// The upgrades run in one process at a time too: a check for a
+		// new release by the predecessor and the successor both would
+		// start the same upgrade twice.
+		wg.Go(func() {
+			defer close(upgraded)
+			upgrades.Run(ctx)
+		})
 		if sl == nil {
 			close(posted)
 			return
@@ -587,11 +654,13 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if handedOff {
 		// The successor accepts from now on. What this process has in hand
 		// it finishes first: the requests, the handoff request among them,
-		// and the post with Slack, which the successor must not post again.
+		// the post with Slack, which the successor must not post again,
+		// and the summary of an upgrade that waited for this very handoff.
 		admin.Close()
 		<-adminServed
 		poster.Stop()
 		<-posted
+		<-upgraded
 	} else {
 		proc.Stop()
 		cancel()
@@ -731,6 +800,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	group := fs.String("socket-group", "", "group whose members may use the socket")
 	hookTimeout := fs.Duration("hook-timeout", hook.DefaultTimeout, "how long one run of the hook may take")
 	handoffTimeout := fs.Duration("handoff-timeout", handoff.DefaultTimeout, "how long a new process may take to become ready at a handoff")
+	upgradeRequest := fs.String("upgrade-request", "", "file the client writes when the hub tells it to upgrade, for the machine's upgrader; without it the notices are dropped")
 	env := hookEnv
 	fs.Func("hook-env", "environment variable to pass to the hook (repeatable)", func(name string) error {
 		env = append(env, name)
@@ -761,7 +831,8 @@ func clientServe(ctx context.Context, args []string) (err error) {
 		return err
 	}
 	defer st.Close()
-	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
+	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version),
+		Divert: (&upgrade.Client{Version: version, Request: *upgradeRequest}).Divert}
 	ln, err := proc.ListenUnix(*socket, *group)
 	if err != nil {
 		return err
@@ -852,28 +923,9 @@ func handoffCommand(ctx context.Context, name string, args []string, stdout io.W
 	if *socket == "" {
 		return usageError(name + ": -socket is required")
 	}
-	old, err := do(ctx, *socket, local.Request{Cmd: local.Handoff})
+	old, now, err := handOff(ctx, *socket)
 	if err != nil {
 		return err
-	}
-	// The old process stops accepting once it has answered; until then a
-	// request may still reach it.
-	var now local.Response
-	for deadline := time.Now().Add(local.Timeout); now.PID == 0 || now.PID == old.PID; {
-		if now, err = do(ctx, *socket, local.Request{Cmd: local.Version}); err != nil {
-			return fmt.Errorf("the new process does not answer on %s: %w", *socket, err)
-		}
-		if now.PID != old.PID {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("the old process (pid %d) still answers on %s", old.PID, *socket)
-		}
-		select {
-		case <-time.After(10 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 	}
 	if *asJSON {
 		return json.NewEncoder(stdout).Encode(struct {
@@ -882,6 +934,83 @@ func handoffCommand(ctx context.Context, name string, args []string, stdout io.W
 		}{old, now})
 	}
 	_, err = fmt.Fprintf(stdout, "handed off from %s (pid %d) to %s (pid %d)\n", old.Version, old.PID, now.Version, now.PID)
+	return err
+}
+
+// handOff asks the daemon on socket to hand off and waits for the new
+// process to answer there; it returns the answers of the old process and
+// the new. A handoff that failed is an error: the old process is still
+// serving.
+func handOff(ctx context.Context, socket string) (old, now local.Response, err error) {
+	if old, err = do(ctx, socket, local.Request{Cmd: local.Handoff}); err != nil {
+		return old, now, err
+	}
+	// The old process stops accepting once it has answered; until then a
+	// request may still reach it.
+	for deadline := time.Now().Add(local.Timeout); now.PID == 0 || now.PID == old.PID; {
+		if now, err = do(ctx, socket, local.Request{Cmd: local.Version}); err != nil {
+			return old, now, fmt.Errorf("the new process does not answer on %s: %w", socket, err)
+		}
+		if now.PID != old.PID {
+			break
+		}
+		if time.Now().After(deadline) {
+			return old, now, fmt.Errorf("the old process (pid %d) still answers on %s", old.PID, socket)
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			return old, now, ctx.Err()
+		}
+	}
+	return old, now, nil
+}
+
+// upgradeCommand carries out the upgrade request at -request: it reads the
+// release the request names and deletes the request first of all, so that
+// the unit watching it is not started again whatever happens next; asks
+// the daemon on -socket what it runs and refuses a release that is not
+// newer; downloads and checks the release's binary for this machine and
+// puts it at -binary in one rename; then hands the daemon off to it and
+// prints the versions handed off from and to.
+func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet upgrade", flag.ContinueOnError)
+	request := fs.String("request", "", "the upgrade request file (required)")
+	binary := fs.String("binary", "", "the binary to replace, which the daemon runs (required)")
+	socket := fs.String("socket", "", "the socket the daemon hands off on: the hub's admin socket or the client's socket (required)")
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *request == "" || *binary == "" || *socket == "" {
+		return usageError("fednet upgrade: -request, -binary and -socket are required")
+	}
+	target, err := upgrade.ReadRequest(*request)
+	if errors.Is(err, upgrade.ErrNoRequest) {
+		fmt.Fprintf(stdout, "no upgrade request at %s\n", *request)
+		return nil
+	}
+	if rerr := os.Remove(*request); rerr != nil && err == nil {
+		err = fmt.Errorf("deleting the request: %w", rerr)
+	}
+	if err != nil {
+		return err
+	}
+	running, err := do(ctx, *socket, local.Request{Cmd: local.Version})
+	if err != nil {
+		return fmt.Errorf("asking what runs on %s: %w", *socket, err)
+	}
+	if !release.Newer(target, running.Version) {
+		return fmt.Errorf("refusing to upgrade: %s is not newer than the running %s", target, running.Version)
+	}
+	if err := releases.Install(ctx, target, runtime.GOARCH, *binary); err != nil {
+		return err
+	}
+	slog.Info("upgrade: installed", "version", target, "binary", *binary)
+	old, now, err := handOff(ctx, *socket)
+	if err != nil {
+		return fmt.Errorf("%s is in place, but the handoff to it failed, so the old process keeps serving: %w", target, err)
+	}
+	_, err = fmt.Fprintf(stdout, "upgraded from %s (pid %d) to %s (pid %d)\n", old.Version, old.PID, now.Version, now.PID)
 	return err
 }
 

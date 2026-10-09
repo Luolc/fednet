@@ -55,6 +55,14 @@ type Event struct {
 	slack.Message
 }
 
+// Commander answers slash commands and takes the clicks on the cards
+// they show. An error from either means the event was not handled and
+// is not acked.
+type Commander interface {
+	Command(ctx context.Context, c slack.Command) (slack.CommandReply, error)
+	Click(ctx context.Context, c slack.Click) error
+}
+
 // Status is how the hub stands with Slack.
 type Status struct {
 	Connected bool
@@ -84,6 +92,10 @@ type Receiver struct {
 	// Approvals takes the clicks on approval cards; nil means they are
 	// acked and dropped.
 	Approvals *approval.Flow
+	// Commands answers slash commands and takes the clicks on the cards
+	// they show; nil means a command is answered that the hub serves
+	// none, and the clicks are dropped.
+	Commands Commander
 
 	// mu guards the fields below, and serializes Connected's fixing of
 	// the backfill's start with a backfill's clearing of it.

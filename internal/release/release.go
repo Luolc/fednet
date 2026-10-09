@@ -62,3 +62,23 @@ func parse(v string) (release, bool) {
 	}
 	return r, true
 }
+
+// IsRelease reports whether v is a release, vMAJOR.MINOR.PATCH.
+func IsRelease(v string) bool {
+	_, ok := parse(v)
+	return ok
+}
+
+// Newer reports whether a is a release newer than b, also a release. One
+// that is not a release is never newer, and nothing is newer than it.
+func Newer(a, b string) bool {
+	ra, ok := parse(a)
+	if !ok {
+		return false
+	}
+	rb, ok := parse(b)
+	if !ok {
+		return false
+	}
+	return rb.before(ra)
+}

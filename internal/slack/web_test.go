@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -532,5 +533,58 @@ func TestWebCards(t *testing.T) {
 	}
 	if whisper.method != "chat.postEphemeral" || whisper.form.Get("channel") != "C9" || whisper.form.Get("user") != "U2" || whisper.form.Get("text") != "你不在审批人名单上" {
 		t.Errorf("Whisper sent %s %v, want an ephemeral message to U2 in C9", whisper.method, whisper.form)
+	}
+}
+
+// The upgrade card has the question, the clients and the two buttons in
+// a block named after the id; the ack of a command carries it, or the
+// text, as an ephemeral message.
+func TestUpgradeCardBlocks(t *testing.T) {
+	c := UpgradeCard{ID: "up-1", From: "v0.1.0", To: "v0.2.0", Clients: []string{"workstation：v0.1.0 在线", "datamachine：v0.1.0 离线"}}
+	ack := CommandAck(CommandReply{Card: &c})
+	if ack["response_type"] != "ephemeral" || ack["text"] != "从 v0.1.0 升到 v0.2.0？" {
+		t.Fatalf("ack = %+v, want an ephemeral message asking about the upgrade", ack)
+	}
+	bs, ok := ack["blocks"].([]slackgo.Block)
+	if !ok || len(bs) != 3 {
+		t.Fatalf("ack blocks = %#v, want the question, the clients and the buttons", ack["blocks"])
+	}
+	actions, ok := bs[2].(*slackgo.ActionBlock)
+	if !ok || actions.BlockID != UpgradeBlockID("up-1") || len(actions.Elements.ElementSet) != 2 {
+		t.Fatalf("card ends with %+v, want two buttons in block %q", bs[2], UpgradeBlockID("up-1"))
+	}
+	for i, want := range []string{UpgradeConfirmAction, UpgradeCancelAction} {
+		b, ok := actions.Elements.ElementSet[i].(*slackgo.ButtonBlockElement)
+		if !ok || b.ActionID != want || b.Value != "up-1" {
+			t.Fatalf("button %d = %+v, want %s carrying up-1", i, actions.Elements.ElementSet[i], want)
+		}
+	}
+	text := blocksJSON(t, bs)
+	for _, want := range []string{"v0.1.0", "v0.2.0", "workstation", "datamachine"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("card %s lacks %q", text, want)
+		}
+	}
+	plain := CommandAck(CommandReply{Text: "hub：v0.1.0"})
+	if plain["text"] != "hub：v0.1.0" || plain["blocks"] != nil {
+		t.Fatalf("ack of a text reply = %+v", plain)
+	}
+}
+
+// Respond posts to the response URL, replacing the message there, as an
+// ephemeral message.
+func TestRespond(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+	w := New("test-token")
+	if err := w.Respond(t.Context(), srv.URL+"/respond", "已取消"); err != nil {
+		t.Fatal(err)
+	}
+	if got["text"] != "已取消" || got["response_type"] != "ephemeral" || got["replace_original"] != true {
+		t.Fatalf("the response URL got %+v", got)
 	}
 }

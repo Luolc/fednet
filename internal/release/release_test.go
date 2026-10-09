@@ -27,3 +27,28 @@ func TestCompatible(t *testing.T) {
 		}
 	}
 }
+
+func TestNewer(t *testing.T) {
+	tests := []struct {
+		a, b  string
+		newer bool
+	}{
+		{"v0.2.0", "v0.1.0", true},
+		{"v0.1.1", "v0.1.0", true},
+		{"v1.0.0", "v0.9.9", true},
+		{"v0.10.0", "v0.9.0", true},
+		{"v0.1.0", "v0.1.0", false},
+		{"v0.1.0", "v0.2.0", false},
+		{"v0.2.0", "dev", false},
+		{"dev", "v0.1.0", false},
+		{"0.2.0", "v0.1.0", false},
+	}
+	for _, tt := range tests {
+		if got := Newer(tt.a, tt.b); got != tt.newer {
+			t.Errorf("Newer(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.newer)
+		}
+	}
+	if !IsRelease("v0.1.0") || IsRelease("dev") || IsRelease("v0.1") {
+		t.Error("IsRelease does not tell a release from the rest")
+	}
+}

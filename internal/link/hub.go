@@ -44,6 +44,11 @@ type Hub struct {
 	// Uplinked, if set, is called after an uplink message is stored in the
 	// inbox, before the client is told. It must not block.
 	Uplinked func()
+	// Connected, if set, is called with the client's id and the version
+	// in VersionHeader each time a downlink connection is up, once the
+	// client's session is registered: a message queued for the client
+	// from inside it is pushed on this connection.
+	Connected func(client, version string)
 
 	mu       sync.Mutex
 	seen     map[string]time.Time
@@ -217,6 +222,9 @@ func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.unregister(client, s)
 	h.heartbeat(client)
+	if h.Connected != nil {
+		h.Connected(client, r.Header.Get(VersionHeader))
+	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

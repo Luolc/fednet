@@ -742,3 +742,70 @@ func TestOutdatedClientGetsNoDownlink(t *testing.T) {
 		t.Fatalf("a's inbox = %v, want [%s]", got, forA.MsgID)
 	}
 }
+
+// A message Divert takes is acked without going in the inbox, and acted
+// on before the ack; the others go in as usual. The hub's Connected is
+// told the client and its version once the connection is up, and a
+// message it queues then is pushed on that connection.
+func TestDivertAndConnected(t *testing.T) {
+	connected := make(chan string, 1)
+	var h *Hub
+	h, srv := testHubWith(t, func(hub *Hub) {
+		hub.Connected = func(client, version string) {
+			if _, err := hub.Send(t.Context(), client, []byte("upgrade")); err != nil {
+				t.Error(err)
+			}
+			connected <- client + " " + version
+		}
+	}, nil)
+	cs := openClientStore(t)
+	var taken []string
+	var mu sync.Mutex
+	cut := &cutter{}
+	c := &Client{
+		Store: cs, ID: "a", Hub: srv.URL, Header: http.Header{VersionHeader: {"v0.1.0"}},
+		Heartbeat: testHeartbeat, Backoff: testBackoff, Timeout: testTimeout,
+		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: cut.dial}},
+		Divert: func(_ context.Context, p []byte) bool {
+			if string(p) != "upgrade" {
+				return false
+			}
+			mu.Lock()
+			taken = append(taken, string(p))
+			mu.Unlock()
+			return true
+		},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+		c.HTTPClient.CloseIdleConnections()
+	})
+	select {
+	case got := <-connected:
+		if got != "a v0.1.0" {
+			t.Fatalf("Connected got %q, want the client and its version", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connected was not called")
+	}
+	kept, err := h.Send(t.Context(), "a", []byte("for the hook"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the hub outbox to be acked", func() bool { return outboxEmpty(t, h, "a") })
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(taken, []string{"upgrade"}) {
+		t.Fatalf("Divert took %q, want the upgrade once", taken)
+	}
+	if got := inboxIDs(t, cs.Inbox); !slices.Equal(got, []string{kept.MsgID}) {
+		t.Fatalf("inbox = %v, want only the message Divert left", got)
+	}
+}

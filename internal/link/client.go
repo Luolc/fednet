@@ -44,6 +44,12 @@ type Client struct {
 	// Received, if set, is called after a downlink message is stored in
 	// the inbox, before it is acked. It must not block.
 	Received func()
+	// Divert, if set, is offered each downlink message's payload before
+	// the message goes in the inbox. A message it takes (true) is acked
+	// without being stored, so it never reaches the hook; what it does
+	// with the message it does before returning, so a message it took is
+	// acted on before it is acked.
+	Divert func(ctx context.Context, payload []byte) (taken bool)
 
 	// nudge has a buffer of one, so a Post is noticed even while the uplink
 	// loop is busy.
@@ -200,11 +206,13 @@ func (c *Client) receive(ctx context.Context, conn *websocket.Conn) error {
 		if err := wsjson.Read(ctx, conn, &d); err != nil {
 			return err
 		}
-		if _, err := c.Store.Inbox.Put(ctx, store.Message{MsgID: d.MsgID, Payload: d.Payload}); err != nil {
-			return err
-		}
-		if c.Received != nil {
-			c.Received()
+		if c.Divert == nil || !c.Divert(ctx, d.Payload) {
+			if _, err := c.Store.Inbox.Put(ctx, store.Message{MsgID: d.MsgID, Payload: d.Payload}); err != nil {
+				return err
+			}
+			if c.Received != nil {
+				c.Received()
+			}
 		}
 		if err := wsjson.Write(ctx, conn, ack{Seq: d.Seq}); err != nil {
 			return err
