@@ -53,15 +53,23 @@ func (h *Hub) lease() time.Duration {
 	return h.Lease
 }
 
-func (h *Hub) identify(r *http.Request) (string, error) {
+// authorize identifies the client behind r. When it cannot, it logs why,
+// replies 401 with a fixed body, and reports false. The reason stays out of
+// the reply: it is for the hub's operator, not for whoever sent the request.
+func (h *Hub) authorize(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var client string
+	var err error
 	if h.Identify != nil {
-		return h.Identify(r)
+		client, err = h.Identify(r)
+	} else if client = r.Header.Get(ClientHeader); client == "" {
+		err = errors.New("missing " + ClientHeader + " header")
 	}
-	id := r.Header.Get(ClientHeader)
-	if id == "" {
-		return "", errors.New("missing " + ClientHeader + " header")
+	if err != nil {
+		slog.Warn("link: unauthorized", "path", r.URL.Path, "err", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return "", false
 	}
-	return id, nil
+	return client, true
 }
 
 // Handler serves DownlinkPath and UplinkPath.
@@ -160,9 +168,8 @@ func (h *Hub) unregister(client string, s *session) {
 }
 
 func (h *Hub) serveDownlink(w http.ResponseWriter, r *http.Request) {
-	client, err := h.identify(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+	client, ok := h.authorize(w, r)
+	if !ok {
 		return
 	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -232,9 +239,8 @@ func (h *Hub) readAcks(ctx context.Context, client string, conn *websocket.Conn)
 // serveUplink stores one message with its sender and replies 204 once it
 // is on disk.
 func (h *Hub) serveUplink(w http.ResponseWriter, r *http.Request) {
-	client, err := h.identify(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+	client, ok := h.authorize(w, r)
+	if !ok {
 		return
 	}
 	var u uplink

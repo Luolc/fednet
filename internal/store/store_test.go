@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -430,6 +431,10 @@ func TestHubUpgradeKeepsData(t *testing.T) {
 	if at < before {
 		t.Fatalf("enqueued_at of an old row = %d, want >= %d", at, before)
 	}
+	// The registry table arrived with a later migration.
+	if err := h.Register(ctx, "a", []byte("h")); err != nil {
+		t.Fatalf("Register after upgrade: %v", err)
+	}
 }
 
 func TestReopenKeepsData(t *testing.T) {
@@ -495,5 +500,44 @@ func TestMigrate(t *testing.T) {
 	// A binary that knows fewer migrations than the file has refuses it.
 	if err := migrate(ctx, db, []string{m1}); err == nil {
 		t.Fatal("migrate with an older migration list: err = nil, want an error")
+	}
+}
+
+func TestRegistry(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t, filepath.Join(t.TempDir(), "hub.db"))
+	hash1, hash2 := []byte("hash-one"), []byte("hash-two")
+
+	if _, err := h.Registration(ctx, "a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Registration of an unknown client: err = %v, want ErrNotFound", err)
+	}
+	if err := h.Revoke(ctx, "a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Revoke of an unknown client: err = %v, want ErrNotFound", err)
+	}
+	if err := h.Register(ctx, "a", hash1); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.SetVersion(ctx, "a", "1.0"); err != nil {
+		t.Fatal(err)
+	}
+	want := Registration{SecretHash: hash1, Version: "1.0"}
+	if got, err := h.Registration(ctx, "a"); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("Registration(a) = %+v, %v; want %+v", got, err, want)
+	}
+
+	// Revoking keeps the row but marks it; registering again replaces the
+	// hash, lifts the revocation and keeps the version.
+	if err := h.Revoke(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.Registration(ctx, "a"); err != nil || !got.Revoked {
+		t.Fatalf("Registration(a) after Revoke = %+v, %v; want revoked", got, err)
+	}
+	if err := h.Register(ctx, "a", hash2); err != nil {
+		t.Fatal(err)
+	}
+	want = Registration{SecretHash: hash2, Version: "1.0"}
+	if got, err := h.Registration(ctx, "a"); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("Registration(a) after re-registering = %+v, %v; want %+v", got, err, want)
 	}
 }

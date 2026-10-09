@@ -31,6 +31,15 @@ ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0;
 UPDATE outbox SET enqueued_at = CAST(unixepoch('subsec') * 1000 AS INTEGER);
 -- The client an uplink message came from; empty for rows from before.
 ALTER TABLE inbox ADD COLUMN client_id TEXT NOT NULL DEFAULT '';
+`, `
+-- The clients allowed to connect. secret_hash is the SHA-256 of the
+-- client's credential; the credential itself is never stored.
+CREATE TABLE client (
+	client_id   TEXT PRIMARY KEY,
+	secret_hash BLOB NOT NULL,
+	revoked     INTEGER NOT NULL DEFAULT 0,
+	version     TEXT NOT NULL DEFAULT ''
+);
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.
@@ -117,6 +126,60 @@ func (h *Hub) Owner(ctx context.Context, thread string) (string, error) {
 		return "", ErrNotFound
 	}
 	return client, err
+}
+
+// Registration is a client's row in the hub's registry.
+type Registration struct {
+	// SecretHash is the SHA-256 of the client's credential.
+	SecretHash []byte
+	// Revoked is set once the client has been retired; its credential no
+	// longer identifies it.
+	Revoked bool
+	// Version is the version the client reported when it last connected,
+	// empty until it has.
+	Version string
+}
+
+// Register adds client with secretHash, or replaces the credential of a
+// client already registered. Registering again also lifts a revocation.
+func (h *Hub) Register(ctx context.Context, client string, secretHash []byte) error {
+	_, err := h.db.ExecContext(ctx,
+		`INSERT INTO client (client_id, secret_hash) VALUES (?, ?)
+		 ON CONFLICT (client_id) DO UPDATE SET secret_hash = excluded.secret_hash, revoked = 0`,
+		client, secretHash)
+	return err
+}
+
+// Revoke retires client: its credential stops identifying it. It returns
+// ErrNotFound if client is not registered.
+func (h *Hub) Revoke(ctx context.Context, client string) error {
+	res, err := h.db.ExecContext(ctx, "UPDATE client SET revoked = 1 WHERE client_id = ?", client)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err == nil && n == 0 {
+		err = ErrNotFound
+	}
+	return err
+}
+
+// Registration returns client's registration, or ErrNotFound.
+func (h *Hub) Registration(ctx context.Context, client string) (Registration, error) {
+	var r Registration
+	err := h.db.QueryRowContext(ctx,
+		"SELECT secret_hash, revoked, version FROM client WHERE client_id = ?", client).
+		Scan(&r.SecretHash, &r.Revoked, &r.Version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Registration{}, ErrNotFound
+	}
+	return r, err
+}
+
+// SetVersion records the version client reported.
+func (h *Hub) SetVersion(ctx context.Context, client, version string) error {
+	_, err := h.db.ExecContext(ctx, "UPDATE client SET version = ? WHERE client_id = ?", version, client)
+	return err
 }
 
 // HubInbox is the hub's inbox, which also records which client each message
