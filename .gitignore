@@ -1,0 +1,2 @@
+# Binary from `go build ./cmd/fednet` in the repository root.
+/fednet
