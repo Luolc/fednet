@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/link"
+	"github.com/Luolc/fednet/internal/local"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -34,8 +37,12 @@ commands:
         let a client connect; HASH is what its client init printed
   hub revoke -db PATH CLIENT-ID
         retire a client: its credential stops working
-  client -hub URL -db PATH -credential PATH
-        run a client on an agent machine
+  client -hub URL -db PATH -credential PATH -socket PATH [-socket-group GROUP]
+        run a client on an agent machine; agents reach it through the socket,
+        which only this user and the members of GROUP can connect to
+  client post -socket PATH -thread KEY [-json] [--] TEXT
+        post TEXT to a thread; prints the msg_id once the client has queued it;
+        put -- before a TEXT that starts with -
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   version
@@ -49,7 +56,7 @@ func main() {
 }
 
 // run is main without the process: it returns the exit code. 2 is a usage
-// error, 1 any other failure.
+// error, an exitError picks its own code, and 1 is any other failure.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fednet", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -73,12 +80,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, nil)))
 	err := cmd(ctx, fs.Args()[1:], stdout)
 	var uerr usageError
+	var eerr exitError
 	switch {
 	case err == nil:
 		return 0
 	case errors.As(err, &uerr):
 		fmt.Fprintf(stderr, "fednet: %v\n%s", err, usage)
 		return 2
+	case errors.As(err, &eerr):
+		fmt.Fprintf(stderr, "fednet: %v\n", err)
+		return eerr.code
 	default:
 		fmt.Fprintf(stderr, "fednet: %v\n", err)
 		return 1
@@ -89,6 +100,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 type usageError string
 
 func (e usageError) Error() string { return string(e) }
+
+// Exit codes besides 0, 1 and the 2 of a usageError.
+const (
+	exitBadRequest  = 2 // the client daemon refused the request as malformed
+	exitDenied      = 3 // not allowed to use the socket
+	exitUnreachable = 4 // the client daemon cannot be reached
+)
+
+// exitError is a failure that run reports with its own exit code.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e exitError) Error() string { return e.err.Error() }
 
 // parseFlags parses args with fs and checks for exactly want positional
 // arguments. A flag error is already reported by fs.
@@ -201,24 +227,32 @@ func hubRevoke(ctx context.Context, args []string) error {
 }
 
 func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
-	if len(args) > 0 && args[0] == "init" {
-		return clientInit(args[1:], stdout)
+	if len(args) > 0 {
+		switch args[0] {
+		case "init":
+			return clientInit(args[1:], stdout)
+		case "post":
+			return clientPost(ctx, args[1:], stdout)
+		}
 	}
 	return clientServe(ctx, args)
 }
 
-// clientServe keeps the link to the hub up until ctx is done. Downlink
-// messages land in the inbox; nothing hands them on yet.
+// clientServe keeps the link to the hub up and answers the agents on the
+// socket until ctx is done. Downlink messages land in the inbox; nothing
+// hands them on yet.
 func clientServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("fednet client", flag.ContinueOnError)
 	hubURL := fs.String("hub", "", "hub base URL, such as http://fednet-hub:8080 (required)")
 	dbPath := fs.String("db", "", "client database file (required)")
 	credPath := fs.String("credential", "", "credential file written by client init (required)")
+	socket := fs.String("socket", "", "unix socket for the agents (required)")
+	group := fs.String("socket-group", "", "group whose members may use the socket")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
-	if *hubURL == "" || *dbPath == "" || *credPath == "" {
-		return usageError("fednet client: -hub, -db and -credential are required")
+	if *hubURL == "" || *dbPath == "" || *credPath == "" || *socket == "" {
+		return usageError("fednet client: -hub, -db, -credential and -socket are required")
 	}
 	cred, err := auth.Read(*credPath)
 	if err != nil {
@@ -230,8 +264,51 @@ func clientServe(ctx context.Context, args []string) error {
 	}
 	defer st.Close()
 	c := &link.Client{Store: st, ID: cred.ClientID, Hub: *hubURL, Header: cred.Header(version)}
+	ln, err := local.Listen(*socket, *group)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	served := make(chan error, 1)
+	go func() {
+		served <- (&local.Server{Post: c.Post}).Serve(ctx, ln)
+		cancel()
+	}()
 	c.Run(ctx)
-	return nil
+	return <-served
+}
+
+// clientPost hands a post to the client daemon through its socket and
+// prints the msg_id. It does not wait for the hub, and does not open the
+// database: only the daemon does.
+func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client post", flag.ContinueOnError)
+	socket := fs.String("socket", "", "the client daemon's socket (required)")
+	thread := fs.String("thread", "", "key of the thread to post to (required)")
+	asJSON := fs.Bool("json", false, "print the reply as JSON")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || *thread == "" || fs.Arg(0) == "" {
+		return usageError("fednet client post: -socket, -thread and a non-empty TEXT are required")
+	}
+	res, err := local.Do(ctx, *socket, local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0)})
+	switch {
+	case errors.Is(err, iofs.ErrPermission):
+		return exitError{exitDenied, err}
+	case err != nil:
+		return exitError{exitUnreachable, err}
+	case res.BadRequest:
+		return exitError{exitBadRequest, errors.New(res.Error)}
+	case res.Error != "":
+		return errors.New(res.Error)
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.MsgID)
+	return err
 }
 
 // clientInit creates the credential file and prints the client id and the

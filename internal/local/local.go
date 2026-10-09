@@ -1,0 +1,201 @@
+// Package local is the unix socket through which the agents on a machine
+// hand requests to the client daemon. Agents never see the client's
+// credential; who may connect is decided by the socket file's mode and
+// group. Each connection carries one request: the caller writes one JSON
+// Request, the daemon replies with one JSON Response and closes.
+package local
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/Luolc/fednet/internal/link"
+	"github.com/Luolc/fednet/internal/payload"
+)
+
+// Commands a Request can carry.
+const (
+	// Post queues a message for a thread and replies with its msg_id
+	// without waiting for the hub.
+	Post = "post"
+)
+
+// Request is what a caller sends. Cmd selects the command; the other fields
+// are its arguments.
+type Request struct {
+	Cmd    string `json:"cmd"`
+	Thread string `json:"thread,omitempty"`
+	Text   string `json:"text,omitempty"`
+}
+
+// Response is the daemon's reply. Error is set when the request failed, and
+// BadRequest when it failed because of the request itself.
+type Response struct {
+	MsgID      string `json:"msg_id,omitempty"`
+	Error      string `json:"error,omitempty"`
+	BadRequest bool   `json:"bad_request,omitempty"`
+}
+
+// Timeout bounds one request on either side.
+const Timeout = 10 * time.Second
+
+// maxRequestBytes bounds a request: a post's text may grow up to six times
+// when escaped as a JSON string.
+const maxRequestBytes = 6*link.MaxPayload + 1024
+
+// Listen creates the socket at path, replacing a stale one. Without group
+// only this Unix user can connect (mode 0600); with group, members of that
+// group can too (mode 0660), and this user must be a member of it.
+func Listen(path, group string) (net.Listener, error) {
+	mode, gid := os.FileMode(0o600), -1
+	if group != "" {
+		g, err := user.LookupGroup(group)
+		if err != nil {
+			return nil, err
+		}
+		if gid, err = strconv.Atoi(g.Gid); err != nil {
+			return nil, err
+		}
+		mode = 0o660
+	}
+	// The socket is created in a private directory and moved into place
+	// once its mode and group are set, so no one else can ever connect to
+	// it with the looser mode it is created with.
+	dir, err := os.MkdirTemp(filepath.Dir(path), ".fednet-socket-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	tmp := filepath.Join(dir, "socket")
+	ln, err := net.Listen("unix", tmp)
+	if err != nil {
+		return nil, err
+	}
+	if err := setup(tmp, path, mode, gid); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+func setup(tmp, path string, mode os.FileMode, gid int) error {
+	if err := os.Lchown(tmp, -1, gid); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// Server answers requests on the socket.
+type Server struct {
+	// Post queues a payload for the hub and returns its msg_id; it is
+	// link.Client.Post.
+	Post func(ctx context.Context, payload []byte) (string, error)
+}
+
+// Serve answers connections on ln until ctx is done. When it returns it has
+// closed ln and waited for the requests in flight. It returns nil once ctx
+// is done, or the error that stopped it accepting.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer ln.Close()
+	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	defer stop()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		wg.Go(func() { s.serve(ctx, conn) })
+	}
+}
+
+func (s *Server) serve(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
+	defer stop()
+	var req Request
+	var res Response
+	if err := json.NewDecoder(io.LimitReader(conn, maxRequestBytes)).Decode(&req); err != nil {
+		res = badRequest("unreadable request: " + err.Error())
+	} else {
+		res = s.handle(ctx, req)
+	}
+	if err := json.NewEncoder(conn).Encode(res); err != nil {
+		slog.Warn("local: reply", "cmd", req.Cmd, "err", err)
+	}
+}
+
+func badRequest(msg string) Response { return Response{Error: msg, BadRequest: true} }
+
+// handle runs one request. A new command is a new case here.
+func (s *Server) handle(ctx context.Context, req Request) Response {
+	switch req.Cmd {
+	case Post:
+		return s.post(ctx, req)
+	default:
+		return badRequest(fmt.Sprintf("unknown command %q", req.Cmd))
+	}
+}
+
+func (s *Server) post(ctx context.Context, req Request) Response {
+	if req.Thread == "" || req.Text == "" {
+		return badRequest("post needs a thread and a text")
+	}
+	p, err := json.Marshal(payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text})
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+	id, err := s.Post(ctx, p)
+	if errors.Is(err, link.ErrPayloadTooBig) {
+		return badRequest("post: text too long")
+	}
+	if err != nil {
+		slog.Warn("local: post", "err", err)
+		return Response{Error: "post: " + err.Error()}
+	}
+	return Response{MsgID: id}
+}
+
+// Do sends req to the socket at path and returns the daemon's response. An
+// error means the daemon could not be reached or did not reply; a failed
+// request is a Response with Error set.
+func Do(ctx context.Context, path string, req Request) (Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", path)
+	if err != nil {
+		return Response{}, err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Now()) })
+	defer stop()
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return Response{}, err
+	}
+	var res Response
+	if err := json.NewDecoder(conn).Decode(&res); err != nil {
+		return Response{}, err
+	}
+	return res, nil
+}

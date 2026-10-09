@@ -22,7 +22,7 @@ type Message struct {
 
 // open opens the database at path and brings its schema up to date.
 func open(ctx context.Context, path string, migrations []string) (*sql.DB, error) {
-	// WAL lets the client daemon and a short-lived `fednet client post`
+	// WAL lets the hub daemon and a short-lived `fednet hub register`
 	// process use the same file at once; busy_timeout makes one wait for the
 	// other's lock instead of failing. With _txlock=immediate a transaction
 	// takes the write lock when it begins, so two writers cannot deadlock
