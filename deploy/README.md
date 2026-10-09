@@ -54,6 +54,8 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 
 channel 里的消息只有 @ 了 bot 才交给 agent，@ 的那条带上线程里之前的消息作为上下文；配置里的 `history` 定上下文的上限：`max_messages` 最多几条，`max_chars` 这几条的正文合计最多几个字符，`max_message_chars` 单条正文超过几个字符就截断 (@ 的那条本身也按它截)。不写就用示例里的默认值 (10、4000、2000)。hub 启动时用 bot token 调一次 `auth.test` 认自己的用户 id，调不到就不启动。
 
+人在 Slack 里上传的文件由 hub 用 bot token 代 client 下载 (app 的 manifest 要有 `files:read`)；配置里的 `files` 定上限：`prefetch_types` 是交给 agent 之前就先取到它机器上的类型 (`image/*` 是所有图片)，`prefetch_max_bytes` 先取的单个文件最大几个字节，`prefetch_max_total_bytes` 一条消息先取的合计最多几个字节，`fetch_max_bytes` agent 用 `fednet client fetch-file` 按需取时单个文件最大几个字节。不写就用示例里的默认值 (图片与 PDF、20 MiB、50 MiB、200 MiB)。hub 不存文件；client 存在它数据库旁边的 `files/` 下 (`-files-dir` 可改)，默认保留 7 天、合计 2 GiB (`-files-retention`、`-files-max-total-bytes`)。
+
 ## 启动之后
 
 在 hub 机器上登记一台 client (ID 和 HASH 是那台机器上 `fednet client init` 打印的)：

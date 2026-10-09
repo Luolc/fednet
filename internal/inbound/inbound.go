@@ -86,6 +86,9 @@ type Receiver struct {
 	Bot string
 	// History bounds the thread history a Mention carries.
 	History Limits
+	// Prefetch says which of a message's files the client fetches before
+	// it runs the hook.
+	Prefetch Prefetch
 	// Window is how far back a backfill reads at most; zero means
 	// DefaultWindow.
 	Window time.Duration
@@ -179,7 +182,7 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		// A reply in a thread nobody handed over: not taken in.
 		return nil
 	}
-	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.Users[ev.User], TS: ev.TS, Files: files(ev.Files)}
+	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.Users[ev.User], TS: ev.TS, Files: r.Prefetch.mark(files(ev.Files))}
 	m.Text = text(ev, r.History.messageChars())
 	// What a mention carries is read outside the transaction; whether the
 	// message is the one that hands the thread over is decided inside it,
@@ -271,7 +274,7 @@ func text(ev Event, max int) string {
 func files(fs []slack.File) []payload.File {
 	var out []payload.File
 	for _, f := range fs {
-		out = append(out, payload.File{Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.URL})
+		out = append(out, payload.File{ID: f.ID, Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.URL})
 	}
 	return out
 }

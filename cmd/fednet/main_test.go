@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -52,6 +53,8 @@ func TestRun(t *testing.T) {
 		{"revoke without a client", []string{"hub", "revoke", "-db", "x"}, 2, "", "want 1 arguments"},
 		{"approval without verify", []string{"approval"}, 2, "", "want verify"},
 		{"request-approval without flags", []string{"client", "request-approval", "-socket", "x", "do it"}, 2, "", "-socket, -agent, -action and a non-empty TEXT are required"},
+		{"fetch-file without an id", []string{"client", "fetch-file", "-socket", "x"}, 2, "", "want 1 arguments"},
+		{"client with a zero retention", []string{"client", "-hub", "h", "-db", "x", "-credential", "c", "-socket", "s", "-files-retention", "0"}, 2, "", "must be positive"},
 		{"request-approval with a missing action file", []string{"client", "request-approval", "-socket", "x", "-agent", "a", "-action", "/nonexistent/action.json", "do it"}, 1, "", "no such file"},
 		{"hub with a missing approval key", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-approval-key-file", "/nonexistent/key"}, 1, "", "no such file"},
 		{"approval verify without flags", []string{"approval", "verify", "-pubkey", "x"}, 2, "", "-pubkey, -approval, -action, -machine, -agent and -used are required"},
@@ -331,6 +334,36 @@ func TestHubAndClient(t *testing.T) {
 	if fi, err := os.Stat(credPath); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Fatalf("credential file mode = %v, %v; want 0600", fi.Mode(), err)
 	}
+}
+
+// The client prunes its files on a timer, with no hook and no hub.
+func TestClientPrunesFilesOnATimer(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credential")
+	var stdout, stderr syncBuffer
+	if code := run(t.Context(), []string{"client", "init", "-id", "workstation", "-credential", credPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client init: exit %d", code)
+	}
+	stale := filepath.Join(dir, "files", "F1", "old.bin")
+	if err := os.MkdirAll(filepath.Dir(stale), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// The hub's address is one nothing listens on; the files directory is
+	// relative, from the client's point of view.
+	t.Chdir(dir)
+	start(t, []string{"client", "-hub", "http://127.0.0.1:1", "-db", filepath.Join(dir, "client.db"), "-credential", credPath, "-socket", filepath.Join(dir, "fednet.sock"),
+		"-files-dir", "files", "-files-retention", "1m", "-files-prune-interval", "20ms"}, &stdout, &stderr)
+	waitFor(t, "the stale file to be pruned", func() bool {
+		_, err := os.Stat(stale)
+		return errors.Is(err, os.ErrNotExist)
+	})
 }
 
 // A socket this user may not write to is refused with exit code 3.

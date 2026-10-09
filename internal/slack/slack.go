@@ -5,10 +5,12 @@
 package slack
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 	"strconv"
@@ -48,6 +50,8 @@ type Message struct {
 
 // File is a file uploaded with a message.
 type File struct {
+	// ID is Slack's id of the file, which FileInfo and Download take.
+	ID   string `json:"id,omitempty"`
 	Name string `json:"name"`
 	// Mimetype and Size are what Slack reports of the file; Size is in
 	// bytes.
@@ -55,6 +59,9 @@ type File struct {
 	Size     int    `json:"size,omitempty"`
 	// URL is the file's permalink, which opens it in Slack.
 	URL string `json:"url"`
+	// DownloadURL is where Download gets the content, with the token; it
+	// is set by FileInfo and goes to no client.
+	DownloadURL string `json:"-"`
 }
 
 // Mentions reports whether text mentions user, as Slack writes a mention
@@ -112,6 +119,14 @@ type API interface {
 	// of a click on what one showed, in place of the message there, which
 	// is seen by that person alone.
 	Respond(ctx context.Context, responseURL, text string) error
+	// FileInfo returns what Slack knows of the file with id, DownloadURL
+	// included; a file Slack does not have, or has deleted, is
+	// ErrNotFound.
+	FileInfo(ctx context.Context, id string) (File, error)
+	// Download returns the content of f, which FileInfo returned, as a
+	// stream the caller closes. The content is not checked against
+	// f.Size: the caller counts.
+	Download(ctx context.Context, f File) (io.ReadCloser, error)
 }
 
 // Command is a slash command someone sent, as Socket Mode delivers it.
@@ -312,7 +327,14 @@ type Fake struct {
 	whispers map[string][]string
 	// responses maps a response URL to the texts posted through it.
 	responses map[string][]string
-	clock     int
+	// files maps a file id to the file and its content.
+	files map[string]fakeFile
+	clock int
+}
+
+type fakeFile struct {
+	File
+	content []byte
 }
 
 type fakeChannel struct {
@@ -623,4 +645,47 @@ func (f *Fake) Responses(responseURL string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.responses[responseURL]...)
+}
+
+// AddFile makes file, with content, one FileInfo and Download find;
+// file.Size is set from content. It returns the file as a message would
+// carry it.
+func (f *Fake) AddFile(file File, content []byte) File {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.files == nil {
+		f.files = make(map[string]fakeFile)
+	}
+	file.Size = len(content)
+	f.files[file.ID] = fakeFile{file, append([]byte(nil), content...)}
+	return file
+}
+
+// RemoveFile deletes the file with id, as a person deleting it in Slack
+// would.
+func (f *Fake) RemoveFile(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.files, id)
+}
+
+func (f *Fake) FileInfo(_ context.Context, id string) (File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ff, ok := f.files[id]
+	if !ok {
+		return File{}, ErrNotFound
+	}
+	ff.DownloadURL = "fake://" + id
+	return ff.File, nil
+}
+
+func (f *Fake) Download(_ context.Context, file File) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ff, ok := f.files[file.ID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(ff.content)), nil
 }

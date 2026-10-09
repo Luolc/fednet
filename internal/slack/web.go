@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -27,15 +29,21 @@ const maxWait = time.Minute
 // token it was made with, and writes no logs.
 type Web struct {
 	c *slackgo.Client
-	// http posts to response URLs, which take no token.
-	http *http.Client
+	// token is the bot token, for the file downloads, which are plain
+	// GETs outside the Web API; base is the Web API's URL, whose host may
+	// receive the token too.
+	token, base string
+	// http posts to response URLs, which take no token; files downloads
+	// files, with the token, and has no timeout of its own: a download
+	// is bounded by its context.
+	http, files *http.Client
 	// sleep waits for d or until ctx is done; tests replace it.
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // New returns a Web that calls Slack with token, a bot token.
 func New(token string) *Web {
-	return &Web{c: slackgo.New(token), http: &http.Client{Timeout: responseTimeout}, sleep: sleep}
+	return &Web{c: slackgo.New(token), token: token, base: slackgo.APIURL, http: &http.Client{Timeout: responseTimeout}, files: &http.Client{}, sleep: sleep}
 }
 
 // responseTimeout bounds one post to a response URL.
@@ -70,7 +78,7 @@ func (w *Web) call(ctx context.Context, method string, f func() error) error {
 }
 
 // notFound is the Slack errors that mean ErrNotFound.
-var notFound = map[string]bool{"channel_not_found": true, "thread_not_found": true, "message_not_found": true}
+var notFound = map[string]bool{"channel_not_found": true, "thread_not_found": true, "message_not_found": true, "file_not_found": true, "file_deleted": true}
 
 // wrap names method in err, and turns Slack's errors for an unknown
 // channel, thread or message into ErrNotFound.
@@ -119,9 +127,82 @@ func message(m slackgo.Message) Message {
 		out.ThreadTS = m.ThreadTimestamp
 	}
 	for _, f := range m.Files {
-		out.Files = append(out.Files, File{Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.Permalink})
+		out.Files = append(out.Files, file(f))
 	}
 	return out
+}
+
+// file converts a file as Slack returns it, with its download URL.
+func file(f slackgo.File) File {
+	return File{ID: f.ID, Name: f.Name, Mimetype: f.Mimetype, Size: f.Size, URL: f.Permalink, DownloadURL: f.URLPrivateDownload}
+}
+
+// FileInfo asks files.info. A file hosted outside Slack (a link to a
+// document elsewhere) has no content Slack serves, and is an error.
+func (w *Web) FileInfo(ctx context.Context, id string) (File, error) {
+	var f *slackgo.File
+	err := w.call(ctx, "files.info", func() (err error) {
+		f, _, _, err = w.c.GetFileInfoContext(ctx, id, 0, 0)
+		return err
+	})
+	if err != nil {
+		return File{}, err
+	}
+	if f.IsExternal || f.URLPrivateDownload == "" {
+		return File{}, fmt.Errorf("slack: file %s is hosted outside Slack, nothing to download", id)
+	}
+	return file(*f), nil
+}
+
+// Download gets f.DownloadURL with the token. The token goes only to an
+// https URL on slack.com or to the host of the Web API; without access
+// to the file Slack redirects to its sign-in page, which is reported
+// instead of being served as the file.
+func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
+	if err := w.mayReceiveToken(f.DownloadURL); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.DownloadURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("slack: download %s: %w", f.ID, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+w.token)
+	res, err := w.files.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("slack: download %s: %w", f.ID, redact(w.token, err))
+	}
+	if res.StatusCode != http.StatusOK {
+		res.Body.Close()
+		return nil, fmt.Errorf("slack: download %s: %s", f.ID, res.Status)
+	}
+	if final := res.Request; final != nil && final.URL.Query().Get("redir") != "" {
+		res.Body.Close()
+		return nil, fmt.Errorf("slack: download %s was redirected to the sign-in page: the token cannot read this file", f.ID)
+	}
+	return res.Body, nil
+}
+
+// mayReceiveToken checks that rawURL is one the token may be sent to.
+func (w *Web) mayReceiveToken(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("slack: download URL: %w", err)
+	}
+	base, err := url.Parse(w.base)
+	if err != nil {
+		return err
+	}
+	host := strings.ToLower(u.Hostname())
+	if (u.Scheme == "https" && (host == "slack.com" || strings.HasSuffix(host, ".slack.com"))) || (u.Scheme == base.Scheme && u.Host == base.Host) {
+		return nil
+	}
+	return fmt.Errorf("slack: refusing to send the token to %s: not an https slack.com URL", u.Host)
+}
+
+// redact returns err with token replaced, should a transport error quote
+// the request.
+func redact(token string, err error) error {
+	return errors.New(strings.ReplaceAll(err.Error(), token, "<token>"))
 }
 
 // machine returns the machine named in m's first block when that is a

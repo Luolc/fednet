@@ -97,6 +97,11 @@ type Runner struct {
 	// Alert, if not nil, is called once for each message moved to the
 	// dead letters, with the alert's text.
 	Alert func(ctx context.Context, text string) error
+	// Prepare, if set, is given each message's payload before the hook
+	// runs for it, on every attempt, and returns the payload the event
+	// file gets; the inbox keeps the original. It is where the files
+	// uploaded with a message are fetched.
+	Prepare func(ctx context.Context, payload []byte) []byte
 
 	// nudge has a buffer of one, so a Nudge is kept until Run looks.
 	nudge     chan struct{}
@@ -333,7 +338,11 @@ const stderrTail = 4 << 10
 func (r *Runner) exec(ctx context.Context, m store.Message) error {
 	// A payload that is not JSON cannot be put in the event; that is the
 	// hub's fault, and the error, counted as an attempt, says so.
-	event, err := json.Marshal(Event{MsgID: m.MsgID, Payload: m.Payload})
+	p := m.Payload
+	if r.Prepare != nil && json.Valid(p) {
+		p = r.Prepare(ctx, p)
+	}
+	event, err := json.Marshal(Event{MsgID: m.MsgID, Payload: p})
 	if err != nil {
 		return fmt.Errorf("payload is not JSON: %v", err)
 	}

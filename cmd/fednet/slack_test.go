@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/inbound"
+	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -217,12 +219,17 @@ func TestHubWithSlack(t *testing.T) {
 	if sr.r.Bot != slack.FakeBot {
 		t.Fatalf("the receiver's bot is %q, want %q from auth.test", sr.r.Bot, slack.FakeBot)
 	}
-	ts, err := f.Start("C1", "U1", "<@"+slack.FakeBot+"> please fix the build")
+	// The message comes with a screenshot and a log: the screenshot is
+	// fetched through the hub before the hook runs, and the event names
+	// its path; the log is listed with its id for the agent to fetch.
+	shot := f.AddFile(slack.File{ID: "F1", Name: "shot.png", Mimetype: "image/png", URL: "https://example.invalid/F1"}, []byte("PNG..."))
+	log := f.AddFile(slack.File{ID: "F2", Name: "build.log", Mimetype: "text/plain", URL: "https://example.invalid/F2"}, []byte("error: ..."))
+	ts, err := f.Add("C1", slack.Message{User: "U1", Text: "<@" + slack.FakeBot + "> please fix the build", SubType: "file_share", Files: []slack.File{shot, log}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	thread := slack.ThreadKey("C1", ts)
-	ev := inbound.Event{ID: "Ev1", Channel: "C1", Message: slack.Message{TS: ts, User: "U1", Text: "<@" + slack.FakeBot + "> please fix the build"}}
+	ev := inbound.Event{ID: "Ev1", Channel: "C1", Message: slack.Message{TS: ts, User: "U1", Text: "<@" + slack.FakeBot + "> please fix the build", SubType: "file_share", Files: []slack.File{shot, log}}}
 	if err := sr.r.Handle(ctx, ev); err != nil {
 		t.Fatal(err)
 	}
@@ -239,6 +246,34 @@ func TestHubWithSlack(t *testing.T) {
 			t.Fatalf("hook got %s, want %s", event.Payload, want)
 		}
 	}
+	var got payload.Message
+	if err := json.Unmarshal(event.Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	shotPath := filepath.Join(dir, "files", "F1", "shot.png")
+	wantFiles := []payload.File{
+		{ID: "F1", Name: "shot.png", Mimetype: "image/png", Size: 6, URL: "https://example.invalid/F1", Fetch: true, Path: shotPath},
+		{ID: "F2", Name: "build.log", Mimetype: "text/plain", Size: 10, URL: "https://example.invalid/F2"},
+	}
+	if !reflect.DeepEqual(got.Files, wantFiles) {
+		t.Fatalf("hook got files %+v, want %+v", got.Files, wantFiles)
+	}
+	if b, err := os.ReadFile(shotPath); err != nil || string(b) != "PNG..." {
+		t.Fatalf("the screenshot at %s holds %q, %v; want the content", shotPath, b, err)
+	}
+	if fi, err := os.Stat(shotPath); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("the screenshot's mode is %v, %v; want 0600", fi.Mode(), err)
+	}
+	// The inbox keeps the payload as the hub sent it: no path.
+	cs, err := store.OpenClient(ctx, clientDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	waitFor(t, "the message queued in the inbox", func() bool {
+		qs, err := cs.Inbox.Queued(ctx)
+		return err == nil && len(qs) == 1 && !strings.Contains(string(qs[0].Payload), `"path"`) && strings.Contains(string(qs[0].Payload), `"fetch":true`)
+	})
 
 	// The hook gives up on it; the client tells the hub, whose first try
 	// at the webhook is refused and logged.

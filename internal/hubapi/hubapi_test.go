@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -390,5 +391,39 @@ func TestRequestApproval(t *testing.T) {
 	_, cards := f.Cards("C9")
 	if len(cards) != 1 || cards[0].ID != reply.ApprovalID || cards[0].Params != string(action) || cards[0].Machine != "workstation" || cards[0].Agent != "ops-exec" {
 		t.Fatalf("cards = %+v, want one for %s from ops-exec on workstation with the action as given", cards, reply.ApprovalID)
+	}
+}
+
+// Fetch serves any file the bot can see to any client, within the size
+// limit; a file Slack no longer has is not found, and nothing is served
+// without Slack.
+func TestFetch(t *testing.T) {
+	s, f := testServer(t)
+	s.MaxFetchBytes = 10
+	ctx := t.Context()
+	f.AddFile(slack.File{ID: "F1", Name: "shot.png", Mimetype: "image/png", URL: "https://example.invalid/F1"}, []byte("PNG..."))
+	f.AddFile(slack.File{ID: "F2", Name: "big.png", Mimetype: "image/png", URL: "https://example.invalid/F2"}, []byte("a dozen bytes"))
+	file, body, err := s.Fetch(ctx, "workstation", "F1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(body)
+	body.Close()
+	if err != nil || string(b) != "PNG..." || file != (link.File{Name: "shot.png", Mimetype: "image/png", Size: 6}) {
+		t.Fatalf("Fetch(F1) = %+v, %q, %v; want the file and its content", file, b, err)
+	}
+	if _, _, err := s.Fetch(ctx, "workstation", "F2"); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "13 bytes, over the hub's limit of 10") {
+		t.Fatalf("Fetch(F2) = %v, want it denied for its size", err)
+	}
+	f.RemoveFile("F1")
+	if _, _, err := s.Fetch(ctx, "workstation", "F1"); !errors.Is(err, link.ErrNotFound) || !strings.Contains(err.Error(), "no longer exists in Slack") {
+		t.Fatalf("Fetch of a deleted file = %v, want not found", err)
+	}
+	if _, _, err := s.Fetch(ctx, "workstation", "../F1"); !errors.Is(err, link.ErrBadRequest) {
+		t.Fatalf("Fetch(../F1) = %v, want a bad request", err)
+	}
+	s.Slack = nil
+	if _, _, err := s.Fetch(ctx, "workstation", "F2"); !errors.Is(err, errNoSlack) {
+		t.Fatalf("Fetch without Slack = %v, want errNoSlack", err)
 	}
 }

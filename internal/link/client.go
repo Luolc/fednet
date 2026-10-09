@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,9 @@ type Client struct {
 	// Timeout bounds one dial, one uplink request and the wait for one
 	// pong. Zero means DefaultTimeout.
 	Timeout time.Duration
+	// FetchTimeout bounds one file download, headers to last byte. Zero
+	// means DefaultFetchTimeout.
+	FetchTimeout time.Duration
 	// HTTPClient is used for both links. Nil means http.DefaultClient.
 	HTTPClient *http.Client
 	// Received, if set, is called after a downlink message is stored in
@@ -62,8 +66,9 @@ type Client struct {
 
 // Defaults for the zero fields of Client.
 const (
-	DefaultHeartbeat = 10 * time.Second
-	DefaultTimeout   = 30 * time.Second
+	DefaultHeartbeat    = 10 * time.Second
+	DefaultTimeout      = 30 * time.Second
+	DefaultFetchTimeout = 5 * time.Minute
 )
 
 // DefaultBackoff is the Backoff used when Client.Backoff is zero.
@@ -88,6 +93,13 @@ func (c *Client) timeout() time.Duration {
 		return DefaultTimeout
 	}
 	return c.Timeout
+}
+
+func (c *Client) fetchTimeout() time.Duration {
+	if c.FetchTimeout == 0 {
+		return DefaultFetchTimeout
+	}
+	return c.FetchTimeout
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -311,19 +323,74 @@ func (c *Client) Request(ctx context.Context, req []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
 	}
-	msg := strings.TrimSpace(string(body))
-	switch res.StatusCode {
-	case http.StatusOK:
+	if res.StatusCode == http.StatusOK {
 		return body, nil
-	case http.StatusUnauthorized:
-		return nil, refusal{ErrDenied, "the hub did not accept this client's credential"}
+	}
+	return nil, refused(res, strings.TrimSpace(string(body)))
+}
+
+// Fetch asks the hub for the file with id and returns what the hub says
+// of it and its content, which the caller reads whole, within
+// FetchTimeout, and closes. Like Request it queues nothing, and fails the
+// same ways: ErrUnreachable without an answer, a refusal as the hub
+// refused. A download the hub broke off ends with io.ErrUnexpectedEOF
+// before Size bytes.
+func (c *Client) Fetch(ctx context.Context, id string) (File, io.ReadCloser, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout())
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Hub+FilePath+"?id="+url.QueryEscape(id), nil)
+	if err != nil {
+		cancel()
+		return File{}, nil, err
+	}
+	hreq.Header = c.header()
+	res, err := c.httpClient().Do(hreq)
+	if err != nil {
+		cancel()
+		return File{}, nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
+	}
+	if res.StatusCode != http.StatusOK {
+		defer cancel()
+		defer res.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(res.Body, maxFrameBytes))
+		if err != nil {
+			return File{}, nil, fmt.Errorf("%w: %w", ErrUnreachable, err)
+		}
+		return File{}, nil, refused(res, strings.TrimSpace(string(body)))
+	}
+	name, err := url.PathUnescape(res.Header.Get(FileNameHeader))
+	if err != nil || res.ContentLength < 0 {
+		cancel()
+		res.Body.Close()
+		return File{}, nil, errors.New("the hub's answer names no file or no size")
+	}
+	f := File{Name: name, Mimetype: res.Header.Get("Content-Type"), Size: res.ContentLength}
+	return f, &fetched{res.Body, cancel}, nil
+}
+
+// fetched is a download's body; closing it ends the download's timeout.
+type fetched struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (f *fetched) Close() error {
+	f.cancel()
+	return f.ReadCloser.Close()
+}
+
+// refused turns a response that is not 200 into the error Request and
+// Fetch return for it: a refusal for the refusal statuses and for 401,
+// otherwise an error naming the status.
+func refused(res *http.Response, msg string) error {
+	if res.StatusCode == http.StatusUnauthorized {
+		return refusal{ErrDenied, "the hub did not accept this client's credential"}
 	}
 	for _, f := range refusals {
 		if res.StatusCode == f.status {
-			return nil, refusal{f.err, msg}
+			return refusal{f.err, msg}
 		}
 	}
-	return nil, fmt.Errorf("hub replied %s: %s", res.Status, msg)
+	return fmt.Errorf("hub replied %s: %s", res.Status, msg)
 }
 
 // Refuse returns the error with which Hub.Answer refuses a request: kind is

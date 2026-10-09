@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -44,6 +46,12 @@ type Hub struct {
 	// Uplinked, if set, is called after an uplink message is stored in the
 	// inbox, before the client is told. It must not block.
 	Uplinked func()
+	// Fetch serves a file GET from client: it returns the file and its
+	// content, which the hub streams to the client and closes. An error
+	// made by Refuse goes back to the client; any other error is logged
+	// and the client only learns that the request failed. Nil means every
+	// file GET fails.
+	Fetch func(ctx context.Context, client, id string) (File, io.ReadCloser, error)
 	// UpgradeTo, if set, is asked at each downlink handshake, accepted or
 	// refused, with the version in VersionHeader, and answers the release
 	// the client should upgrade to, or "": that goes to the client in
@@ -112,6 +120,7 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET "+DownlinkPath, h.serveDownlink)
 	mux.HandleFunc("POST "+UplinkPath, h.serveUplink)
 	mux.HandleFunc("POST "+RequestPath, h.serveRequest)
+	mux.HandleFunc("GET "+FilePath, h.serveFile)
 	return mux
 }
 
@@ -347,20 +356,60 @@ func (h *Hub) serveRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	answer, err := h.Answer(r.Context(), client, req)
+	if h.fail(w, client, "request", err) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(answer)
+}
+
+// fail reports err to the client when it is not nil: a refusal with its
+// status and text, anything else as a 500 whose reason stays in the log.
+// It reports whether there was an error.
+func (h *Hub) fail(w http.ResponseWriter, client, what string, err error) bool {
+	if err == nil {
+		return false
+	}
 	var rf refusal
 	if errors.As(err, &rf) {
 		for _, f := range refusals {
 			if rf.kind == f.err {
 				http.Error(w, rf.msg, f.status)
-				return
+				return true
 			}
 		}
 	}
-	if err != nil {
-		slog.Warn("link: request", "client", client, "err", err)
-		http.Error(w, "the hub failed to answer", http.StatusInternalServerError)
+	slog.Warn("link: "+what, "client", client, "err", err)
+	http.Error(w, "the hub failed to answer", http.StatusInternalServerError)
+	return true
+}
+
+// serveFile streams one file: the headers say what it is, then the
+// content follows, Content-Length long. A download that breaks off
+// leaves the client with fewer bytes than that, which it must notice.
+func (h *Hub) serveFile(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.authorize(w, r)
+	if !ok {
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(answer)
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "no file id", http.StatusBadRequest)
+		return
+	}
+	if h.Fetch == nil {
+		http.Error(w, "the hub serves no files", http.StatusInternalServerError)
+		return
+	}
+	f, body, err := h.Fetch(r.Context(), client, id)
+	if h.fail(w, client, "file", err) {
+		return
+	}
+	defer body.Close()
+	w.Header().Set("Content-Type", f.Mimetype)
+	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	w.Header().Set(FileNameHeader, url.PathEscape(f.Name))
+	if _, err := io.Copy(w, body); err != nil {
+		slog.Warn("link: file", "client", client, "id", id, "err", err)
+	}
 }
