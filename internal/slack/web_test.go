@@ -378,8 +378,8 @@ func TestCardBlocks(t *testing.T) {
 	params := "{\n  \"note\": \"```not a fence```\",\n  \"bucket\": \"*example-critical* <https://example.invalid|x>\"\n}"
 	c := Card{ID: "apr-1", Summary: "delete *b* <!channel>", Params: params, Machine: "workstation", Agent: "ops-*exec*", Requester: "<@U7>", Expires: time.Unix(1_760_000_000, 0)}
 	bs := blocks(c)
-	if len(bs) > 50 {
-		t.Fatalf("%d blocks, Slack takes at most 50", len(bs))
+	if len(bs) != fixedBlocks+1 {
+		t.Fatalf("%d blocks with one parameter block, want the %d fixed ones and it", len(bs), fixedBlocks)
 	}
 	actions, ok := bs[len(bs)-1].(*slackgo.ActionBlock)
 	if !ok || len(actions.Elements.ElementSet) != 2 {
@@ -450,24 +450,43 @@ func TestCardBlocks(t *testing.T) {
 		t.Errorf("expired card %s does not say expired", text)
 	}
 
-	c.Params = strings.Repeat("é", paramChunk) + "<&>"
+	c.Params = strings.Repeat("é", ParamChunk) + "<&>"
 	got := paramTexts(t, blocks(c))
-	if len(got) != 2 || strings.Join(got, "") != c.Params || utf8.RuneCountInString(got[0]) != paramChunk {
-		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the parameters, the first %d characters", len(got), strings.Join(got, ""), paramChunk)
+	if len(got) != 2 || strings.Join(got, "") != c.Params || utf8.RuneCountInString(got[0]) != ParamChunk {
+		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the parameters, the first %d characters", len(got), strings.Join(got, ""), ParamChunk)
+	}
+	// The largest parameters that fit make exactly the largest message
+	// Slack takes, pending or decided, with or without a requester; the
+	// Fake refuses one block more, as Slack would.
+	c.Params = strings.Repeat("x", MaxParamChunks*ParamChunk)
+	for _, outcome := range []string{"", "approved"} {
+		c.Outcome = outcome
+		if n := len(blocks(c)); n != maxBlocks {
+			t.Fatalf("largest card (outcome %q) has %d blocks, want %d", outcome, n, maxBlocks)
+		}
+	}
+	f := &Fake{}
+	f.AddChannel("C9", "")
+	if _, err := f.PostCard(context.Background(), "C9", c); err != nil {
+		t.Fatalf("the Fake refused the largest card: %v", err)
+	}
+	c.Params += "x"
+	if _, err := f.PostCard(context.Background(), "C9", c); err == nil {
+		t.Fatal("the Fake took a card of more blocks than Slack does")
 	}
 }
 
-// ParamBlocks fits at most maxParamChunks blocks of paramChunk characters
+// ParamBlocks fits at most MaxParamChunks blocks of ParamChunk characters
 // each; one character more does not fit; a character is never split.
 func TestParamBlocks(t *testing.T) {
-	exact := strings.Repeat("x", maxParamChunks*paramChunk)
-	if chunks, ok := ParamBlocks(exact); !ok || len(chunks) != maxParamChunks {
-		t.Fatalf("ParamBlocks(exact) = %d blocks, %v; want %d, true", len(chunks), ok, maxParamChunks)
+	exact := strings.Repeat("x", MaxParamChunks*ParamChunk)
+	if chunks, ok := ParamBlocks(exact); !ok || len(chunks) != MaxParamChunks {
+		t.Fatalf("ParamBlocks(exact) = %d blocks, %v; want %d, true", len(chunks), ok, MaxParamChunks)
 	}
 	if _, ok := ParamBlocks(exact + "x"); ok {
 		t.Fatal("ParamBlocks(exact + 1) fits")
 	}
-	chunks, _ := ParamBlocks(strings.Repeat("x", paramChunk-1) + "éy")
+	chunks, _ := ParamBlocks(strings.Repeat("x", ParamChunk-1) + "éy")
 	if len(chunks) != 2 || chunks[1] != "y" || !utf8.ValidString(chunks[0]) {
 		t.Fatalf("ParamBlocks around a two-byte character = %q, want it whole in the first block", chunks)
 	}

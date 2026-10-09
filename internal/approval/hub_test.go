@@ -342,8 +342,8 @@ func TestFlowRefusesClicks(t *testing.T) {
 // posted.
 func TestFlowActionMustFitTheCard(t *testing.T) {
 	tf := newFlow(t)
-	// 46 blocks of 2900 characters, as a JSON string.
-	fits := `"` + strings.Repeat("x", 46*2900-2) + `"`
+	// The most parameter blocks a card takes, each full, as a JSON string.
+	fits := `"` + strings.Repeat("x", slack.MaxParamChunks*slack.ParamChunk-2) + `"`
 	id, err := tf.Request(t.Context(), "workstation", "ops-exec", "", "big one", []byte(fits))
 	if err != nil {
 		t.Fatal(err)

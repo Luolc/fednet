@@ -264,7 +264,7 @@ func TestApprovalFlow(t *testing.T) {
 
 	// An action the card cannot show whole is refused as a bad request.
 	big := filepath.Join(rig.dir, "big.json")
-	if err := os.WriteFile(big, []byte(`"`+strings.Repeat("x", 46*2900)+`"`), 0o644); err != nil {
+	if err := os.WriteFile(big, []byte(`"`+strings.Repeat("x", slack.MaxParamChunks*slack.ParamChunk)+`"`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if code, out := rig.request(t, ctx, big); code != exitBadRequest || out != "" {

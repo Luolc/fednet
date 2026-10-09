@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strconv"
@@ -131,16 +132,20 @@ type Click struct {
 	TS      string
 }
 
-// Limits of a card's parameters: Slack takes at most 50 blocks in one
-// message and about 3000 characters in one text; the card has four
-// blocks besides the parameters.
+// Limits of a card: Slack takes at most maxBlocks blocks in one message
+// and about 3000 characters in one text. The card has fixedBlocks blocks
+// besides the parameters (the header, the two labels, the summary, who
+// asks, the expiry with the id, and the buttons or the outcome), so the
+// parameters get the rest, ParamChunk characters each.
 const (
-	paramChunk     = 2900
-	maxParamChunks = 46
+	maxBlocks      = 50
+	fixedBlocks    = 7
+	ParamChunk     = 2900
+	MaxParamChunks = maxBlocks - fixedBlocks
 )
 
 // ParamBlocks splits params into the texts of the card's parameter
-// blocks, each at most paramChunk characters, split between characters.
+// blocks, each at most ParamChunk characters, split between characters.
 // The blocks show the text as it is, so nothing is escaped. ok is false
 // when they would take more blocks than fit in one message, so that a
 // card either shows the whole parameters or is not posted. Empty params
@@ -149,7 +154,7 @@ func ParamBlocks(params string) (chunks []string, ok bool) {
 	var b strings.Builder
 	n := 0 // characters in b
 	for _, r := range params {
-		if n == paramChunk {
+		if n == ParamChunk {
 			chunks = append(chunks, b.String())
 			b.Reset()
 			n = 0
@@ -158,7 +163,7 @@ func ParamBlocks(params string) (chunks []string, ok bool) {
 		n++
 	}
 	chunks = append(chunks, b.String())
-	return chunks, len(chunks) <= maxParamChunks
+	return chunks, len(chunks) <= MaxParamChunks
 }
 
 // Action ids of a card's buttons.
@@ -427,10 +432,10 @@ func (f *Fake) DMs(user string) []string {
 
 // PostCard posts the card as a message from the user "fednet" whose text
 // is the card's summary, and keeps the card for Card. Like Slack, it
-// refuses a card whose parameters do not fit.
+// refuses a card of more than maxBlocks blocks, as Web would lay it out.
 func (f *Fake) PostCard(_ context.Context, channel string, c Card) (string, error) {
-	if _, ok := ParamBlocks(c.Params); !ok {
-		return "", errors.New("slack: the card's parameters do not fit in one message")
+	if err := fits(c); err != nil {
+		return "", err
 	}
 	ts, err := f.Add(channel, Message{User: "fednet", Text: c.Summary})
 	if err != nil {
@@ -446,12 +451,23 @@ func (f *Fake) PostCard(_ context.Context, channel string, c Card) (string, erro
 }
 
 func (f *Fake) UpdateCard(_ context.Context, channel, ts string, c Card) error {
+	if err := fits(c); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.cards[ThreadKey(channel, ts)]; !ok {
 		return ErrNotFound
 	}
 	f.cards[ThreadKey(channel, ts)] = c
+	return nil
+}
+
+// fits is the check Slack would make on the card's blocks.
+func fits(c Card) error {
+	if n := len(blocks(c)); n > maxBlocks {
+		return fmt.Errorf("slack: the card has %d blocks, Slack takes at most %d", n, maxBlocks)
+	}
 	return nil
 }
 
