@@ -137,16 +137,34 @@ commands:
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
-  client post -socket PATH -thread KEY [-file PATH]... [-json] [--] [TEXT]
+  client post -socket PATH -thread KEY [-file PATH]... [-footer] [-json] [--] [TEXT]
         post TEXT to a thread; prints the msg_id once the client has queued it;
         put -- before a TEXT that starts with -; with -file (repeatable) the
         files are uploaded to the thread with TEXT, which may then be left
         out, through the hub, which must be reachable: such a post is not
-        queued, and returns once Slack has it; TEXT is standard Markdown,
-        which the hub puts in a Slack markdown block (headings, tables,
-        lists, code blocks); a TEXT over 4000 characters goes out as
-        several messages in order, each cut at the last line break that
-        leaves it at least half full, else at that length
+        queued, and returns once Slack has it; it still goes out after the
+        posts and progress queued before it, for which the client and then
+        the hub each wait at most 30s, failing the upload after that; TEXT
+        is standard Markdown, which the hub puts in a Slack markdown block
+        (headings, tables, lists, code blocks); a TEXT over 4000 characters
+        goes out as several messages in order, each cut at the last line
+        break that leaves it at least half full, else at that length; with
+        -footer TEXT goes out instead as one line of small grey text, with
+        its links [text](url) kept and the rest as it is, at most 3000
+        characters with the links written out; any post first closes the
+        thread's progress card, as progress -done does
+  client progress -socket PATH -thread KEY -title TITLE [-item TEXT:STATE]... [-json]
+  client progress -socket PATH -thread KEY (-done | -error) [-title TITLE] [-item TEXT:STATE]... [-json]
+        show what the agent is doing in a progress card in the thread; the
+        card is queued with the posts, in order, and prints the msg_id; a
+        thread has one open card at a time, which each call replaces whole
+        with TITLE and the items given (at most 50, each STATE doing, done
+        or error: a spinner, a tick, a red mark), so give the whole card
+        each time; with no open card, as after a post, the call posts a new
+        one below what is in the thread; -done closes the card, the items
+        still doing then done, -error in error instead, with TITLE and the
+        items given in place of the card's own; with no open card -done and
+        -error do nothing
   client read-thread -socket PATH [-json] THREAD-KEY
         print the messages of a thread, read by the hub
   client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
@@ -614,7 +632,8 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		}
 	}
 	api := &hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals,
-		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles}
+		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
+		BeforeUpload: poster.BeforeUpload}
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Request: *upgradeRequest, HandedOff: proc.Exit(),
@@ -855,6 +874,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientInit(args[1:], stdout)
 		case "post":
 			return clientPost(ctx, args[1:], stdout)
+		case "progress":
+			return clientProgress(ctx, args[1:], stdout)
 		case "read-thread":
 			return clientReadThread(ctx, args[1:], stdout)
 		case "open-thread":
@@ -1184,13 +1205,20 @@ func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 		paths = append(paths, path)
 		return nil
 	})
+	footer := fs.Bool("footer", false, "post TEXT as one line of small grey text")
 	if err := parseFlags(fs, args, -1); err != nil {
 		return err
 	}
 	if *socket == "" || *thread == "" || fs.NArg() > 1 || (fs.Arg(0) == "" && len(paths) == 0) {
 		return usageError("fednet client post: -socket, -thread and a non-empty TEXT or a -file are required")
 	}
-	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0)}
+	if *footer && (len(paths) > 0 || fs.Arg(0) == "") {
+		return usageError("fednet client post: -footer takes a non-empty TEXT and no -file")
+	}
+	if *footer && !slack.FooterFits(fs.Arg(0)) {
+		return usageError(fmt.Sprintf("fednet client post: a -footer TEXT takes at most %d characters, links written out", slack.MaxFooterChars))
+	}
+	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0), Footer: *footer}
 	var files []io.Reader
 	for _, path := range paths {
 		f, err := os.Open(path)
@@ -1214,6 +1242,51 @@ func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	if len(paths) > 0 {
 		return nil
+	}
+	_, err = fmt.Fprintln(stdout, res.MsgID)
+	return err
+}
+
+// clientProgress queues the thread's progress card for the hub, as a
+// post is queued, and prints the msg_id.
+func clientProgress(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client progress", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	thread := fs.String("thread", "", "key of the thread (required)")
+	title := fs.String("title", "", "the card's title: what is going on now (required unless -done or -error)")
+	var items []slack.ProgressItem
+	fs.Func("item", "an item of the card as TEXT:STATE, STATE doing, done or error (repeatable)", func(v string) error {
+		i := strings.LastIndexByte(v, ':')
+		if i < 0 {
+			return fmt.Errorf("%q is not TEXT:STATE", v)
+		}
+		items = append(items, slack.ProgressItem{Text: v[:i], State: v[i+1:]})
+		return nil
+	})
+	done := fs.Bool("done", false, "close the card, the items still doing done")
+	failed := fs.Bool("error", false, "close the card, the items still doing in error")
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" || *thread == "" || (*done && *failed) {
+		return usageError("fednet client progress: -socket and -thread are required, and at most one of -done and -error")
+	}
+	req := local.Request{Cmd: local.Progress, Thread: *thread, Title: *title, Items: items}
+	switch {
+	case *done:
+		req.Close = slack.Done
+	case *failed:
+		req.Close = slack.Failed
+	}
+	if err := slack.CheckProgress(req.Title, req.Items, req.Close != ""); err != nil {
+		return usageError("fednet client progress: " + err.Error())
+	}
+	res, err := do(ctx, *socket, req)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
 	}
 	_, err = fmt.Fprintln(stdout, res.MsgID)
 	return err

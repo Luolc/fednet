@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,12 @@ func TestRun(t *testing.T) {
 		{"post with two texts", []string{"client", "post", "-socket", "x", "-thread", "t", "a", "b"}, 2, "", "-socket, -thread and a non-empty TEXT or a -file are required"},
 		{"post with a missing file", []string{"client", "post", "-socket", "x", "-thread", "t", "-file", "/nonexistent/shot.png"}, 1, "", "no such file"},
 		{"post to a missing socket", []string{"client", "post", "-socket", "/nonexistent/fednet.sock", "-thread", "t", "hello"}, 4, "", "no such file"},
+		{"progress without a title", []string{"client", "progress", "-socket", "x", "-thread", "t"}, 2, "", "a progress card needs a title"},
+		{"progress with a bad state", []string{"client", "progress", "-socket", "x", "-thread", "t", "-title", "a", "-item", "b:started"}, 2, "", `state "started" is not doing, done or error`},
+		{"progress with too many items", append([]string{"client", "progress", "-socket", "x", "-thread", "t", "-title", "a"}, slices.Repeat([]string{"-item", "b:done"}, 51)...), 2, "", "51 items, a progress card takes at most 50"},
+		{"progress done and error", []string{"client", "progress", "-socket", "x", "-thread", "t", "-done", "-error"}, 2, "", "at most one of -done and -error"},
+		{"footer with a file", []string{"client", "post", "-socket", "x", "-thread", "t", "-footer", "-file", "/dev/null", "a"}, 2, "", "-footer takes a non-empty TEXT and no -file"},
+		{"footer too long", []string{"client", "post", "-socket", "x", "-thread", "t", "-footer", strings.Repeat("<", 1001)}, 2, "", "at most 3000 characters"},
 		{"client init without flags", []string{"client", "init"}, 2, "", "-id and -credential are required"},
 		{"read-thread without a socket", []string{"client", "read-thread", "C1/1"}, 2, "", "-socket and THREAD-KEY are required"},
 		{"adopt without a thread", []string{"client", "adopt", "-socket", "x"}, 2, "", "want 1 arguments"},

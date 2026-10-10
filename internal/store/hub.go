@@ -89,6 +89,15 @@ ALTER TABLE inbox ADD COLUMN parts_sent INTEGER NOT NULL DEFAULT 0;
 -- thread got its owner; empty when the hub could not read it, for a
 -- direct message, and for threads owned before this column existed.
 ALTER TABLE owner ADD COLUMN channel_name TEXT NOT NULL DEFAULT '';
+`, `
+-- The progress card open in each thread: the ts of its message and the
+-- card itself as JSON, its title and items. A thread has at most one; the
+-- row goes once the card is closed.
+CREATE TABLE progress (
+	thread TEXT PRIMARY KEY,
+	ts     TEXT NOT NULL,
+	card   BLOB NOT NULL
+);
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.

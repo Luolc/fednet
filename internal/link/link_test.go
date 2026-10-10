@@ -967,7 +967,7 @@ func TestUpload(t *testing.T) {
 		got = append(got, "text="+u.Text)
 		return nil
 	}
-	c := &Client{ID: "a", Hub: srv.URL, Timeout: testTimeout}
+	c := &Client{Store: openClientStore(t), ID: "a", Hub: srv.URL, Timeout: testTimeout}
 	u := Upload{Thread: "C1/1.1", Text: "see", Files: []FileHeader{{Name: "a.png", Size: 3}, {Name: "b.log", Size: 2}}}
 	// More than the declared sizes is not sent.
 	if err := c.Upload(t.Context(), u, strings.NewReader("PNGerextra")); err != nil {
@@ -983,5 +983,36 @@ func TestUpload(t *testing.T) {
 	srv.Close()
 	if err := c.Upload(t.Context(), u, strings.NewReader("PNGer")); !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("Upload with the hub down = %v, want ErrUnreachable", err)
+	}
+}
+
+// An upload goes out only once what was queued before it has reached the
+// hub; when that does not happen within UploadWait it fails as
+// unreachable, and the hub gets nothing.
+func TestUploadWaitsForTheOutbox(t *testing.T) {
+	outboxPoll = time.Millisecond
+	t.Cleanup(func() { outboxPoll = 100 * time.Millisecond })
+	h, srv := testHub(t, nil)
+	uploads := 0
+	h.Upload = func(_ context.Context, _ string, u Upload, body io.Reader) error {
+		uploads++
+		_, err := io.Copy(io.Discard, body)
+		return err
+	}
+	st := openClientStore(t)
+	c := &Client{Store: st, ID: "a", Hub: srv.URL, Timeout: testTimeout, UploadWait: 20 * time.Millisecond}
+	id, err := c.Post(t.Context(), []byte(`{"type":"post"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := Upload{Thread: "C1/1.1", Files: []FileHeader{{Name: "a.png", Size: 3}}}
+	if err := c.Upload(t.Context(), u, strings.NewReader("PNG")); !errors.Is(err, ErrUnreachable) || uploads != 0 {
+		t.Fatalf("Upload behind a queued post = %v with %d uploads, want ErrUnreachable and none", err, uploads)
+	}
+	if err := st.Outbox.Ack(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Upload(t.Context(), u, strings.NewReader("PNG")); err != nil || uploads != 1 {
+		t.Fatalf("Upload with the outbox empty = %v with %d uploads, want one", err, uploads)
 	}
 }

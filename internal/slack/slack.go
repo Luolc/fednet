@@ -139,6 +139,15 @@ type API interface {
 	// channel, as one message from machine, as PostReply does; each
 	// file's content is read from its Body, Size bytes.
 	Upload(ctx context.Context, channel, ts, machine, text string, files []Upload) error
+	// PostProgress posts p in the thread that starts at ts in channel and
+	// returns the new message's ts.
+	PostProgress(ctx context.Context, channel, ts string, p Progress) (string, error)
+	// UpdateProgress replaces the progress card at ts in channel with p.
+	UpdateProgress(ctx context.Context, channel, ts string, p Progress) error
+	// PostFooter posts text, standard Markdown whose links are kept and
+	// nothing else, as one line of small grey text in the thread that
+	// starts at ts in channel, and returns the new message's ts.
+	PostFooter(ctx context.Context, channel, ts, text string) (string, error)
 }
 
 // Upload is one file to upload: its name, its size in bytes and its
@@ -343,6 +352,10 @@ type Fake struct {
 	machines map[string]string
 	// cards maps channel and ts, as a thread key, to the card there.
 	cards map[string]Card
+	// progress maps channel and ts, as a thread key, to the progress
+	// card there; footers maps the ts of each footer to its mrkdwn.
+	progress map[string]Progress
+	footers  map[string]string
 	// whispers maps a user to the ephemeral texts shown to them.
 	whispers map[string][]string
 	// responses maps a response URL to the texts posted through it.

@@ -112,6 +112,9 @@ type Server struct {
 	// how many one upload may have. Zero means the default.
 	MaxUploadBytes int64
 	MaxUploadFiles int
+	// BeforeUpload, if set, readies a thread for an upload from a client
+	// before the upload starts: it is outbound.Poster.BeforeUpload.
+	BeforeUpload func(ctx context.Context, client, thread string) error
 }
 
 // Defaults for the zero limits of Server: the largest file served is 200
@@ -161,6 +164,11 @@ func (s *Server) Upload(ctx context.Context, client string, u link.Upload, body 
 	}
 	if s.Slack == nil {
 		return errNoSlack
+	}
+	if s.BeforeUpload != nil {
+		if err := s.BeforeUpload(ctx, client, u.Thread); err != nil {
+			return err
+		}
 	}
 	err = s.Slack.Upload(ctx, channel, ts, client, u.Text, files)
 	if errors.Is(err, slack.ErrNotFound) {

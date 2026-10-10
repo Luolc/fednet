@@ -43,6 +43,9 @@ type Client struct {
 	// FileTimeout bounds one file download or upload, headers to last
 	// byte. Zero means DefaultFileTimeout.
 	FileTimeout time.Duration
+	// UploadWait bounds how long Upload waits for the outbox to empty.
+	// Zero means DefaultUploadWait.
+	UploadWait time.Duration
 	// HTTPClient is used for both links. Nil means http.DefaultClient.
 	HTTPClient *http.Client
 	// Received, if set, is called after a downlink message is stored in
@@ -69,7 +72,11 @@ const (
 	DefaultHeartbeat   = 10 * time.Second
 	DefaultTimeout     = 30 * time.Second
 	DefaultFileTimeout = 5 * time.Minute
+	DefaultUploadWait  = 30 * time.Second
 )
+
+// outboxPoll is how often Upload looks at the outbox; tests shorten it.
+var outboxPoll = 100 * time.Millisecond
 
 // DefaultBackoff is the Backoff used when Client.Backoff is zero.
 var DefaultBackoff = Backoff{Min: time.Second, Max: time.Minute}
@@ -381,8 +388,13 @@ func (f *fetched) Close() error {
 // Upload posts u's files, whose content it reads from body, u.Total()
 // bytes, in the thread u names, and returns once the hub has posted them
 // in Slack, within FileTimeout. Like Request it queues nothing and fails
-// the same ways.
+// the same ways; but it goes out only once what was queued before it has
+// reached the hub, so that it stays in order with the posts. When the
+// outbox does not empty within UploadWait it fails as unreachable.
 func (c *Client) Upload(ctx context.Context, u Upload, body io.Reader) error {
+	if err := c.drain(ctx); err != nil {
+		return err
+	}
 	header, err := json.Marshal(u)
 	if err != nil {
 		return err
@@ -409,6 +421,34 @@ func (c *Client) Upload(ctx context.Context, u Upload, body io.Reader) error {
 		return nil
 	}
 	return refused(res, strings.TrimSpace(string(msg)))
+}
+
+// drain waits until the outbox is empty, at most UploadWait.
+func (c *Client) drain(ctx context.Context) error {
+	wait := c.UploadWait
+	if wait == 0 {
+		wait = DefaultUploadWait
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		ms, err := c.Store.Outbox.Pending(ctx)
+		if err != nil {
+			return err
+		}
+		if len(ms) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %d posts queued before the upload have not reached the hub after %v", ErrUnreachable, len(ms), wait)
+		}
+		t := time.NewTimer(outboxPoll)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+	}
 }
 
 // refused turns a response that is not 200 into the error Request and
