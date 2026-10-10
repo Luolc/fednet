@@ -58,3 +58,14 @@ func (h *Hub) Clients(ctx context.Context) ([]string, error) {
 	}
 	return clients, rows.Err()
 }
+
+// LastUndelivered returns the rowid of the latest message from client,
+// among those up to upTo, that is not marked delivered, or 0 when there
+// is none. Alerts are left out: they hold up no post.
+func (in HubInbox) LastUndelivered(ctx context.Context, client string, upTo int64) (int64, error) {
+	var last int64
+	err := in.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(rowid), 0) FROM inbox WHERE delivered = 0 AND client_id = ? AND rowid <= ?
+		 AND json_extract(CAST(payload AS TEXT), '$.type') IS NOT 'alert'`, client, upTo).Scan(&last)
+	return last, err
+}

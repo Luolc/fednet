@@ -4,12 +4,18 @@
 // write them with this package.
 package payload
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/Luolc/fednet/internal/slack"
+)
 
 // Types of message.
 const (
 	// Post is a message an agent posts to a thread.
 	Post = "post"
+	// Progress sets or closes the progress card of a thread.
+	Progress = "progress"
 	// Inbound is a message a person posted in a Slack thread, sent down to
 	// the thread's owner.
 	Inbound = "message"
@@ -143,4 +149,13 @@ type Message struct {
 	Approval json.RawMessage `json:"approval,omitempty"`
 	// Version is, on an Upgrade, the release to upgrade to.
 	Version string `json:"version,omitempty"`
+	// Footer is set on a post whose Text goes out as one line of small
+	// grey text.
+	Footer bool `json:"footer,omitempty"`
+	// Title and Items are, on a Progress, the whole card; Close is
+	// slack.Done or slack.Failed on one that closes the card, when Title
+	// and Items may be left out to keep them as they are.
+	Title string               `json:"title,omitempty"`
+	Items []slack.ProgressItem `json:"items,omitempty"`
+	Close string               `json:"close,omitempty"`
 }

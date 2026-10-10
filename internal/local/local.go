@@ -34,6 +34,9 @@ const (
 	// Post queues a message for a thread and replies with its msg_id
 	// without waiting for the hub.
 	Post = "post"
+	// Progress queues the thread's progress card, to set or to close, as
+	// a Post is queued, and replies with its msg_id.
+	Progress = "progress"
 	// Handoff starts a new process of the daemon that takes over this
 	// socket, and replies once it is ready, with the version and pid of the
 	// process that answered, or with why the new process did not start.
@@ -66,6 +69,13 @@ type Request struct {
 	// each Size bytes. A post with files is not queued: the daemon hands
 	// it to the hub and replies once the hub has posted it in Slack.
 	Files []link.FileHeader `json:"files,omitempty"`
+	// Footer makes a Post one line of small grey text.
+	Footer bool `json:"footer,omitempty"`
+	// Title, Items and Close are the arguments of Progress, as
+	// payload.Message has them.
+	Title string               `json:"title,omitempty"`
+	Items []slack.ProgressItem `json:"items,omitempty"`
+	Close string               `json:"close,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -325,6 +335,11 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 			return badRequest("post is not served on this socket")
 		}
 		return s.post(ctx, req)
+	case Progress:
+		if s.Post == nil {
+			return badRequest("progress is not served on this socket")
+		}
+		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
 		hubapi.Users, hubapi.DM, hubapi.RequestApproval:
 		if s.Request == nil {
@@ -357,17 +372,38 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 	if req.Thread == "" || req.Text == "" {
 		return badRequest("post needs a thread and a text")
 	}
-	p, err := json.Marshal(payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text})
+	if req.Footer && !slack.FooterFits(req.Text) {
+		return badRequest(fmt.Sprintf("post: a footer takes at most %d characters, links written out", slack.MaxFooterChars))
+	}
+	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text, Footer: req.Footer})
+}
+
+func (s *Server) progress(ctx context.Context, req Request) Response {
+	if req.Thread == "" {
+		return badRequest("progress needs a thread")
+	}
+	if req.Close != "" && req.Close != slack.Done && req.Close != slack.Failed {
+		return badRequest(fmt.Sprintf("progress: close %q is not %s or %s", req.Close, slack.Done, slack.Failed))
+	}
+	if err := slack.CheckProgress(req.Title, req.Items, req.Close != ""); err != nil {
+		return badRequest("progress: " + err.Error())
+	}
+	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Progress, Thread: req.Thread, Title: req.Title, Items: req.Items, Close: req.Close})
+}
+
+// queue queues m for the hub and replies with its msg_id.
+func (s *Server) queue(ctx context.Context, cmd string, m payload.Message) Response {
+	p, err := json.Marshal(m)
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
 	id, err := s.Post(ctx, p)
 	if errors.Is(err, link.ErrPayloadTooBig) {
-		return badRequest("post: text too long")
+		return badRequest(cmd + ": too long")
 	}
 	if err != nil {
-		slog.Warn("local: post", "err", err)
-		return Response{Error: "post: " + err.Error()}
+		slog.Warn("local: "+cmd, "err", err)
+		return Response{Error: cmd + ": " + err.Error()}
 	}
 	return Response{MsgID: id}
 }

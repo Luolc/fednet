@@ -312,6 +312,28 @@ func TestHubWithSlack(t *testing.T) {
 		t.Fatalf("alerts = %q, want one dead letter for %s from workstation", a, event.MsgID)
 	}
 
+	// The agent shows its progress and posts a screenshot right after:
+	// the upload waits for the card, closes it, and lands below it.
+	if code := run(ctx, []string{"client", "progress", "-socket", socket, "-thread", thread, "-title", "taking a screenshot",
+		"-item", "build:done", "-item", "screenshot:doing"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client progress: exit %d", code)
+	}
+	shotFile := filepath.Join(dir, "after.png")
+	if err := os.WriteFile(shotFile, []byte("PNG"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "-file", shotFile, "the page now"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client post -file: exit %d", code)
+	}
+	ms, _ = f.Replies(ctx, "C1", ts)
+	if len(ms) != 4 || ms[2].Text != "进度：taking a screenshot" || ms[3].Text != "the page now" || len(ms[3].Files) != 1 {
+		t.Fatalf("Slack thread = %+v, want the card, then the upload", ms)
+	}
+	card, ok := f.Progress("C1", ms[2].TS)
+	if want := []slack.ProgressItem{{Text: "build", State: slack.Done}, {Text: "screenshot", State: slack.Done}}; !ok || !reflect.DeepEqual(card.Items, want) {
+		t.Fatalf("card = %+v, want it closed, every item done", card)
+	}
+
 	if code := stopClient(); code != 0 {
 		t.Errorf("client exited %d", code)
 	}

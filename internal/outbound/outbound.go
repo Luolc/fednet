@@ -10,6 +10,12 @@
 // go out (its payload is not a post, its thread is not in Slack) is
 // alerted, logged and marked delivered, so it does not hold up the rest.
 //
+// A post may also be a footer, one line of small grey text, or a
+// progress card: one card open at a time in each thread, which each
+// progress replaces whole, kept in the store so that it outlives the
+// process. Whatever goes into a thread, uploads included, first closes
+// its open card, as a progress with Close slack.Done does.
+//
 // The inbox also holds the alerts clients raise, which only the hub can
 // send, since only the hub has the webhook: each goes to the webhook as
 // from the client that raised it, and one that fails stays in the inbox
@@ -22,6 +28,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +46,13 @@ const (
 	// DefaultMaxChars is about the longest message Slack recommends.
 	DefaultMaxChars = 4000
 	DefaultInterval = 5 * time.Second
+	// DefaultUploadWait is well within the time a client gives an upload.
+	DefaultUploadWait = 30 * time.Second
 )
+
+// uploadPoll is how often BeforeUpload looks at the inbox; tests shorten
+// it.
+var uploadPoll = 100 * time.Millisecond
 
 // Poster posts the hub's inbox to Slack. Run serves until its context is
 // done; Nudge tells it a post has arrived.
@@ -54,6 +68,13 @@ type Poster struct {
 	// Interval is how often Run looks at the inbox when not nudged, and
 	// how long it waits after a failure. Zero means DefaultInterval.
 	Interval time.Duration
+	// UploadWait bounds how long BeforeUpload waits for a client's
+	// earlier posts. Zero means DefaultUploadWait.
+	UploadWait time.Duration
+
+	// cards is held over each change to a progress card, which Run and
+	// BeforeUpload make.
+	cards sync.Mutex
 
 	nudge     chan struct{}
 	nudgeOnce sync.Once
@@ -226,19 +247,36 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 	if err := json.Unmarshal(u.Payload, &m); err != nil {
 		return fmt.Errorf("%w: payload is not JSON: %v", errPermanent, err)
 	}
-	if m.Type != payload.Post {
-		return fmt.Errorf("%w: payload type %q is not %q", errPermanent, m.Type, payload.Post)
+	if m.Type != payload.Post && m.Type != payload.Progress {
+		return fmt.Errorf("%w: payload type %q is not %q or %q", errPermanent, m.Type, payload.Post, payload.Progress)
 	}
 	channel, ts, ok := slack.ParseThreadKey(m.Thread)
 	if !ok {
 		return fmt.Errorf("%w: %q is not a thread key", errPermanent, m.Thread)
 	}
+	if m.Type == payload.Progress {
+		return p.progress(ctx, channel, ts, m)
+	}
 	if strings.TrimSpace(m.Text) == "" {
 		return fmt.Errorf("%w: empty text", errPermanent)
 	}
 	parts := Split(m.Text, p.maxChars())
+	if m.Footer {
+		if !slack.FooterFits(m.Text) {
+			return fmt.Errorf("%w: footer over %d characters", errPermanent, slack.MaxFooterChars)
+		}
+		parts = []string{m.Text}
+	}
+	if err := p.close(ctx, m.Thread, slack.Done, "", nil); err != nil {
+		return err
+	}
 	for i := u.PartsSent; i < len(parts); i++ {
-		_, err := p.Slack.PostReply(ctx, channel, ts, u.Client, parts[i])
+		var err error
+		if m.Footer {
+			_, err = p.Slack.PostFooter(ctx, channel, ts, parts[i])
+		} else {
+			_, err = p.Slack.PostReply(ctx, channel, ts, u.Client, parts[i])
+		}
 		if errors.Is(err, slack.ErrNotFound) {
 			return fmt.Errorf("%w: %v", errPermanent, err)
 		}
@@ -275,4 +313,116 @@ func Split(text string, max int) []string {
 		text = text[cut:]
 	}
 	return append(parts, text)
+}
+
+// progress sets the thread's progress card to m's, or closes it. A card
+// to set replaces the open one, or is posted as a new one when none is
+// open or the open one is gone from Slack.
+func (p *Poster) progress(ctx context.Context, channel, ts string, m payload.Message) error {
+	if m.Close != "" && m.Close != slack.Done && m.Close != slack.Failed {
+		return fmt.Errorf("%w: close %q is not %q or %q", errPermanent, m.Close, slack.Done, slack.Failed)
+	}
+	if err := slack.CheckProgress(m.Title, m.Items, m.Close != ""); err != nil {
+		return fmt.Errorf("%w: %v", errPermanent, err)
+	}
+	if m.Close != "" {
+		return p.close(ctx, m.Thread, m.Close, m.Title, m.Items)
+	}
+	card := slack.Progress{Title: m.Title, Items: m.Items}
+	b, err := json.Marshal(card)
+	if err != nil {
+		return err
+	}
+	p.cards.Lock()
+	defer p.cards.Unlock()
+	open, _, err := p.Store.OpenProgress(ctx, m.Thread)
+	switch {
+	case err == nil:
+		err = p.Slack.UpdateProgress(ctx, channel, open, card)
+		if err == nil {
+			return p.record(ctx, func() error { return p.Store.SetProgress(ctx, m.Thread, open, b) })
+		}
+		if !errors.Is(err, slack.ErrNotFound) {
+			return err
+		}
+	case !errors.Is(err, store.ErrNotFound):
+		return err
+	}
+	posted, err := p.Slack.PostProgress(ctx, channel, ts, card)
+	if errors.Is(err, slack.ErrNotFound) {
+		return fmt.Errorf("%w: %v", errPermanent, err)
+	}
+	if err != nil {
+		return err
+	}
+	return p.record(ctx, func() error { return p.Store.SetProgress(ctx, m.Thread, posted, b) })
+}
+
+// close closes the card open in thread, if any, with title and items in
+// place of its own when given: the items still Doing become state,
+// slack.Done or slack.Failed.
+func (p *Poster) close(ctx context.Context, thread, state, title string, items []slack.ProgressItem) error {
+	p.cards.Lock()
+	defer p.cards.Unlock()
+	ts, b, err := p.Store.OpenProgress(ctx, thread)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var card slack.Progress
+	if err := json.Unmarshal(b, &card); err != nil {
+		return err
+	}
+	if title != "" {
+		card.Title = title
+	}
+	if items != nil {
+		card.Items = items
+	}
+	card.Items = slices.Clone(card.Items)
+	for i := range card.Items {
+		if card.Items[i].State == slack.Doing {
+			card.Items[i].State = state
+		}
+	}
+	channel, _, _ := slack.ParseThreadKey(thread)
+	if err := p.Slack.UpdateProgress(ctx, channel, ts, card); err != nil && !errors.Is(err, slack.ErrNotFound) {
+		return err
+	}
+	return p.record(ctx, func() error { return p.Store.CloseProgress(ctx, thread) })
+}
+
+// BeforeUpload readies thread for an upload from client: it waits, at
+// most UploadWait, until what client posted before is in Slack, then
+// closes the thread's progress card.
+func (p *Poster) BeforeUpload(ctx context.Context, client, thread string) error {
+	wait := p.UploadWait
+	if wait == 0 {
+		wait = DefaultUploadWait
+	}
+	deadline := time.Now().Add(wait)
+	upTo := int64(math.MaxInt64)
+	for {
+		last, err := p.Store.Inbox.LastUndelivered(ctx, client, upTo)
+		if err != nil {
+			return err
+		}
+		if last == 0 {
+			break
+		}
+		upTo = last
+		if time.Now().After(deadline) {
+			return fmt.Errorf("what this machine posted before the upload is not in Slack after %v", wait)
+		}
+		t := time.NewTimer(uploadPoll)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+	}
+	return p.close(ctx, thread, slack.Done, "", nil)
 }
