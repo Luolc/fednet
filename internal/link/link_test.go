@@ -1,6 +1,7 @@
 package link
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -227,11 +228,10 @@ func TestDownlinkResumesAfterDisconnect(t *testing.T) {
 }
 
 func TestUplinkRetriesUntilStored(t *testing.T) {
-	// The hub refuses the first three posts, then stores the fourth but
-	// holds its reply until the client has given up on it and posted again,
-	// so the message reaches the store twice whatever the client's timeout.
+	// The hub refuses the first three posts, and stores the fourth only
+	// once the client has given up on it, so the client posts it again and
+	// the message reaches the store twice whatever the client's timeout.
 	var posts atomic.Int32
-	retried := make(chan struct{})
 	h, srv := testHub(t, func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != UplinkPath {
@@ -242,19 +242,28 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 			case n <= 3:
 				http.Error(w, "not now", http.StatusServiceUnavailable)
 			case n == 4:
+				// The server notices the client hang up only once the
+				// body has been read to the end.
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("held post: %v", err)
+					return
+				}
+				select {
+				case <-r.Context().Done():
+				case <-t.Context().Done():
+					return
+				}
+				// The store must not see the client's cancellation, or it
+				// fails instead of storing the message a first time.
+				held := r.WithContext(context.WithoutCancel(r.Context()))
+				held.Body = io.NopCloser(bytes.NewReader(body))
 				rec := httptest.NewRecorder()
-				next.ServeHTTP(rec, r)
+				next.ServeHTTP(rec, held)
 				if rec.Code != http.StatusNoContent {
 					t.Errorf("held post: hub replied %d, want %d", rec.Code, http.StatusNoContent)
 				}
-				select {
-				case <-retried:
-				case <-t.Context().Done():
-				}
 			default:
-				if n == 5 {
-					close(retried)
-				}
 				next.ServeHTTP(w, r)
 			}
 		})
