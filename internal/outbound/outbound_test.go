@@ -29,7 +29,7 @@ type flaky struct {
 	fail int
 }
 
-func (f *flaky) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
+func (f *flaky) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
 	f.mu.Lock()
 	if f.fail > 0 {
 		f.fail--
@@ -37,7 +37,7 @@ func (f *flaky) PostReply(ctx context.Context, channel, ts, machine, text string
 		return "", errors.New("slack is down")
 	}
 	f.mu.Unlock()
-	return f.API.PostReply(ctx, channel, ts, machine, text)
+	return f.API.PostReply(ctx, channel, ts, text)
 }
 
 type fixture struct {
@@ -124,9 +124,9 @@ func (f *fixture) undelivered() []string {
 	return ids
 }
 
-// A post goes to its thread under the name of the machine it came from,
-// and is then delivered.
-func TestPostNamesTheMachine(t *testing.T) {
+// A post goes to its thread as it is, without the name of the machine it
+// came from, and is then delivered.
+func TestPost(t *testing.T) {
 	f := newFixture(t)
 	f.put("workstation", f.thread, "the build is fixed")
 	f.put("datamachine", f.thread, "the data is in")
@@ -136,9 +136,6 @@ func TestPostNamesTheMachine(t *testing.T) {
 	ms := f.replies()
 	if got := texts(ms); !slices.Equal(got, []string{"the build is fixed", "the data is in"}) {
 		t.Fatalf("thread = %q, want both posts in order", got)
-	}
-	if a, b := f.fake.Machine(ms[0].TS), f.fake.Machine(ms[1].TS); a != "workstation" || b != "datamachine" {
-		t.Fatalf("machines = %q, %q; want workstation, datamachine", a, b)
 	}
 	if u := f.undelivered(); len(u) != 0 {
 		t.Fatalf("undelivered after the pass: %v", u)
@@ -230,12 +227,12 @@ type failSecond struct {
 	n int
 }
 
-func (s *failSecond) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
+func (s *failSecond) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
 	s.n++
 	if s.n > 1 {
 		return "", errors.New("slack is down")
 	}
-	return s.API.PostReply(ctx, channel, ts, machine, text)
+	return s.API.PostReply(ctx, channel, ts, text)
 }
 
 // A post that can never go out is alerted and delivered, and the posts
@@ -416,12 +413,12 @@ type stopDuring struct {
 	n     int
 }
 
-func (s *stopDuring) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
+func (s *stopDuring) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
 	s.n++
 	if s.n >= s.after {
 		s.p.Stop()
 	}
-	return s.API.PostReply(ctx, channel, ts, machine, text)
+	return s.API.PostReply(ctx, channel, ts, text)
 }
 
 // An alert a client raised goes to the webhook as from that client, once.

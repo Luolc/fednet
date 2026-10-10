@@ -475,8 +475,8 @@ func TestUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 	ms, err := f.Replies(ctx, "C1", ts)
-	if err != nil || len(ms) != 2 || ms[1].Text != "see these" || ms[1].Machine != "workstation" || len(ms[1].Files) != 2 || ms[1].Files[0].Name != "shot.png" || ms[1].Files[1].Size != 5 {
-		t.Fatalf("thread = %+v, %v; want the upload as a message from workstation with both files", ms, err)
+	if err != nil || len(ms) != 2 || ms[1].Text != "see these" || len(ms[1].Files) != 2 || ms[1].Files[0].Name != "shot.png" || ms[1].Files[1].Size != 5 {
+		t.Fatalf("thread = %+v, %v; want the upload as one message with both files", ms, err)
 	}
 	if body, err := f.Download(ctx, ms[1].Files[0]); err != nil {
 		t.Fatal(err)

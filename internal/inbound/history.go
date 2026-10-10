@@ -78,7 +78,7 @@ func (r *Receiver) history(ev Event, thread string, ms []slack.Message) *payload
 }
 
 // historyMessage converts m for a history. A message the bot posted is
-// an agent's: it has no user, and is named by its machine.
+// an agent's: it has no user, and is named fednet.
 func (r *Receiver) historyMessage(m slack.Message) payload.HistoryMessage {
 	h := payload.HistoryMessage{TS: m.TS, User: m.User, Name: r.Users[m.User], Files: files(m.Files)}
 	if h.Files == nil {
@@ -86,9 +86,6 @@ func (r *Receiver) historyMessage(m slack.Message) payload.HistoryMessage {
 	}
 	if m.User == r.Bot {
 		h.User, h.Name = "", "fednet"
-		if m.Machine != "" {
-			h.Name = "fednet (" + m.Machine + ")"
-		}
 	}
 	h.Text, h.Truncated = clip(m.Text, r.History.messageChars())
 	return h

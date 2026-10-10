@@ -121,7 +121,8 @@ func TestProgressError(t *testing.T) {
 }
 
 // A post, a footer among them, first closes the open card as -done does;
-// the next progress then posts a new card below the post.
+// the next progress then posts a new card below the post. A footer ends
+// with the machine it came from.
 func TestPostClosesTheCard(t *testing.T) {
 	f := newFixture(t)
 	f.send(progress("fixing", item("fix", slack.Doing)))
@@ -137,14 +138,14 @@ func TestPostClosesTheCard(t *testing.T) {
 	f.send(progress("checking", item("check", slack.Doing)))
 	f.send(payload.Message{Type: payload.Post, Footer: true, Text: "会话已结束 · [T-1](https://example.invalid/T-1)"})
 	ms = f.replies()
-	if got := texts(ms); !slices.Equal(got, []string{"进度：fixing", "fixed", "进度：checking", "会话已结束 · T-1"}) {
+	if got := texts(ms); !slices.Equal(got, []string{"进度：fixing", "fixed", "进度：checking", "会话已结束 · T-1 · workstation"}) {
 		t.Fatalf("thread = %q, want a new card after the post, then the footer", got)
 	}
 	if got := f.card(ms[2].TS); got.Items[0].State != slack.Done {
 		t.Fatalf("card = %+v, want it closed by the footer", got)
 	}
-	if m, ok := f.fake.FooterText(ms[3].TS); !ok || m != "会话已结束 · <https://example.invalid/T-1|T-1>" {
-		t.Fatalf("footer = %q, %v; want the link in mrkdwn", m, ok)
+	if m, ok := f.fake.FooterText(ms[3].TS); !ok || m != "会话已结束 · <https://example.invalid/T-1|T-1> · workstation" {
+		t.Fatalf("footer = %q, %v; want the link in mrkdwn and the machine at the end", m, ok)
 	}
 }
 

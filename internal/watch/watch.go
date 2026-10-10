@@ -194,7 +194,7 @@ func (w *Watch) tellThreads(ctx context.Context, client string, limit time.Durat
 			continue
 		}
 		text := fmt.Sprintf("%s is offline; messages for it have waited over %v and will reach it when it is back.", client, limit)
-		if _, err := w.Slack.PostReply(ctx, channel, ts, "fednet", text); err != nil && !errors.Is(err, slack.ErrNotFound) {
+		if _, err := w.Slack.PostReply(ctx, channel, ts, text); err != nil && !errors.Is(err, slack.ErrNotFound) {
 			errs = append(errs, fmt.Errorf("tell thread %s: %w", m.Thread, err))
 			continue
 		}

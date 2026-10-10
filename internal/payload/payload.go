@@ -90,7 +90,7 @@ type HistoryMessage struct {
 	// message an agent posted.
 	User string `json:"user"`
 	// Name is the person's name on the hub's user list, or, for a message
-	// an agent posted, "fednet (<machine>)".
+	// an agent posted, "fednet".
 	Name string `json:"name"`
 	Text string `json:"text"`
 	// Truncated is set when Text was cut to the hub's limit.

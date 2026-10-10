@@ -38,7 +38,7 @@ func serve(t *testing.T, c *link.Client) string {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- (&Server{Post: c.Post, Request: c.Request}).Serve(ctx, ln) }()
+	go func() { done <- (&Server{Machine: "workstation", Post: c.Post, Request: c.Request}).Serve(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
@@ -82,6 +82,11 @@ func TestPost(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("payload = %+v, want %+v", got, want)
 	}
+	// A footer that fits with the machine's name added is queued.
+	res, err = Do(ctx, path, Request{Cmd: Post, Thread: "C1/1700000000.000100", Text: strings.Repeat("x", slack.MaxFooterChars-len([]rune(" · workstation"))), Footer: true})
+	if err != nil || res.Error != "" || res.MsgID == "" {
+		t.Fatalf("Do(post -footer) = %+v, %v; want a msg_id", res, err)
+	}
 }
 
 func TestBadRequest(t *testing.T) {
@@ -95,6 +100,7 @@ func TestBadRequest(t *testing.T) {
 		{"post without a thread", Request{Cmd: Post, Text: "x"}},
 		{"post without a text", Request{Cmd: Post, Thread: "t"}},
 		{"post over the payload limit", Request{Cmd: Post, Thread: "t", Text: strings.Repeat("x", link.MaxPayload)}},
+		{"footer over the limit with the machine's name", Request{Cmd: Post, Thread: "t", Text: strings.Repeat("x", slack.MaxFooterChars-len([]rune(" · workstation"))+1), Footer: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

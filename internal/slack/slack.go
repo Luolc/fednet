@@ -43,9 +43,6 @@ type Message struct {
 	// starts, as History reports it; empty when it has none, and on a
 	// message Replies returns.
 	LatestReply string `json:"latest_reply,omitempty"`
-	// Machine is the machine named above the text of a message a machine
-	// posted through PostReply; empty for any other message.
-	Machine string `json:"machine,omitempty"`
 }
 
 // File is a file uploaded with a message.
@@ -108,10 +105,9 @@ type API interface {
 	ChannelInfo(ctx context.Context, channel string) (ChannelInfo, error)
 	// SetPurpose replaces channel's purpose.
 	SetPurpose(ctx context.Context, channel, purpose string) error
-	// PostReply posts text in the thread that starts at ts in channel,
-	// under a line that names machine, the machine the text comes from, and
+	// PostReply posts text in the thread that starts at ts in channel and
 	// returns the new message's ts.
-	PostReply(ctx context.Context, channel, ts, machine, text string) (string, error)
+	PostReply(ctx context.Context, channel, ts, text string) (string, error)
 	// Delete deletes the message at ts in channel.
 	Delete(ctx context.Context, channel, ts string) error
 	// DM sends text to user as a direct message, which belongs to no
@@ -136,9 +132,9 @@ type API interface {
 	// f.Size: the caller counts.
 	Download(ctx context.Context, f File) (io.ReadCloser, error)
 	// Upload posts files, with text, in the thread that starts at ts in
-	// channel, as one message from machine, as PostReply does; each
-	// file's content is read from its Body, Size bytes.
-	Upload(ctx context.Context, channel, ts, machine, text string, files []Upload) error
+	// channel, as one message; each file's content is read from its Body,
+	// Size bytes.
+	Upload(ctx context.Context, channel, ts, text string, files []Upload) error
 	// PostProgress posts p in the thread that starts at ts in channel and
 	// returns the new message's ts.
 	PostProgress(ctx context.Context, channel, ts string, p Progress) (string, error)
@@ -347,9 +343,6 @@ type Fake struct {
 	mu       sync.Mutex
 	channels map[string]*fakeChannel
 	dms      map[string][]string
-	// machines maps the ts of each message PostReply posted to the machine
-	// it named.
-	machines map[string]string
 	// cards maps channel and ts, as a thread key, to the card there.
 	cards map[string]Card
 	// progress maps channel and ts, as a thread key, to the progress
@@ -485,29 +478,17 @@ func (f *Fake) Start(channel, user, text string) (string, error) {
 	return f.Add(channel, Message{User: user, Text: text})
 }
 
-// PostReply posts as the bot, naming machine as Web does, and records
-// machine, which Machine returns.
-func (f *Fake) PostReply(_ context.Context, channel, ts, machine, text string) (string, error) {
+// PostReply posts as the bot.
+func (f *Fake) PostReply(_ context.Context, channel, ts, text string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c, ok := f.channels[channel]
 	if !ok || c.threads[ts] == nil {
 		return "", ErrNotFound
 	}
-	m := Message{TS: f.next(), User: FakeBot, Text: text, Machine: machine}
+	m := Message{TS: f.next(), User: FakeBot, Text: text}
 	c.threads[ts] = append(c.threads[ts], m)
-	if f.machines == nil {
-		f.machines = make(map[string]string)
-	}
-	f.machines[m.TS] = machine
 	return m.TS, nil
-}
-
-// Machine returns the machine PostReply named for the message at ts.
-func (f *Fake) Machine(ts string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.machines[ts]
 }
 
 // Delete deletes the message at ts in channel; deleting the first message
@@ -721,10 +702,10 @@ func (f *Fake) FileInfo(_ context.Context, id string) (File, error) {
 	return ff.File, nil
 }
 
-// Upload adds a message from the bot to the thread, naming machine as
-// PostReply does, with the files; each gets an id FileInfo and Download
-// then find, and its content read whole from Body.
-func (f *Fake) Upload(_ context.Context, channel, ts, machine, text string, files []Upload) error {
+// Upload adds a message from the bot to the thread, with the files; each
+// gets an id FileInfo and Download then find, and its content read whole
+// from Body.
+func (f *Fake) Upload(_ context.Context, channel, ts, text string, files []Upload) error {
 	var fs []File
 	var contents [][]byte
 	for _, u := range files {
@@ -753,12 +734,8 @@ func (f *Fake) Upload(_ context.Context, channel, ts, machine, text string, file
 		fs[i].Size = len(contents[i])
 		f.files[fs[i].ID] = fakeFile{fs[i], contents[i]}
 	}
-	m := Message{TS: f.next(), User: FakeBot, Text: text, Machine: machine, Files: fs, SubType: "file_share"}
+	m := Message{TS: f.next(), User: FakeBot, Text: text, Files: fs, SubType: "file_share"}
 	c.threads[ts] = append(c.threads[ts], m)
-	if f.machines == nil {
-		f.machines = make(map[string]string)
-	}
-	f.machines[m.TS] = machine
 	return nil
 }
 

@@ -89,7 +89,7 @@ func TestWeb(t *testing.T) {
 			if r.form.Get("cursor") == "" {
 				return 200, `{"ok":true,"messages":[{"ts":"1.1","user":"U1","text":"first"}],"has_more":true,"response_metadata":{"next_cursor":"page2"}}`
 			}
-			return 200, `{"ok":true,"messages":[{"ts":"1.2","user":"U2","text":"second"},{"ts":"1.3","user":"UBOT","bot_id":"B2","text":"fixed","blocks":[{"type":"context","elements":[{"type":"plain_text","text":"workstation"}]},{"type":"markdown","text":"fixed"}]},{"ts":"1.4","user":"U1","text":"a heading","blocks":[{"type":"header","text":{"type":"plain_text","text":"a heading"}},{"type":"section","text":{"type":"plain_text","text":"x"}}]}],"has_more":false}`
+			return 200, `{"ok":true,"messages":[{"ts":"1.2","user":"U2","text":"second"},{"ts":"1.3","user":"UBOT","bot_id":"B2","text":"fixed","blocks":[{"type":"markdown","text":"fixed"}]}],"has_more":false}`
 		case "auth.test":
 			return 200, `{"ok":true,"user":"fednet","user_id":"UBOT","bot_id":"B2"}`
 		case "chat.postMessage":
@@ -117,14 +117,11 @@ func TestWeb(t *testing.T) {
 	if self, err := w.Self(ctx); err != nil || self != "UBOT" {
 		t.Errorf("Self = %q, %v; want UBOT", self, err)
 	}
-	// A reply a machine posted carries the machine's name, read back from
-	// the context block PostReply puts before the text; a message whose
-	// first block is something else names no machine.
 	ms, err := w.Replies(ctx, "C1", "1.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Message{{TS: "1.1", User: "U1", Text: "first"}, {TS: "1.2", User: "U2", Text: "second"}, {TS: "1.3", User: "UBOT", Text: "fixed", BotID: "B2", Machine: "workstation"}, {TS: "1.4", User: "U1", Text: "a heading"}}
+	want := []Message{{TS: "1.1", User: "U1", Text: "first"}, {TS: "1.2", User: "U2", Text: "second"}, {TS: "1.3", User: "UBOT", Text: "fixed", BotID: "B2"}}
 	if !reflect.DeepEqual(ms, want) {
 		t.Errorf("Replies = %v, want %v", ms, want)
 	}
@@ -316,7 +313,7 @@ func TestWebPostReplyAndDelete(t *testing.T) {
 		}
 		return 200, `{"ok":false,"error":"unknown_method"}`
 	})
-	if got, err := w.PostReply(ctx, "C1", "1.1", "workstation", "the build is fixed"); err != nil || got != "1.5" {
+	if got, err := w.PostReply(ctx, "C1", "1.1", "the build is fixed"); err != nil || got != "1.5" {
 		t.Fatalf("PostReply = %q, %v; want 1.5", got, err)
 	}
 	if err := w.Delete(ctx, "C1", "1.5"); err != nil {
@@ -332,19 +329,14 @@ func TestWebPostReplyAndDelete(t *testing.T) {
 		t.Fatalf("PostReply sent %s %v", rs[0].method, post)
 	}
 	var blocks []struct {
-		Type     string `json:"type"`
-		Text     any    `json:"text"`
-		Elements []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"elements"`
+		Type string `json:"type"`
+		Text any    `json:"text"`
 	}
 	if err := json.Unmarshal([]byte(post.Get("blocks")), &blocks); err != nil {
 		t.Fatalf("blocks %q: %v", post.Get("blocks"), err)
 	}
-	if len(blocks) != 2 || blocks[0].Type != "context" || len(blocks[0].Elements) != 1 || blocks[0].Elements[0].Text != "workstation" ||
-		blocks[1].Type != "markdown" || blocks[1].Text != "the build is fixed" {
-		t.Fatalf("blocks = %s, want a context block naming the machine, then the text", post.Get("blocks"))
+	if len(blocks) != 1 || blocks[0].Type != "markdown" || blocks[0].Text != "the build is fixed" {
+		t.Fatalf("blocks = %s, want just the text in a markdown block", post.Get("blocks"))
 	}
 	if rs[1].method != "chat.delete" || rs[1].form.Get("channel") != "C1" || rs[1].form.Get("ts") != "1.5" {
 		t.Fatalf("Delete sent %s %v", rs[1].method, rs[1].form)
@@ -715,8 +707,7 @@ func TestWebFiles(t *testing.T) {
 
 // An upload: an upload URL for each file, the content posted there with
 // the token, then one completion that puts the files in the thread with
-// the machine and the text in blocks, or in the comment with
-// CommentUpload.
+// the text in a markdown block.
 func TestWebUpload(t *testing.T) {
 	ctx := context.Background()
 	var srv *httptest.Server
@@ -752,7 +743,7 @@ func TestWebUpload(t *testing.T) {
 	mux.Handle("/", srv.Config.Handler)
 	srv.Config.Handler = mux
 	files := []Upload{{Name: "shot.png", Size: 6, Body: strings.NewReader("PNG...")}, {Name: "build.log", Size: 5, Body: strings.NewReader("error")}}
-	if err := w.Upload(ctx, "C1", "1.1", "workstation", "see these", files); err != nil {
+	if err := w.Upload(ctx, "C1", "1.1", "see these", files); err != nil {
 		t.Fatal(err)
 	}
 	if uploaded["shot.png"] != "Bearer "+testToken+" PNG..." || uploaded["build.log"] != "Bearer "+testToken+" error" {
@@ -768,35 +759,24 @@ func TestWebUpload(t *testing.T) {
 	if complete.form.Get("channel_id") != "C1" || complete.form.Get("thread_ts") != "1.1" || complete.form.Get("files") != `[{"id":"F1","title":"shot.png"},{"id":"F2","title":"build.log"}]` {
 		t.Fatalf("completeUploadExternal got %v", complete.form)
 	}
-	if blocks := complete.form.Get("blocks"); !strings.Contains(blocks, `"type":"context"`) || !strings.Contains(blocks, `"text":"workstation"`) || !strings.Contains(blocks, `"text":"see these"`) || complete.form.Get("initial_comment") != "" {
-		t.Fatalf("completeUploadExternal blocks = %s, initial_comment = %q; want the machine and the text in blocks", blocks, complete.form.Get("initial_comment"))
+	if blocks := complete.form.Get("blocks"); blocks != `[{"type":"markdown","text":"see these"}]` || complete.form.Get("initial_comment") != "" {
+		t.Fatalf("completeUploadExternal blocks = %s, initial_comment = %q; want just the text in a markdown block", blocks, complete.form.Get("initial_comment"))
 	}
-	// With CommentUpload the machine goes in the comment and no blocks
-	// are sent; an upload without text has just the context block.
-	w.CommentUpload = true
-	if err := w.Upload(ctx, "C1", "1.1", "workstation", "see these", []Upload{{Name: "a.txt", Size: 1, Body: strings.NewReader("a")}}); err != nil {
+	// An upload without text has no blocks.
+	if err := w.Upload(ctx, "C1", "1.1", "", []Upload{{Name: "a.txt", Size: 1, Body: strings.NewReader("a")}}); err != nil {
 		t.Fatal(err)
 	}
 	reqs, _ = ts.got()
 	complete = reqs[len(reqs)-1]
-	if complete.form.Get("initial_comment") != "workstation: see these" || complete.form.Get("blocks") != "" {
-		t.Fatalf("with CommentUpload: initial_comment = %q, blocks = %q", complete.form.Get("initial_comment"), complete.form.Get("blocks"))
-	}
-	w.CommentUpload = false
-	if err := w.Upload(ctx, "C1", "1.1", "workstation", "", []Upload{{Name: "a.txt", Size: 1, Body: strings.NewReader("a")}}); err != nil {
-		t.Fatal(err)
-	}
-	reqs, _ = ts.got()
-	complete = reqs[len(reqs)-1]
-	if blocks := complete.form.Get("blocks"); strings.Contains(blocks, `"markdown"`) || !strings.Contains(blocks, `"text":"workstation"`) {
-		t.Fatalf("without text: blocks = %s, want just the machine", blocks)
+	if blocks := complete.form.Get("blocks"); blocks != "" {
+		t.Fatalf("without text: blocks = %s, want none", blocks)
 	}
 	// An upload the URL refuses before reading the body fails without
 	// leaving anything running behind: the content is sent by the request
 	// itself, there is no writer to wait for.
 	before := runtime.NumGoroutine()
 	refuse = true
-	err := w.Upload(ctx, "C1", "1.1", "workstation", "x", []Upload{{Name: "c.txt", Size: 1 << 20, Body: bytes.NewReader(make([]byte, 1<<20))}})
+	err := w.Upload(ctx, "C1", "1.1", "x", []Upload{{Name: "c.txt", Size: 1 << 20, Body: bytes.NewReader(make([]byte, 1<<20))}})
 	if err == nil || !strings.Contains(err.Error(), "replied 500") {
 		t.Fatalf("Upload refused by the URL = %v, want an error naming the status", err)
 	}
@@ -810,7 +790,7 @@ func TestWebUpload(t *testing.T) {
 	}
 	// An upload URL on another host does not get the token.
 	host = func() string { return "https://files.example.invalid" }
-	err = w.Upload(ctx, "C1", "1.1", "workstation", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
+	err = w.Upload(ctx, "C1", "1.1", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
 	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 3 {
 		t.Fatalf("Upload to another host = %v, %d uploads; want it refused before any upload, without quoting the token", err, len(uploaded))
 	}

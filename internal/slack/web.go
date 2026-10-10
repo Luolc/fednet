@@ -28,12 +28,6 @@ const maxWait = time.Minute
 // Web is the API backed by Slack's Web API. It calls Slack with the bot
 // token it was made with, and writes no logs.
 type Web struct {
-	// CommentUpload makes Upload name the machine in the message's
-	// initial comment, as "machine: text", instead of in a context block
-	// as PostReply does: for a Slack that does not take blocks with an
-	// upload.
-	CommentUpload bool
-
 	c *slackgo.Client
 	// token is the bot token, for the file downloads, which are plain
 	// GETs outside the Web API; base is the Web API's URL, whose host may
@@ -124,11 +118,9 @@ func (w *Web) Replies(ctx context.Context, channel, ts string) ([]Message, error
 }
 
 // message converts a message as Slack returns it. A thread's first message
-// carries its own ts as thread_ts, which here means "not a reply". A
-// message a machine posted (see PostReply) has the machine's name in a
-// context block before the text; that is read back as Machine.
+// carries its own ts as thread_ts, which here means "not a reply".
 func message(m slackgo.Message) Message {
-	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType, LatestReply: m.LatestReply, Machine: machine(m)}
+	out := Message{TS: m.Timestamp, User: m.User, Text: m.Text, BotID: m.BotID, SubType: m.SubType, LatestReply: m.LatestReply}
 	if m.ThreadTimestamp != m.Timestamp {
 		out.ThreadTS = m.ThreadTimestamp
 	}
@@ -191,12 +183,11 @@ func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
 // Upload gets an upload URL for each file (files.getUploadURLExternal),
 // posts the content there as the request's body, Size bytes with the
 // token, then completes the upload (files.completeUploadExternal) into
-// the thread as one message with the files: machine and text go in blocks
-// laid out as PostReply does, or, with CommentUpload, in the initial
-// comment. The content is posted once: the upload to the URL is not
-// retried. The upload URL gets the token only if it passes the same check
-// as a download URL.
-func (w *Web) Upload(ctx context.Context, channel, ts, machine, text string, files []Upload) error {
+// the thread as one message with the files, text in a markdown block as
+// PostReply puts it. The content is posted once: the upload to the URL is
+// not retried. The upload URL gets the token only if it passes the same
+// check as a download URL.
+func (w *Web) Upload(ctx context.Context, channel, ts, text string, files []Upload) error {
 	var ids []slackgo.FileSummary
 	for _, u := range files {
 		var res *slackgo.GetUploadURLExternalResponse
@@ -213,10 +204,8 @@ func (w *Web) Upload(ctx context.Context, channel, ts, machine, text string, fil
 		ids = append(ids, slackgo.FileSummary{ID: res.FileID, Title: u.Name})
 	}
 	p := slackgo.CompleteUploadExternalParameters{Files: ids, Channel: channel, ThreadTimestamp: ts}
-	if w.CommentUpload {
-		p.InitialComment = machine + ": " + text
-	} else {
-		p.Blocks = slackgo.Blocks{BlockSet: uploadBlocks(machine, text)}
+	if text != "" {
+		p.Blocks = slackgo.Blocks{BlockSet: []slackgo.Block{slackgo.NewMarkdownBlock("", text)}}
 	}
 	return w.call(ctx, "files.completeUploadExternal", func() error {
 		_, err := w.c.CompleteUploadExternalContext(ctx, p)
@@ -248,16 +237,6 @@ func (w *Web) upload(ctx context.Context, uploadURL string, u Upload) error {
 	return nil
 }
 
-// uploadBlocks lays an upload's message out as PostReply does: the
-// machine in a context block, then the text, when there is one.
-func uploadBlocks(machine, text string) []slackgo.Block {
-	bs := []slackgo.Block{slackgo.NewContextBlock("", slackgo.NewTextBlockObject(slackgo.PlainTextType, machine, false, false))}
-	if text != "" {
-		bs = append(bs, slackgo.NewMarkdownBlock("", text))
-	}
-	return bs
-}
-
 // mayReceiveToken checks that rawURL is one the token may be sent to.
 func (w *Web) mayReceiveToken(rawURL string) error {
 	u, err := url.Parse(rawURL)
@@ -279,23 +258,6 @@ func (w *Web) mayReceiveToken(rawURL string) error {
 // the request.
 func redact(token string, err error) error {
 	return errors.New(strings.ReplaceAll(err.Error(), token, "<token>"))
-}
-
-// machine returns the machine named in m's first block when that is a
-// context block holding one plain text, the layout PostReply posts with,
-// and "" otherwise.
-func machine(m slackgo.Message) string {
-	if len(m.Blocks.BlockSet) < 2 {
-		return ""
-	}
-	c, ok := m.Blocks.BlockSet[0].(*slackgo.ContextBlock)
-	if !ok || len(c.ContextElements.Elements) != 1 {
-		return ""
-	}
-	if t, ok := c.ContextElements.Elements[0].(*slackgo.TextBlockObject); ok && t.Type == slackgo.PlainTextType {
-		return t.Text
-	}
-	return ""
 }
 
 // Self asks auth.test which user the token belongs to.
@@ -370,15 +332,10 @@ func (w *Web) Post(ctx context.Context, channel, text string) (string, error) {
 	return ts, err
 }
 
-// PostReply puts machine in a context block, the small grey line Slack
-// shows above the text, and text in a markdown block. text is also the
-// message's plain text, which notifications and conversations.replies
-// show.
-func (w *Web) PostReply(ctx context.Context, channel, ts, machine, text string) (string, error) {
-	blocks := slackgo.MsgOptionBlocks(
-		slackgo.NewContextBlock("", slackgo.NewTextBlockObject(slackgo.PlainTextType, machine, false, false)),
-		slackgo.NewMarkdownBlock("", text),
-	)
+// PostReply puts text in a markdown block. text is also the message's
+// plain text, which notifications and conversations.replies show.
+func (w *Web) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
+	blocks := slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", text))
 	var posted string
 	err := w.call(ctx, "chat.postMessage", func() (err error) {
 		_, posted, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionTS(ts), slackgo.MsgOptionText(text, false), blocks)
