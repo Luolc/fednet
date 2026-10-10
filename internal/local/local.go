@@ -107,6 +107,9 @@ const (
 	NotFound = "not_found"
 	// Unreachable is a request for the hub when the hub cannot be reached.
 	Unreachable = "unreachable"
+	// Busy is a request the hub did not carry out for now; it may succeed
+	// when tried again later.
+	Busy = "busy"
 )
 
 // Timeout bounds one request on either side, except a Handoff, which is
@@ -459,6 +462,7 @@ var kinds = []struct {
 	{link.ErrDenied, Denied},
 	{link.ErrNotFound, NotFound},
 	{link.ErrUnreachable, Unreachable},
+	{link.ErrBusy, Busy},
 }
 
 // ask hands req to the hub and replies with the hub's answer.

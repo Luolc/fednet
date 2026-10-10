@@ -319,18 +319,27 @@ func (h *Hub) next(ctx context.Context) (latest, why string, err error) {
 // starts the upgrade to the latest release that `/fednet upgrade` would,
 // without a card, and answers once it has started; how it goes is said
 // through Alert, as for any upgrade. An op Ops does not list client for
-// is refused, and so is any other op. Every request is said through
-// Alert with what came of it, after Op returns.
+// is refused, and so is any other op. Every request is logged with what
+// came of it, and said through Alert after Op returns; a request there is
+// no room to say is refused as busy, not carried out.
 func (h *Hub) Op(ctx context.Context, client, op string) (string, error) {
-	text, outcome, err := h.op(ctx, client, op)
+	shown := op
 	if op != OpVersion && op != OpUpgrade {
 		// The op is the client's to write; only known ones are repeated.
-		op = "未知操作"
+		shown = "未知操作"
 	}
-	// The record goes out after the answer, so that a slow webhook does
-	// not hold the answer past the client's timeout.
-	record := "ops：" + client + " 请求 " + op + "，" + outcome
-	h.later("record of an ops request", record, func(ctx context.Context) { h.say(ctx, record) })
+	// Each request is logged at once. Its record in the alerts channel
+	// goes out after the answer, so that a slow webhook does not hold the
+	// answer past the client's timeout; when no place is left for the
+	// record, the request is not carried out.
+	if !h.reserve() {
+		slog.Warn("upgrade: ops："+client+" 请求 "+shown+"，没有执行：报警 channel 积压", "client", client)
+		return "", link.Refuse(link.ErrBusy, "hub 忙：之前的请求还有太多记录没发到报警 channel，这次什么都没做，稍后再试")
+	}
+	text, outcome, err := h.op(ctx, client, op)
+	record := "ops：" + client + " 请求 " + shown + "，" + outcome
+	slog.Info("upgrade: " + record)
+	h.spawn(func(ctx context.Context) { h.alert(ctx, record) })
 	return text, err
 }
 
@@ -384,17 +393,33 @@ func (h *Hub) Click(_ context.Context, c slack.Click) error {
 	return nil
 }
 
-// later runs f after the caller returns, under the context Run cancels
-// and waits for f under when it returns; when maxResponses are on their
-// way out already, f is dropped with a log line naming what and about.
+// later runs f after the caller returns, as spawn does; when maxResponses
+// are on their way out already, f is dropped with a log line naming what
+// and about.
 func (h *Hub) later(what, about string, f func(ctx context.Context)) {
-	ctx := h.responseContext()
-	select {
-	case h.inFlight <- struct{}{}:
-	default:
+	if !h.reserve() {
 		slog.Warn("upgrade: too many answers on their way out, dropping one", "what", what, "about", about)
 		return
 	}
+	h.spawn(f)
+}
+
+// reserve takes one of the maxResponses places for something on its way
+// out, for spawn, and reports whether one was free.
+func (h *Hub) reserve() bool {
+	h.responseContext()
+	select {
+	case h.inFlight <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// spawn runs f, in the place reserve took, under the context Run cancels
+// and waits for f under when it returns; the place is freed when f does.
+func (h *Hub) spawn(f func(ctx context.Context)) {
+	ctx := h.responseContext()
 	h.responses.Add(1)
 	go func() {
 		defer h.responses.Done()
@@ -640,11 +665,16 @@ func (h *Hub) await(ctx context.Context, todo []string, failed map[string]string
 // say posts text through Alert, and logs it.
 func (h *Hub) say(ctx context.Context, text string) {
 	slog.Info("upgrade: " + text)
+	h.alert(ctx, text)
+}
+
+// alert posts text through Alert; a post that fails is logged.
+func (h *Hub) alert(ctx context.Context, text string) {
 	if h.Alert == nil {
 		return
 	}
 	if err := h.Alert(ctx, text); err != nil {
-		slog.Warn("upgrade: posting the progress", "err", err)
+		slog.Warn("upgrade: posting to the alerts channel", "err", err)
 	}
 }
 

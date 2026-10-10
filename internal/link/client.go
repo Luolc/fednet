@@ -467,8 +467,8 @@ func refused(res *http.Response, msg string) error {
 }
 
 // Refuse returns the error with which Hub.Answer refuses a request: kind is
-// ErrBadRequest, ErrDenied or ErrNotFound, and the message goes back to the
-// client.
+// ErrBadRequest, ErrDenied, ErrNotFound or ErrBusy, and the message goes
+// back to the client.
 func Refuse(kind error, format string, args ...any) error {
 	return refusal{kind, fmt.Sprintf(format, args...)}
 }

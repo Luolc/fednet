@@ -206,7 +206,9 @@ commands:
         as soon as it has started: how it goes is posted to the alerts
         channel, not printed here, as the hub restarts on the way; when the
         hub is on the latest release already, upgrade says so and starts
-        nothing
+        nothing; exits 3 when the hub refuses, and 5 when the hub is busy:
+        too many records of earlier requests are still waiting for the
+        alerts channel, so it did nothing; try again later
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   approval verify -pubkey PATH -approval PATH -action PATH -machine CLIENT-ID -agent NAME -used PATH
@@ -288,6 +290,7 @@ const (
 	exitBadRequest  = 2 // the client daemon or the hub refused the request as malformed
 	exitDenied      = 3 // not allowed to use the socket, or not allowed by the hub
 	exitUnreachable = 4 // the client daemon or the hub cannot be reached
+	exitBusy        = 5 // the hub did not carry out the request for now: try again later
 )
 
 // exitCodes maps a failed request's local.Response.Kind to its exit code;
@@ -296,6 +299,7 @@ var exitCodes = map[string]int{
 	local.BadRequest:  exitBadRequest,
 	local.Denied:      exitDenied,
 	local.Unreachable: exitUnreachable,
+	local.Busy:        exitBusy,
 }
 
 // exitError is a failure that run reports with its own exit code.

@@ -1,9 +1,11 @@
 package upgrade
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -697,5 +699,84 @@ func TestOpsAnswerDoesNotWaitForTheRecord(t *testing.T) {
 		if got := b.told(c); len(got) != 1 {
 			t.Fatalf("%s was told %q, want one notice", c, got)
 		}
+	}
+}
+
+// lockedBuffer is a bytes.Buffer the log handler and the test share.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// With the webhook stuck, ops requests are answered and logged until the
+// records waiting for it fill every place; the next request is refused
+// as busy and not carried out, and is logged too. Once the webhook takes
+// them, every record of a request answered reaches it, and the hub
+// carries out requests again.
+func TestOpsBusyWhenRecordsBackUp(t *testing.T) {
+	logs := &lockedBuffer{}
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	b := newBench(t)
+	b.run(t)
+	release := make(chan struct{})
+	alert := b.h.Alert
+	b.h.Alert = func(ctx context.Context, text string) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return alert(ctx, text)
+	}
+	for i := range maxResponses {
+		client := []string{"workstation", "datamachine"}[i%2]
+		_, err := b.h.Op(t.Context(), client, OpVersion)
+		if (client == "workstation") != (err == nil) {
+			t.Fatalf("request %d, version from %s = %v", i, client, err)
+		}
+	}
+	if _, err := b.h.Op(t.Context(), "workstation", OpUpgrade); !errors.Is(err, link.ErrBusy) {
+		t.Fatalf("upgrade with every place taken = %v, want ErrBusy", err)
+	}
+	if n := len(b.told("workstation")) + len(b.told("datamachine")); n != 0 {
+		t.Fatalf("a busy hub sent %d upgrade notices", n)
+	}
+	log := logs.String()
+	if n := strings.Count(log, "ops：workstation 请求 version，已回答"); n != maxResponses/2 {
+		t.Errorf("%d answered requests from workstation logged, want %d", n, maxResponses/2)
+	}
+	if n := strings.Count(log, "ops：datamachine 请求 version，被拒"); n != maxResponses/2 {
+		t.Errorf("%d refused requests from datamachine logged, want %d", n, maxResponses/2)
+	}
+	if !strings.Contains(log, "ops：workstation 请求 upgrade，没有执行") {
+		t.Errorf("the busy refusal is not logged:\n%s", log)
+	}
+
+	close(release)
+	var said []string
+	for range maxResponses {
+		said = append(said, b.next(t))
+	}
+	for i, s := range said {
+		if !strings.HasPrefix(s, "ops：") || strings.Contains(s, "upgrade") {
+			t.Errorf("record %d is %q, want one of the version requests", i, s)
+		}
+	}
+	b.quiet(t)
+	if text, err := b.h.Op(t.Context(), "workstation", OpUpgrade); err != nil || !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
+		t.Fatalf("upgrade once the records are out = %q, %v", text, err)
 	}
 }

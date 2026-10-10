@@ -644,6 +644,8 @@ func TestRequest(t *testing.T) {
 			return nil, Refuse(ErrDenied, "not for %s", client)
 		case "missing":
 			return nil, Refuse(ErrNotFound, "nothing here")
+		case "busy":
+			return nil, Refuse(ErrBusy, "try again later")
 		case "broken":
 			return nil, errors.New("disk on fire")
 		}
@@ -663,6 +665,7 @@ func TestRequest(t *testing.T) {
 		{"bad", ErrBadRequest, "no such thing as bad"},
 		{"denied", ErrDenied, "not for a"},
 		{"missing", ErrNotFound, "nothing here"},
+		{"busy", ErrBusy, "try again later"},
 		// The cause of a failure stays on the hub.
 		{"broken", nil, "the hub failed to answer"},
 	}
