@@ -1,8 +1,7 @@
 // Package outbound posts to Slack what the clients posted: the hub's inbox
 // holds each post until it is in Slack. Posts go out in the order they
-// reached the hub, each in its thread, under a line naming the machine it
-// came from. A post longer than MaxChars is split into consecutive
-// messages in the same thread.
+// reached the hub, each in its thread. A post longer than MaxChars is
+// split into consecutive messages in the same thread.
 //
 // A post Slack does not take is left in the inbox and tried again later,
 // after the Slack API's own waits on rate limits; nothing behind it goes
@@ -10,11 +9,12 @@
 // go out (its payload is not a post, its thread is not in Slack) is
 // alerted, logged and marked delivered, so it does not hold up the rest.
 //
-// A post may also be a footer, one line of small grey text, or a
-// progress card: one card open at a time in each thread, which each
-// progress replaces whole, kept in the store so that it outlives the
-// process. Whatever goes into a thread, uploads included, first closes
-// its open card, as a progress with Close slack.Done does.
+// A post may also be a footer, one line of small grey text that ends with
+// the name of the machine it came from, or a progress card: one card open
+// at a time in each thread, which each progress replaces whole, kept in
+// the store so that it outlives the process. Whatever goes into a
+// thread, uploads included, first closes its open card, as a progress
+// with Close slack.Done does.
 //
 // The inbox also holds the alerts clients raise, which only the hub can
 // send, since only the hub has the webhook: each goes to the webhook as
@@ -262,10 +262,11 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 	}
 	parts := Split(m.Text, p.maxChars())
 	if m.Footer {
-		if !slack.FooterFits(m.Text) {
+		footer := slack.MachineFooter(m.Text, u.Client)
+		if !slack.FooterFits(footer) {
 			return fmt.Errorf("%w: footer over %d characters", errPermanent, slack.MaxFooterChars)
 		}
-		parts = []string{m.Text}
+		parts = []string{footer}
 	}
 	if err := p.close(ctx, m.Thread, slack.Done, "", nil); err != nil {
 		return err
@@ -275,7 +276,7 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 		if m.Footer {
 			_, err = p.Slack.PostFooter(ctx, channel, ts, parts[i])
 		} else {
-			_, err = p.Slack.PostReply(ctx, channel, ts, u.Client, parts[i])
+			_, err = p.Slack.PostReply(ctx, channel, ts, parts[i])
 		}
 		if errors.Is(err, slack.ErrNotFound) {
 			return fmt.Errorf("%w: %v", errPermanent, err)

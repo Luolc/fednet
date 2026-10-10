@@ -133,6 +133,10 @@ func Footer(text string) (mrkdwn, plain string) {
 	return m.String(), p.String()
 }
 
+// MachineFooter is text as the hub posts it in a footer from machine,
+// the machine's name added at the end.
+func MachineFooter(text, machine string) string { return text + " · " + machine }
+
 // FooterFits reports whether text, as Footer writes it in mrkdwn, is
 // within MaxFooterChars.
 func FooterFits(text string) bool {

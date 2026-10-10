@@ -219,7 +219,7 @@ func TestHubRequests(t *testing.T) {
 	}
 
 	// post -file uploads the files to the thread through the hub, as a
-	// message from this machine with the text; the command reads the files
+	// message with the text; the command reads the files
 	// itself. The uploaded file can then be read back by anyone the bot
 	// serves, fetch-file included. An upload over the hub's limits is
 	// refused.
@@ -239,8 +239,8 @@ func TestHubRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := replies[len(replies)-1]
-	if last.Text != "see these" || last.Machine != "workstation" || len(last.Files) != 2 || last.Files[0].Name != "shot.png" || last.Files[1].Name != "build.log" {
-		t.Fatalf("thread ends with %+v, want the upload from workstation with both files", last)
+	if last.Text != "see these" || len(last.Files) != 2 || last.Files[0].Name != "shot.png" || last.Files[1].Name != "build.log" {
+		t.Fatalf("thread ends with %+v, want the upload with both files", last)
 	}
 	if uploaded, err := f.Download(ctx, last.Files[1]); err != nil {
 		t.Fatal(err)
@@ -410,9 +410,9 @@ func TestHubConfigFiles(t *testing.T) {
 		}
 		return p
 	}
-	cfg, err := readHubConfig(write("set.json", `{"files": {"prefetch_types": ["image/png"], "prefetch_max_bytes": 1000, "prefetch_max_total_bytes": 3000, "fetch_max_bytes": 5000, "upload_max_bytes": 7000, "upload_max_files": 3, "upload_comment": true}}`))
-	if err != nil || !reflect.DeepEqual(cfg.prefetch(), inbound.Prefetch{Types: []string{"image/png"}, MaxBytes: 1000, MaxTotal: 3000}) || cfg.Files.FetchMaxBytes != 5000 || cfg.Files.UploadMaxBytes != 7000 || cfg.Files.UploadMaxFiles != 3 || !cfg.Files.UploadComment {
-		t.Fatalf("readHubConfig = %+v, %v; want the seven values", cfg.Files, err)
+	cfg, err := readHubConfig(write("set.json", `{"files": {"prefetch_types": ["image/png"], "prefetch_max_bytes": 1000, "prefetch_max_total_bytes": 3000, "fetch_max_bytes": 5000, "upload_max_bytes": 7000, "upload_max_files": 3}}`))
+	if err != nil || !reflect.DeepEqual(cfg.prefetch(), inbound.Prefetch{Types: []string{"image/png"}, MaxBytes: 1000, MaxTotal: 3000}) || cfg.Files.FetchMaxBytes != 5000 || cfg.Files.UploadMaxBytes != 7000 || cfg.Files.UploadMaxFiles != 3 {
+		t.Fatalf("readHubConfig = %+v, %v; want the six values", cfg.Files, err)
 	}
 	// Left out, the types are nil (the default list), not an empty list
 	// (nothing fetched).
@@ -436,7 +436,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if cfg.history() != (inbound.Limits{MaxMessages: inbound.DefaultMaxMessages, MaxChars: inbound.DefaultMaxChars, MaxMessageChars: inbound.DefaultMaxMessageChars}) {
 		t.Fatalf("the example's history limits are %+v, want the defaults", cfg.History)
 	}
-	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles || cfg.Files.UploadComment {
+	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
 	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 {

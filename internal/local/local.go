@@ -250,6 +250,9 @@ func setup(tmp, path string, mode os.FileMode, gid int) error {
 // Server answers requests on the socket. A command whose field is nil is
 // refused as a bad request: the hub's admin socket serves no Post.
 type Server struct {
+	// Machine is the client's id, which the hub adds at the end of a
+	// footer.
+	Machine string
 	// Post queues a payload for the hub and returns its msg_id; it is
 	// link.Client.Post.
 	Post func(ctx context.Context, payload []byte) (string, error)
@@ -372,8 +375,8 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 	if req.Thread == "" || req.Text == "" {
 		return badRequest("post needs a thread and a text")
 	}
-	if req.Footer && !slack.FooterFits(req.Text) {
-		return badRequest(fmt.Sprintf("post: a footer takes at most %d characters, links written out", slack.MaxFooterChars))
+	if req.Footer && !slack.FooterFits(slack.MachineFooter(req.Text, s.Machine)) {
+		return badRequest(fmt.Sprintf("post: a footer takes at most %d characters, links written out and the machine's name added", slack.MaxFooterChars))
 	}
 	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text, Footer: req.Footer})
 }

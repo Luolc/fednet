@@ -51,7 +51,7 @@ func fakeSlack(t *testing.T, dir string, api slack.API, fail error) ([]string, <
 	}
 	runs := make(chan slackRun, 1)
 	var botToken string
-	newSlack = func(token string, _ bool) slack.API {
+	newSlack = func(token string) slack.API {
 		botToken = token
 		return api
 	}
@@ -64,11 +64,7 @@ func fakeSlack(t *testing.T, dir string, api slack.API, fail error) ([]string, <
 		return ctx.Err()
 	}
 	t.Cleanup(func() {
-		newSlack = func(token string, commentUpload bool) slack.API {
-			w := slack.New(token)
-			w.CommentUpload = commentUpload
-			return w
-		}
+		newSlack = func(token string) slack.API { return slack.New(token) }
 		runInbound = inbound.Run
 	})
 	return []string{"-slack-app-token-file", app, "-slack-bot-token-file", bot}, runs
@@ -103,8 +99,9 @@ func (h *webhook) got() []string {
 
 // The hub with Slack and the webhook configured, from credential files: a
 // message posted in Slack reaches the client that is already connected; an
-// agent's post reaches the thread under its machine's name; a message the
-// hook gives up on is alerted once, by the hub, as from the client. None
+// agent's post reaches the thread as it is, and its footer ends with the
+// machine's name; a message the hook gives up on is alerted once, by the
+// hub, as from the client. None
 // of it waits for the outbound side's polling, and no credential shows up
 // in any output.
 func TestHubWithSlack(t *testing.T) {
@@ -129,8 +126,10 @@ func TestHubWithSlack(t *testing.T) {
 	if err := os.WriteFile(webhookFile, []byte(hookSrv.URL+testHookPath+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The config still has upload_comment, as configs written before it
+	// went do; the hub ignores it.
 	config := filepath.Join(dir, "hub.json")
-	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"machine": "workstation"}}, "users": {"U1": "maintainer"}, "upgrade": {"admins": ["U1"], "auto": false}}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"machine": "workstation"}}, "users": {"U1": "maintainer"}, "upgrade": {"admins": ["U1"], "auto": false}, "files": {"upload_comment": true}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -294,8 +293,8 @@ func TestHubWithSlack(t *testing.T) {
 		return strings.Contains(stderr.String(), "outbound: alert from a client")
 	})
 
-	// An agent posts to the thread: it reaches Slack under the machine's
-	// name, and the alert goes out on the same pass.
+	// An agent posts to the thread: it reaches Slack, and the alert goes
+	// out on the same pass.
 	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "build is green"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("client post: exit %d", code)
 	}
@@ -304,8 +303,8 @@ func TestHubWithSlack(t *testing.T) {
 		return err == nil && len(ms) == 2
 	})
 	ms, _ := f.Replies(ctx, "C1", ts)
-	if ms[1].Text != "build is green" || f.Machine(ms[1].TS) != "workstation" {
-		t.Fatalf("Slack thread ends with %q from %q, want the post from workstation", ms[1].Text, f.Machine(ms[1].TS))
+	if ms[1].Text != "build is green" {
+		t.Fatalf("Slack thread ends with %q, want the post", ms[1].Text)
 	}
 	a := wh.got()
 	if len(a) != 1 || !strings.HasPrefix(a[0], "[workstation] dead letter: msg_id "+event.MsgID) || !strings.Contains(a[0], "no agent here") {
@@ -333,6 +332,17 @@ func TestHubWithSlack(t *testing.T) {
 	if want := []slack.ProgressItem{{Text: "build", State: slack.Done}, {Text: "screenshot", State: slack.Done}}; !ok || !reflect.DeepEqual(card.Items, want) {
 		t.Fatalf("card = %+v, want it closed, every item done", card)
 	}
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "-footer", "会话已结束"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client post -footer: exit %d", code)
+	}
+	waitFor(t, "the footer in Slack", func() bool {
+		ms, err := f.Replies(ctx, "C1", ts)
+		return err == nil && len(ms) == 5
+	})
+	ms, _ = f.Replies(ctx, "C1", ts)
+	if m, ok := f.FooterText(ms[4].TS); !ok || m != "会话已结束 · workstation" {
+		t.Fatalf("footer = %q, %v; want the machine's name at the end", m, ok)
+	}
 
 	if code := stopClient(); code != 0 {
 		t.Errorf("client exited %d", code)
@@ -345,6 +355,9 @@ func TestHubWithSlack(t *testing.T) {
 		if strings.Contains(out, s) {
 			t.Errorf("output contains the %s", name)
 		}
+	}
+	if !strings.Contains(out, "ignoring files.upload_comment") {
+		t.Error("the hub does not say it ignores upload_comment")
 	}
 	if strings.Contains(out, "Slack not configured") {
 		t.Error("the hub says Slack is not configured")

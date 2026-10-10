@@ -202,14 +202,14 @@ func TestHandleRoutes(t *testing.T) {
 // A mention in a thread that has no owner hands the thread over with the
 // messages before it, the thread's first message included, and the
 // purpose; later replies carry no history. A machine's own reply is
-// named by its machine and has no user.
+// named fednet and has no user.
 func TestHandleMentionInThread(t *testing.T) {
 	ctx := t.Context()
 	r, f := newReceiver(t)
 	root := post(t, f, "C1", slack.Message{User: "U1", Text: "CI is red again"})
 	handle(t, r, root)
 	post(t, f, "C1", slack.Message{User: "U2", Text: "which job?", ThreadTS: root.TS})
-	if _, err := f.PostReply(ctx, "C1", root.TS, "datamachine", "not me"); err != nil {
+	if _, err := f.PostReply(ctx, "C1", root.TS, "not me"); err != nil {
 		t.Fatal(err)
 	}
 	withFile := post(t, f, "C1", slack.Message{User: "U1", Text: "this one", ThreadTS: root.TS, SubType: "file_share", Files: []slack.File{{Name: "ci.png", Mimetype: "image/png", Size: 183204, URL: "https://example.invalid/ci.png"}}})
@@ -229,7 +229,7 @@ func TestHandleMentionInThread(t *testing.T) {
 			Messages: []payload.HistoryMessage{
 				{TS: root.TS, User: "U1", Name: "maintainer", Text: "CI is red again", Files: []payload.File{}},
 				{TS: "1700000000.100002", User: "U2", Name: "", Text: "which job?", Files: []payload.File{}},
-				{TS: "1700000000.100003", User: "", Name: "fednet (datamachine)", Text: "not me", Files: []payload.File{}},
+				{TS: "1700000000.100003", User: "", Name: "fednet", Text: "not me", Files: []payload.File{}},
 				{TS: withFile.TS, User: "U1", Name: "maintainer", Text: "this one", Files: []payload.File{{Name: "ci.png", Mimetype: "image/png", Size: 183204, URL: "https://example.invalid/ci.png"}}},
 			},
 			ReadMore: "fednet client read-thread -socket <socket> " + thread,

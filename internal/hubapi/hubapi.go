@@ -170,7 +170,7 @@ func (s *Server) Upload(ctx context.Context, client string, u link.Upload, body 
 			return err
 		}
 	}
-	err = s.Slack.Upload(ctx, channel, ts, client, u.Text, files)
+	err = s.Slack.Upload(ctx, channel, ts, u.Text, files)
 	if errors.Is(err, slack.ErrNotFound) {
 		return link.Refuse(link.ErrNotFound, "no thread %s", u.Thread)
 	}

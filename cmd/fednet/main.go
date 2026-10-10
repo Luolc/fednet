@@ -99,7 +99,7 @@ commands:
          "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
          "files": {"prefetch_types": ["image/*", "application/pdf"], "prefetch_max_bytes": 20971520,
                    "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200,
-                   "upload_max_bytes": 52428800, "upload_max_files": 10, "upload_comment": false},
+                   "upload_max_bytes": 52428800, "upload_max_files": 10},
          "upgrade": {"admins": ["U123"], "auto": true}}
         the admin socket takes hub handoff; D is how long a new process may
         take to become ready at a handoff; the upgrade request is the file
@@ -150,9 +150,10 @@ commands:
         goes out as several messages in order, each cut at the last line
         break that leaves it at least half full, else at that length; with
         -footer TEXT goes out instead as one line of small grey text, with
-        its links [text](url) kept and the rest as it is, at most 3000
-        characters with the links written out; any post first closes the
-        thread's progress card, as progress -done does
+        its links [text](url) kept and the rest as it is, and the hub adds
+        " · " and this machine's name at the end; at most 3000 characters
+        with the links written out and the name added; any post first
+        closes the thread's progress card, as progress -done does
   client progress -socket PATH -thread KEY -title TITLE [-item TEXT:STATE]... [-json]
   client progress -socket PATH -thread KEY (-done | -error) [-title TITLE] [-item TEXT:STATE]... [-json]
         show what the agent is doing in a progress card in the thread; the
@@ -380,9 +381,9 @@ type hubConfig struct {
 		// UploadMaxFiles how many files one post may upload.
 		UploadMaxBytes int64 `json:"upload_max_bytes"`
 		UploadMaxFiles int   `json:"upload_max_files"`
-		// UploadComment makes an upload name the machine in the
-		// message's comment rather than in a block.
-		UploadComment bool `json:"upload_comment"`
+		// UploadComment is not used; it is accepted, with a log line, so
+		// that a config that still has it loads.
+		UploadComment json.RawMessage `json:"upload_comment"`
 	} `json:"files"`
 	// Upgrade is about upgrades.
 	Upgrade struct {
@@ -435,6 +436,9 @@ func readHubConfig(path string) (hubConfig, error) {
 	}
 	if err := d.Decode(&struct{}{}); err != io.EOF {
 		return hubConfig{}, fmt.Errorf("%s: more than one JSON value", path)
+	}
+	if cfg.Files.UploadComment != nil {
+		slog.Info("hub: ignoring files.upload_comment, which is no longer used", "config", path)
 	}
 	for _, u := range cfg.Approvals.Approvers {
 		if _, ok := cfg.Users[u]; !ok {
@@ -491,11 +495,7 @@ func (c hubConfig) openThread() map[string][]string {
 // How the hub reaches Slack once it has the tokens; tests replace them
 // with fakes.
 var (
-	newSlack = func(botToken string, commentUpload bool) slack.API {
-		w := slack.New(botToken)
-		w.CommentUpload = commentUpload
-		return w
-	}
+	newSlack   = func(botToken string) slack.API { return slack.New(botToken) }
 	runInbound = inbound.Run
 )
 
@@ -592,7 +592,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	var sl slack.API
 	var bot string
 	if botToken != "" {
-		sl = newSlack(botToken, cfg.Files.UploadComment)
+		sl = newSlack(botToken)
 		// Which user the bot is decides which messages mention it; a
 		// hub that cannot find out serves no channel.
 		if bot, err = sl.Self(ctx); err != nil {
@@ -978,7 +978,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	defer cancel()
 	served := make(chan error, 1)
 	go func() {
-		served <- (&local.Server{Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get, Upload: c.Upload}).Serve(ctx, ln)
+		served <- (&local.Server{Machine: cred.ClientID, Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get, Upload: c.Upload}).Serve(ctx, ln)
 	}()
 	// Ready before the predecessor is told to go: a failure here means
 	// this process exits and the predecessor stays.
