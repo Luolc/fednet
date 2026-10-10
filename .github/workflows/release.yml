@@ -46,6 +46,8 @@ jobs:
 
   ci-green:
     runs-on: ubuntu-24.04
+    # The script waits for at most 30 minutes.
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: read # the CI runs of the tagged commit

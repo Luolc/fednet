@@ -82,6 +82,8 @@ jobs:
         run: .github/scripts/design-length.sh
 
       - name: Release guard tests
+        # The waiting arms of release-ci-green.test.sh poll without a pause.
+        timeout-minutes: 5
         run: |
           .github/scripts/release-version.test.sh
           .github/scripts/release-on-main.test.sh

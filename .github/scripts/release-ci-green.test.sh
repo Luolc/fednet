@@ -37,7 +37,7 @@ expect() { # <want exit> <name> <answer>...
     i=$((i + 1))
     printf '%s\n' "$a" >"$dir/$i"
   done
-  STUB_DIR=$dir PATH="$tmp/bin:$PATH" RELEASE_CI_INTERVAL=0 RELEASE_CI_TIMEOUT=${TIMEOUT:-60} \
+  STUB_DIR=$dir PATH="$tmp/bin:$PATH" RELEASE_CI_INTERVAL=0 RELEASE_CI_TIMEOUT=${TIMEOUT:-5} \
     "$here/release-ci-green.sh" abc123 owner/repo >/dev/null 2>&1
   got=$?
   [ "$got" -eq "$want" ] || { echo "FAIL: $name: exit $got, want $want"; status=1; }
@@ -47,7 +47,9 @@ expect 1 "red" "$(run 7 completed failure 1)"
 expect 1 "green rerun" "$(run 7 completed success 2)"
 expect 1 "no run" "$none"
 expect 0 "completes while waited for" "$(run 7 in_progress null 1)" "$(run 7 queued null 1)" "$(run 7 completed success 1)"
-expect 1 "disappears while waited for" "$(run 7 in_progress null 1)" "$none"
+# A green run after the gap: without the disappearance check, the script
+# would wait it out and exit 0.
+expect 1 "disappears while waited for" "$(run 7 in_progress null 1)" "$none" "$(run 7 completed success 1)"
 TIMEOUT=0 expect 1 "never completes" "$(run 7 in_progress null 1)"
 expect 4 "API error" FAIL
 expect 4 "API error while waited for" "$(run 7 in_progress null 1)" FAIL
