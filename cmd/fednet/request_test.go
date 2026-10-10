@@ -290,6 +290,15 @@ func TestHubRequests(t *testing.T) {
 	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", "while the hub is down"); code != 4 || len(f.DMs("U1")) != 1 {
 		t.Fatalf("dm with the hub down: exit %d, DMs to U1 %q; want 4 and only the first", code, f.DMs("U1"))
 	}
+	// A text the hub would refuse for its length is refused before it is
+	// sent: with the hub down, the exit is still 2, not 4.
+	long := strings.Repeat("字", hubapi.MaxTextChars+1)
+	if code, _ := fednet("client", "open-thread", "-socket", socket, "-channel", "C1", long); code != 2 || !strings.Contains(stderr.String(), "open-thread: TEXT is over 4000 characters") {
+		t.Fatalf("open-thread of a text over the limit: exit %d, want 2 and the limit", code)
+	}
+	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", long); code != 2 || !strings.Contains(stderr.String(), "dm: TEXT is over 4000 characters") {
+		t.Fatalf("dm of a text over the limit: exit %d, want 2 and the limit", code)
+	}
 	if got, err := f.Replies(ctx, "C1", ts); err != nil || !slices.ContainsFunc(got, func(m slack.Message) bool { return m.Text == "on it" }) {
 		t.Fatalf("Slack thread = %+v, %v", got, err)
 	}

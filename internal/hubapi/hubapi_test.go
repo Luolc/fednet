@@ -207,6 +207,7 @@ func TestOpenThread(t *testing.T) {
 		{"a channel the config does not list", "workstation", Request{Cmd: OpenThread, Channel: "C2", Text: "x"}, link.ErrDenied},
 		{"a channel Slack does not know", "workstation", Request{Cmd: OpenThread, Channel: "C9", Text: "x"}, link.ErrNotFound},
 		{"no text", "workstation", Request{Cmd: OpenThread, Channel: "C1"}, link.ErrBadRequest},
+		{"a text over MaxTextChars", "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: strings.Repeat("字", MaxTextChars+1)}, link.ErrBadRequest},
 	}
 	for _, tt := range tests {
 		if _, err := answer(t, s, tt.client, tt.req); !errors.Is(err, tt.want) {
@@ -352,12 +353,17 @@ func TestUsers(t *testing.T) {
 
 func TestDM(t *testing.T) {
 	s, f := testServer(t)
-	s.Users = map[string]string{"U1": "maintainer"}
+	s.Users = map[string]string{"U1": "maintainer", "U2": ""}
 	if _, err := answer(t, s, "workstation", Request{Cmd: DM, User: "U1", Text: "daily report"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.DMs("U1"); !slices.Equal(got, []string{"daily report"}) {
 		t.Fatalf("DMs to U1 = %q, want the report", got)
+	}
+	// The limit counts characters, not bytes.
+	full := strings.Repeat("字", MaxTextChars)
+	if _, err := answer(t, s, "workstation", Request{Cmd: DM, User: "U2", Text: full}); err != nil {
+		t.Fatalf("dm of MaxTextChars characters = %v, want it sent", err)
 	}
 
 	tests := []struct {
@@ -368,6 +374,7 @@ func TestDM(t *testing.T) {
 		{"a user not on the list", Request{Cmd: DM, User: "U9", Text: "x"}, link.ErrDenied},
 		{"no user", Request{Cmd: DM, Text: "x"}, link.ErrBadRequest},
 		{"no text", Request{Cmd: DM, User: "U1"}, link.ErrBadRequest},
+		{"a text over MaxTextChars", Request{Cmd: DM, User: "U1", Text: full + "字"}, link.ErrBadRequest},
 	}
 	for _, tt := range tests {
 		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, tt.want) {
@@ -376,6 +383,9 @@ func TestDM(t *testing.T) {
 	}
 	if got := f.DMs("U9"); len(got) != 0 {
 		t.Fatalf("DMs to the user not on the list = %q, want none", got)
+	}
+	if got := f.DMs("U1"); len(got) != 1 {
+		t.Fatalf("DMs to U1 = %q, want only the report", got)
 	}
 }
 

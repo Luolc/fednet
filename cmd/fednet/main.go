@@ -23,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/approval"
@@ -171,7 +172,10 @@ commands:
   client read-thread -socket PATH [-json] THREAD-KEY
         print the messages of a thread, read by the hub
   client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
-        start a thread in CHANNEL with TEXT and print its key; this machine owns it
+        start a thread in CHANNEL with TEXT and print its key; this machine
+        owns it; TEXT is standard Markdown, as with post, and goes out as one
+        message of at most 4000 characters: for more, start the thread with
+        the first part, then post the rest to it
   client threads -socket PATH [-json]
         print the keys of the threads this machine owns
   client adopt -socket PATH [-json] THREAD-KEY
@@ -183,7 +187,9 @@ commands:
   client users -socket PATH [-json]
         print the user list: each user's Slack id and name
   client dm -socket PATH -user USER-ID [-json] [--] TEXT
-        send TEXT as a direct message to a user on the user list
+        send TEXT as a direct message to a user on the user list; TEXT is
+        standard Markdown, as with post, at most 4000 characters, in one
+        message
   client fetch-file -socket PATH [-json] FILE-ID
         fetch the Slack file with FILE-ID (the id in a message's files)
         through the hub into the client's files directory, unless it is
@@ -1398,6 +1404,9 @@ func clientOpenThread(ctx context.Context, args []string, stdout io.Writer) erro
 	if *socket == "" || *channel == "" || fs.Arg(0) == "" {
 		return usageError("fednet client open-thread: -socket, -channel and a non-empty TEXT are required")
 	}
+	if err := checkLength("fednet client open-thread", fs.Arg(0)); err != nil {
+		return err
+	}
 	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.OpenThread, Channel: *channel, Text: fs.Arg(0)})
 	if err != nil {
 		return err
@@ -1526,11 +1535,23 @@ func clientDM(ctx context.Context, args []string, stdout io.Writer) error {
 	if *socket == "" || *user == "" || fs.Arg(0) == "" {
 		return usageError("fednet client dm: -socket, -user and a non-empty TEXT are required")
 	}
+	if err := checkLength("fednet client dm", fs.Arg(0)); err != nil {
+		return err
+	}
 	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.DM, User: *user, Text: fs.Arg(0)})
 	if err != nil || !*asJSON {
 		return err
 	}
 	return json.NewEncoder(stdout).Encode(res)
+}
+
+// checkLength refuses, before it goes to the hub, a text the hub would
+// refuse for its length.
+func checkLength(cmd, text string) error {
+	if utf8.RuneCountInString(text) > hubapi.MaxTextChars {
+		return exitError{exitBadRequest, fmt.Errorf("%s: TEXT is over %d characters", cmd, hubapi.MaxTextChars)}
+	}
+	return nil
 }
 
 // clientRequestApproval asks the hub for approval of an action and prints

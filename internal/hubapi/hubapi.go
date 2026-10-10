@@ -17,12 +17,18 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/link"
+	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
+
+// MaxTextChars is the longest Text, in characters, of an OpenThread or a
+// DM: each goes out as one message, as long as each message of a post.
+const MaxTextChars = outbound.DefaultMaxChars
 
 // Commands a Request can carry.
 const (
@@ -334,6 +340,9 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	if r.Channel == "" || r.Text == "" {
 		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
 	}
+	if err := checkLength(r.Text); err != nil {
+		return Reply{}, err
+	}
 	if !slices.Contains(s.OpenThread[r.Channel], client) {
 		return Reply{}, link.Refuse(link.ErrDenied, "client %s may not open threads in %s", client, r.Channel)
 	}
@@ -420,6 +429,9 @@ func (s *Server) dm(ctx context.Context, r Request) error {
 	if r.User == "" || r.Text == "" {
 		return link.Refuse(link.ErrBadRequest, "needs a user and a text")
 	}
+	if err := checkLength(r.Text); err != nil {
+		return err
+	}
 	if _, ok := s.Users[r.User]; !ok {
 		return link.Refuse(link.ErrDenied, "user %s is not on the user list", r.User)
 	}
@@ -427,6 +439,14 @@ func (s *Server) dm(ctx context.Context, r Request) error {
 		return errNoSlack
 	}
 	return s.Slack.DM(ctx, r.User, r.Text)
+}
+
+// checkLength refuses a text over MaxTextChars.
+func checkLength(text string) error {
+	if utf8.RuneCountInString(text) > MaxTextChars {
+		return link.Refuse(link.ErrBadRequest, "text over %d characters", MaxTextChars)
+	}
+	return nil
 }
 
 // requestApproval records the request and posts its card; the hub refuses
