@@ -105,8 +105,9 @@ type Hub struct {
 	// start carries the upgrades Click begins to Run.
 	start     chan rollout
 	startOnce sync.Once
-	// responses are the answers to clicks on their way out: Run cancels
-	// and waits for them when it returns; at most maxResponses at once.
+	// responses are the answers to clicks and the records of ops on
+	// their way out: Run cancels and waits for them when it returns; at
+	// most maxResponses at once.
 	responses     sync.WaitGroup
 	responseCtx   context.Context
 	stopResponses context.CancelFunc
@@ -114,11 +115,12 @@ type Hub struct {
 	inFlight      chan struct{}
 }
 
-// maxResponses is how many answers to clicks may be on their way out at
-// once; one more is dropped with a log line.
+// maxResponses is how many answers to clicks and records of ops may be
+// on their way out at once; one more is dropped with a log line.
 const maxResponses = 16
 
-// responseContext returns the context the answers to clicks run under,
+// responseContext returns the context the answers to clicks and the
+// records of ops run under,
 // made on first use.
 func (h *Hub) responseContext() context.Context {
 	h.responseOnce.Do(func() {
@@ -318,15 +320,17 @@ func (h *Hub) next(ctx context.Context) (latest, why string, err error) {
 // without a card, and answers once it has started; how it goes is said
 // through Alert, as for any upgrade. An op Ops does not list client for
 // is refused, and so is any other op. Every request is said through
-// Alert with what came of it.
+// Alert with what came of it, after Op returns.
 func (h *Hub) Op(ctx context.Context, client, op string) (string, error) {
 	text, outcome, err := h.op(ctx, client, op)
 	if op != OpVersion && op != OpUpgrade {
 		// The op is the client's to write; only known ones are repeated.
 		op = "未知操作"
 	}
-	// The record goes out even when the client has given up waiting.
-	h.say(context.WithoutCancel(ctx), "ops："+client+" 请求 "+op+"，"+outcome)
+	// The record goes out after the answer, so that a slow webhook does
+	// not hold the answer past the client's timeout.
+	record := "ops：" + client + " 请求 " + op + "，" + outcome
+	h.later("record of an ops request", record, func(ctx context.Context) { h.say(ctx, record) })
 	return text, err
 }
 
@@ -376,20 +380,27 @@ func (h *Hub) Click(_ context.Context, c slack.Click) error {
 	if h.Slack == nil || c.ResponseURL == "" {
 		return nil
 	}
+	h.later("answer to a click", "user "+c.User, func(ctx context.Context) { h.respond(ctx, c, text) })
+	return nil
+}
+
+// later runs f after the caller returns, under the context Run cancels
+// and waits for f under when it returns; when maxResponses are on their
+// way out already, f is dropped with a log line naming what and about.
+func (h *Hub) later(what, about string, f func(ctx context.Context)) {
 	ctx := h.responseContext()
 	select {
 	case h.inFlight <- struct{}{}:
 	default:
-		slog.Warn("upgrade: too many answers to clicks on their way out, dropping one", "user", c.User)
-		return nil
+		slog.Warn("upgrade: too many answers on their way out, dropping one", "what", what, "about", about)
+		return
 	}
 	h.responses.Add(1)
 	go func() {
 		defer h.responses.Done()
 		defer func() { <-h.inFlight }()
-		h.respond(ctx, c, text)
+		f(ctx)
 	}()
-	return nil
 }
 
 // click returns what to tell the clicker.

@@ -654,3 +654,48 @@ func TestOpsUpgradeNothingToDo(t *testing.T) {
 		t.Fatalf("the hub said %q", s)
 	}
 }
+
+// A slow alerts webhook does not hold the answer: upgrade answers that it
+// has started at once, starts once, and the record follows when the
+// webhook takes it.
+func TestOpsAnswerDoesNotWaitForTheRecord(t *testing.T) {
+	b := newBench(t)
+	b.run(t)
+	release := make(chan struct{})
+	alert := b.h.Alert
+	b.h.Alert = func(ctx context.Context, text string) error {
+		if strings.HasPrefix(text, "ops：") {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return alert(ctx, text)
+	}
+	answered := make(chan string, 1)
+	go func() {
+		text, _ := b.h.Op(t.Context(), "workstation", OpUpgrade)
+		answered <- text
+	}()
+	select {
+	case text := <-answered:
+		if !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
+			t.Fatalf("upgrade = %q", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upgrade waited for the webhook")
+	}
+	if s := b.next(t); !strings.HasPrefix(s, "开始升级到 v0.2.0 (workstation 经 ops 发起)") {
+		t.Fatalf("the hub said %q before the record", s)
+	}
+	close(release)
+	if s := b.next(t); s != "ops：workstation 请求 upgrade，开始从 v0.1.0 升到 v0.2.0" {
+		t.Fatalf("the hub said %q", s)
+	}
+	for _, c := range []string{"datamachine", "workstation"} {
+		if got := b.told(c); len(got) != 1 {
+			t.Fatalf("%s was told %q, want one notice", c, got)
+		}
+	}
+}
