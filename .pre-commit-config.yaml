@@ -2,8 +2,9 @@
 repos:
   # Runs first: a leaked secret must be stopped before other hooks rewrite
   # staged files. The upstream entry scans the staged diff only (it ends in
-  # --staged); CI scans the full history, see the gitleaks step in
-  # .github/workflows/ci.yml.
+  # --staged); CI scans the commits of each PR or push, see the gitleaks
+  # step in .github/workflows/ci.yml, and gitleaks.yml the whole history
+  # weekly.
   #
   # --redact is repeated here on purpose: the upstream entry already has it,
   # but inherited args are invisible in this file and could be dropped on a

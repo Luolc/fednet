@@ -3,9 +3,11 @@
 # file in `sha256sum` format. Deployment and self-upgrade download these
 # names, so they are a contract; see deploy/README.md.
 #
-# Order: the same checks as a PR (ci.yml), the tagged commit must be on main,
-# then each architecture is built on its own runner and its binary must
-# report the tag as its version. Only then is the release created.
+# Order: the tagged commit must be on main, and its CI run on main (ci.yml,
+# started by the push to main) must have passed at the first attempt; CI is
+# not run again here. Then each architecture is built on its own runner and
+# its binary must report the tag as its version. Only then is the release
+# created.
 #
 # workflow_dispatch is a dry run of everything but the release: it builds
 # the commit it runs on as the given version and publishes nothing.
@@ -32,9 +34,6 @@ env:
   VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 
 jobs:
-  check:
-    uses: ./.github/workflows/ci.yml
-
   on-main:
     runs-on: ubuntu-24.04
     steps:
@@ -45,8 +44,21 @@ jobs:
           fetch-depth: 0
       - run: .github/scripts/release-on-main.sh "$GITHUB_SHA" origin/main
 
+  ci-green:
+    runs-on: ubuntu-24.04
+    # The script waits for at most 30 minutes.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read # the CI runs of the tagged commit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/release-ci-green.sh "$GITHUB_SHA"
+
   build:
-    needs: [check, on-main]
+    needs: [on-main, ci-green]
     strategy:
       matrix:
         include:
@@ -83,7 +95,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [on-main, ci-green, build]
     # Only a pushed tag publishes; a workflow_dispatch run stops after build.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
