@@ -323,22 +323,24 @@ func (w *Web) Conversations(ctx context.Context) ([]Conversation, error) {
 	}
 }
 
+// Post puts text in a markdown block, as PostReply does.
 func (w *Web) Post(ctx context.Context, channel, text string) (string, error) {
-	var ts string
-	err := w.call(ctx, "chat.postMessage", func() (err error) {
-		_, ts, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionText(text, false))
-		return err
-	})
-	return ts, err
+	return w.postMarkdown(ctx, channel, text)
 }
 
 // PostReply puts text in a markdown block. text is also the message's
 // plain text, which notifications and conversations.replies show.
 func (w *Web) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
-	blocks := slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", text))
+	return w.postMarkdown(ctx, channel, text, slackgo.MsgOptionTS(ts))
+}
+
+// postMarkdown posts text in channel in a markdown block, with text as
+// the plain text too, and opts.
+func (w *Web) postMarkdown(ctx context.Context, channel, text string, opts ...slackgo.MsgOption) (string, error) {
+	opts = append(opts, slackgo.MsgOptionText(text, false), slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", text)))
 	var posted string
 	err := w.call(ctx, "chat.postMessage", func() (err error) {
-		_, posted, err = w.c.PostMessageContext(ctx, channel, slackgo.MsgOptionTS(ts), slackgo.MsgOptionText(text, false), blocks)
+		_, posted, err = w.c.PostMessageContext(ctx, channel, opts...)
 		return err
 	})
 	return posted, err
@@ -501,7 +503,7 @@ func date(t time.Time) string {
 }
 
 // DM opens the direct message conversation with user, or finds the one
-// already open, and posts text in it.
+// already open, and posts text in it as Post does.
 func (w *Web) DM(ctx context.Context, user, text string) error {
 	var c *slackgo.Channel
 	err := w.call(ctx, "conversations.open", func() (err error) {

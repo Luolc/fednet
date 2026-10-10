@@ -164,21 +164,21 @@ func TestWeb(t *testing.T) {
 	rs, _ := ts.got()
 	for _, r := range rs {
 		f := r.form
-		got = append(got, sent{r.method, strings.Join([]string{f.Get("channel"), f.Get("ts"), f.Get("cursor"), f.Get("text"), f.Get("purpose"), f.Get("users"), f.Get("oldest"), f.Get("types"), f.Get("thread_ts")}, "|")})
+		got = append(got, sent{r.method, strings.Join([]string{f.Get("channel"), f.Get("ts"), f.Get("cursor"), f.Get("text"), f.Get("purpose"), f.Get("users"), f.Get("oldest"), f.Get("types"), f.Get("thread_ts"), f.Get("blocks")}, "|")})
 	}
 	wantSent := []sent{
-		{"auth.test", "||||||||"},
-		{"conversations.replies", "C1|1.1|||||||"},
-		{"conversations.replies", "C1|1.1|page2||||||"},
-		{"chat.postMessage", "C1|||hello|||||"},
-		{"conversations.info", "C1||||||||"},
-		{"conversations.setPurpose", "C1||||new purpose||||"},
-		{"conversations.open", "|||||U1|||"},
-		{"chat.postMessage", "D1|||psst|||||"},
-		{"conversations.history", "C1||||||2.0||"},
-		{"conversations.history", "C1||page2||||2.0||"},
-		{"users.conversations", "|||||||public_channel,private_channel,im|"},
-		{"users.conversations", "||page2|||||public_channel,private_channel,im|"},
+		{"auth.test", "|||||||||"},
+		{"conversations.replies", "C1|1.1||||||||"},
+		{"conversations.replies", "C1|1.1|page2|||||||"},
+		{"chat.postMessage", "C1|||hello||||||[{\"type\":\"markdown\",\"text\":\"hello\"}]"},
+		{"conversations.info", "C1|||||||||"},
+		{"conversations.setPurpose", "C1||||new purpose|||||"},
+		{"conversations.open", "|||||U1||||"},
+		{"chat.postMessage", "D1|||psst||||||[{\"type\":\"markdown\",\"text\":\"psst\"}]"},
+		{"conversations.history", "C1||||||2.0|||"},
+		{"conversations.history", "C1||page2||||2.0|||"},
+		{"users.conversations", "|||||||public_channel,private_channel,im||"},
+		{"users.conversations", "||page2|||||public_channel,private_channel,im||"},
 	}
 	if !reflect.DeepEqual(got, wantSent) {
 		t.Errorf("requests = %v, want %v", got, wantSent)
