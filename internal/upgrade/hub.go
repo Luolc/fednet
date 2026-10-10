@@ -319,8 +319,9 @@ func (h *Hub) next(ctx context.Context) (latest, why string, err error) {
 // starts the upgrade to the latest release that `/fednet upgrade` would,
 // without a card, and answers once it has started; how it goes is said
 // through Alert, as for any upgrade. An op Ops does not list client for
-// is refused, and so is any other op. Every request is logged with what
-// came of it, and said through Alert after Op returns; a request there is
+// is refused, and so is any other op. Every request is logged when it
+// arrives and with what came of it, and said through Alert after Op
+// returns; a request there is
 // no room to say is refused as busy, not carried out.
 func (h *Hub) Op(ctx context.Context, client, op string) (string, error) {
 	shown := op
@@ -328,10 +329,12 @@ func (h *Hub) Op(ctx context.Context, client, op string) (string, error) {
 		// The op is the client's to write; only known ones are repeated.
 		shown = "未知操作"
 	}
-	// Each request is logged at once. Its record in the alerts channel
-	// goes out after the answer, so that a slow webhook does not hold the
-	// answer past the client's timeout; when no place is left for the
-	// record, the request is not carried out.
+	// Each request is logged before anything is done for it, and again
+	// with its outcome. Its record in the alerts channel goes out after
+	// the answer, so that a slow webhook does not hold the answer past
+	// the client's timeout; when no place is left for the record, the
+	// request is not carried out.
+	slog.Info("upgrade: ops：" + client + " 请求 " + shown + "，收到")
 	if !h.reserve() {
 		slog.Warn("upgrade: ops："+client+" 请求 "+shown+"，没有执行：报警 channel 积压", "client", client)
 		return "", link.Refuse(link.ErrBusy, "hub 忙：之前的请求还有太多记录没发到报警 channel，这次什么都没做，稍后再试")

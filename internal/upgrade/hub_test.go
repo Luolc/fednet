@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -778,5 +779,47 @@ func TestOpsBusyWhenRecordsBackUp(t *testing.T) {
 	b.quiet(t)
 	if text, err := b.h.Op(t.Context(), "workstation", OpUpgrade); err != nil || !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
 		t.Fatalf("upgrade once the records are out = %q, %v", text, err)
+	}
+}
+
+// logAtLatest is a transport that, on each request for the latest
+// release, notes what the log holds by then.
+type logAtLatest struct {
+	logs *lockedBuffer
+	mu   sync.Mutex
+	seen []string
+}
+
+func (l *logAtLatest) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/latest") {
+		l.mu.Lock()
+		l.seen = append(l.seen, l.logs.String())
+		l.mu.Unlock()
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// An ops request is logged before the hub does anything for it: by the
+// time upgrade asks for the latest release, which comes before the
+// rollout starts, the request is in the log.
+func TestOpsLoggedBeforeCarriedOut(t *testing.T) {
+	logs := &lockedBuffer{}
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	b := newBench(t)
+	b.run(t)
+	tr := &logAtLatest{logs: logs}
+	b.h.Releases.HTTP = &http.Client{Transport: tr}
+	if text, err := b.h.Op(t.Context(), "workstation", OpUpgrade); err != nil || !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
+		t.Fatalf("upgrade = %q, %v", text, err)
+	}
+	tr.mu.Lock()
+	seen := tr.seen
+	tr.mu.Unlock()
+	if len(seen) != 1 || !strings.Contains(seen[0], "ops：workstation 请求 upgrade，收到") || strings.Contains(seen[0], "开始从") {
+		t.Fatalf("when the latest release was asked for, the log held %q; want the request, and not yet its outcome", seen)
+	}
+	if !strings.Contains(logs.String(), "ops：workstation 请求 upgrade，开始从 v0.1.0 升到 v0.2.0") {
+		t.Fatalf("the outcome is not logged:\n%s", logs.String())
 	}
 }
