@@ -48,7 +48,7 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 
 两个 Slack 文件要么都给，要么都不给。都不给时 hub 只跑 client 用的 HTTP 服务，启动日志里有一句 `Slack not configured`，适合本地试跑。没给 Slack 时 webhook 文件不读，给了也不用；给了 Slack、没给 webhook 时，报警只进日志。
 
-`/fednet upgrade` 要在配置里的 `upgrade.admins` 写上谁能升级 (Slack 用户 id，每个都得在 `users` 名单上)；`upgrade.auto` 默认是 `true`。
+`/fednet upgrade` 要在配置里的 `upgrade.admins` 写上谁能升级 (Slack 用户 id，每个都得在 `users` 名单上)；`upgrade.auto` 默认是 `true`。`fednet client ops` 要在配置里的 `ops.upgrade`、`ops.version` 分别写上哪些 client 能用 (client id)，没写就谁都不能用。
 
 审批要同时有 Slack 和私钥，还要在配置里的 `approvals` 写上审批卡发到哪个 channel (`channel`) 和谁能批 (`approvers`，Slack 用户 id，每个都得在 `users` 名单上)。缺任何一样，agent 的 `request-approval` 直接被拒绝，不发卡、不签名；没给私钥时启动日志里有一句 `approvals are off`。
 
@@ -80,10 +80,11 @@ hub 和 client 都不改自己的二进制。要升级时它们只写一个升�
 - 每台 agent 机器：[`fednet-client-upgrade.path`](fednet-client-upgrade.path) 和 [`fednet-client-upgrade.service`](fednet-client-upgrade.service)，标了 `replace` 的几行改成本机的路径：请求文件 (client 的 `-upgrade-request`，要放在 client 用户能写的目录里)、二进制、client 的 socket (`-socket`)；`ReadWritePaths` 要盖住二进制和请求文件所在的目录。client 启动参数加上 `-upgrade-request <同一个文件>`；没有这个参数、或者请求文件写不了时，client 把失败经上行报给 hub，hub 报一次警 (同一个版本一次)，等它下次重连或者下一次定时检查时 hub 再补发。
 - 首次安装仍按「下载二进制」一节手工装；装好之后版本就由 fednet 自己管，部署工具不要再把二进制钉回某个版本，否则每次重新配置都会把升过的版本降回去。
 
-升级怎么触发，两条路都走上面这套单元：
+升级怎么触发，三条路都走上面这套单元：
 
 - Slack 里的 slash command `/fednet`。正式 app 的 manifest 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
 - hub 每小时查一次最新的 release，有新的就自己开始升级；配置里 `upgrade.auto` 设成 `false` 就只留手动。hub 跑的不是发布版 (`fednet version` 打出 `dev`) 时不查，也不能从 Slack 升级。
+- agent 机器上的 `fednet client ops -socket <client 的 socket> upgrade`，例如用户在 Slack 里让 workstation 上的 agent 把 fednet 升级一下。hub 配置里 `ops.upgrade` 列出的 client 才能用 (`ops.version` 管同一条命令的 `version`，读数和 `/fednet version` 一样)，没列的一律拒绝，认的是 client 连 hub 用的凭证，不是请求里写的名字。它和点「升级」走同一条路、只能升到最新的 release，hub 开始升级就返回，不等做完，进度看报警 channel；已是最新就只回一句。每次请求，不论成功、失败还是被拒，hub 都在报警 channel 发一条，写明哪台 client、什么操作、结果。这条命令只在人要求时用，agent 不自己决定升级。
 
 一次升级的顺序：hub 先给每台在线、版本不是目标版本的 client 发升级通知，client 程序自己写请求文件 (不经过 agent)；hub 等它们都重连并报上新版本 (默认最多等十分钟)，全部到齐才写自己的请求文件、换成新进程。有一台失败或超时，hub 不升，汇总里列出是哪台，处理好了再发一次 `/fednet upgrade`；hub 自己到时没换成新进程，汇总里带上升级器写的结局 (回退到了哪个版本)。离线的 client 不等，它每次连 hub 时 hub 发现版本比自己旧，就在握手的回应里再告诉它一次，hub 因版本过旧拒绝的 client 也一样能收到。开始、hub 开始升级、最后的汇总都作为普通消息发到报警 webhook 对应的 channel，没配 webhook 就只进日志。
 

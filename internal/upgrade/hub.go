@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/release"
 	"github.com/Luolc/fednet/internal/slack"
@@ -36,12 +38,21 @@ const (
 	respondTimeout = 10 * time.Second
 )
 
+// The operations a client may ask the hub for through `fednet client ops`.
+const (
+	// OpVersion answers as `/fednet version` does.
+	OpVersion = "version"
+	// OpUpgrade starts the upgrade `/fednet upgrade` would.
+	OpUpgrade = "upgrade"
+)
+
 // Hub decides the upgrades on the hub. Its Command and Click answer the
 // `/fednet` slash command and the clicks on the card `/fednet upgrade`
-// shows; Run looks for a new release every Interval, when Auto is set,
-// and carries out each upgrade: it tells every online client, waits for
-// them all to report the new release, and only then requests the hub's
-// own upgrade; a client that fails or is late keeps the hub where it is.
+// shows, and Op the same two from a client; Run looks for a new release
+// every Interval, when Auto is set, and carries out each upgrade: it
+// tells every online client, waits for them all to report the new
+// release, and only then requests the hub's own upgrade; a client that
+// fails or is late keeps the hub where it is.
 // Connected tells a client that connects with an older release than the
 // hub's to upgrade. Its exported fields are set before use and not
 // changed after.
@@ -73,6 +84,9 @@ type Hub struct {
 	// the Slack user ids of those who may upgrade, each on Users.
 	Users  map[string]string
 	Admins []string
+	// Ops maps each operation, OpVersion or OpUpgrade, to the clients
+	// that may ask for it; any other client is refused.
+	Ops map[string][]string
 	// Auto makes Run look for a new release every Interval and upgrade
 	// to it.
 	Auto bool
@@ -161,6 +175,11 @@ func (h *Hub) Command(ctx context.Context, c slack.Command) (slack.CommandReply,
 // version answers `/fednet version`: the hub's version, the latest
 // release, and each client's version and whether it is online.
 func (h *Hub) version(ctx context.Context) (slack.CommandReply, error) {
+	text, err := h.versionText(ctx)
+	return slack.CommandReply{Text: text}, err
+}
+
+func (h *Hub) versionText(ctx context.Context) (string, error) {
 	lines := []string{"hub：" + h.Version}
 	if latest, err := h.latest(ctx); err != nil {
 		lines = append(lines, "最新 release：查不到 ("+err.Error()+")")
@@ -175,12 +194,12 @@ func (h *Hub) version(ctx context.Context) (slack.CommandReply, error) {
 	}
 	clients, err := h.clients(ctx)
 	if err != nil {
-		return slack.CommandReply{}, err
+		return "", err
 	}
 	for _, c := range clients {
 		lines = append(lines, c.line())
 	}
-	return slack.CommandReply{Text: strings.Join(lines, "\n")}, nil
+	return strings.Join(lines, "\n"), nil
 }
 
 // latest fetches the latest release, within Fetch.
@@ -229,26 +248,15 @@ func (h *Hub) clients(ctx context.Context) ([]client, error) {
 // upgrade to the latest release, or why there is none to confirm.
 func (h *Hub) upgrade(ctx context.Context, c slack.Command) (slack.CommandReply, error) {
 	text := func(s string) (slack.CommandReply, error) { return slack.CommandReply{Text: s}, nil }
-	switch {
-	case !slices.Contains(h.Admins, c.User):
+	if !slices.Contains(h.Admins, c.User) {
 		return text("只有管理员能升级")
-	case !release.IsRelease(h.Version):
-		return text("hub 跑的是 " + h.Version + "，不是发布版，不能从这里升级")
-	case h.Request == "":
-		return text("hub 没有配升级请求的路径 (-upgrade-request)，升不了自己")
 	}
-	latest, err := h.latest(ctx)
+	latest, why, err := h.next(ctx)
 	if err != nil {
-		return text("查不到最新的 release：" + err.Error())
+		return text(err.Error())
 	}
-	if !release.Newer(latest, h.Version) {
-		return text("hub 已经是最新的 release：" + h.Version + " (最新 " + latest + ")")
-	}
-	h.mu.Lock()
-	target := h.target
-	h.mu.Unlock()
-	if target != "" {
-		return text("正在升级到 " + target)
+	if why != "" {
+		return text(why)
 	}
 	clients, err := h.clients(ctx)
 	if err != nil {
@@ -272,6 +280,89 @@ func (h *Hub) upgrade(ctx context.Context, c slack.Command) (slack.CommandReply,
 	h.cards[shown.ID] = card{user: c.User, from: h.Version, to: latest, at: now}
 	h.mu.Unlock()
 	return slack.CommandReply{Card: shown}, nil
+}
+
+// next returns the release a command may start an upgrade to: the
+// latest, when it is newer than the hub and no upgrade is in progress.
+// Otherwise it returns why there is none: when that is nothing to fix,
+// the hub on the latest release or on its way there, as why; when the hub
+// cannot upgrade from a command, or cannot find the latest release, as an
+// error, a refusal for the former. Either is said as it is to whoever
+// asked.
+func (h *Hub) next(ctx context.Context) (latest, why string, err error) {
+	switch {
+	case !release.IsRelease(h.Version):
+		return "", "", link.Refuse(link.ErrDenied, "hub 跑的是 %s，不是发布版，不能从这里升级", h.Version)
+	case h.Request == "":
+		return "", "", link.Refuse(link.ErrDenied, "hub 没有配升级请求的路径 (-upgrade-request)，升不了自己")
+	}
+	latest, err = h.latest(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("查不到最新的 release：%w", err)
+	}
+	if !release.Newer(latest, h.Version) {
+		return "", "hub 已经是最新的 release：" + h.Version + " (最新 " + latest + ")", nil
+	}
+	h.mu.Lock()
+	target := h.target
+	h.mu.Unlock()
+	if target != "" {
+		return "", "正在升级到 " + target, nil
+	}
+	return latest, "", nil
+}
+
+// Op carries out op for client, the id the link authenticated the
+// request with: OpVersion answers what `/fednet version` does, OpUpgrade
+// starts the upgrade to the latest release that `/fednet upgrade` would,
+// without a card, and answers once it has started; how it goes is said
+// through Alert, as for any upgrade. An op Ops does not list client for
+// is refused, and so is any other op. Every request is said through
+// Alert with what came of it.
+func (h *Hub) Op(ctx context.Context, client, op string) (string, error) {
+	text, outcome, err := h.op(ctx, client, op)
+	if op != OpVersion && op != OpUpgrade {
+		// The op is the client's to write; only known ones are repeated.
+		op = "未知操作"
+	}
+	// The record goes out even when the client has given up waiting.
+	h.say(context.WithoutCancel(ctx), "ops："+client+" 请求 "+op+"，"+outcome)
+	return text, err
+}
+
+// op returns what to answer client, and what came of op for the record.
+func (h *Hub) op(ctx context.Context, client, op string) (text, outcome string, err error) {
+	if op != OpVersion && op != OpUpgrade {
+		return "", "被拒：没有这个操作", link.Refuse(link.ErrBadRequest, "unknown op: want %s or %s", OpVersion, OpUpgrade)
+	}
+	if !slices.Contains(h.Ops[op], client) {
+		return "", "被拒：hub 配置的 ops." + op + " 里没有它",
+			link.Refuse(link.ErrDenied, "client %s may not ask for %s: the hub's config does not list it under ops.%s", client, op, op)
+	}
+	if op == OpVersion {
+		if text, err = h.versionText(ctx); err != nil {
+			return "", "失败：" + err.Error(), err
+		}
+		return text, "已回答", nil
+	}
+	latest, why, err := h.next(ctx)
+	switch {
+	case errors.Is(err, link.ErrDenied):
+		return "", "被拒：" + err.Error(), err
+	case err != nil:
+		return "", "失败：" + err.Error(), err
+	case why != "":
+		return why, why, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.target != "" {
+		return "正在升级到 " + h.target, "正在升级到 " + h.target, nil
+	}
+	h.target = latest
+	h.startCh() <- rollout{to: latest, by: client + " 经 ops"}
+	started := "开始从 " + h.Version + " 升到 " + latest
+	return started + "，过程和结果发到报警 channel", started, nil
 }
 
 // Click applies a press on an upgrade card's button: the confirm button,
