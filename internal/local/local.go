@@ -76,6 +76,8 @@ type Request struct {
 	Title string               `json:"title,omitempty"`
 	Items []slack.ProgressItem `json:"items,omitempty"`
 	Close string               `json:"close,omitempty"`
+	// Op is the argument of hubapi.Ops.
+	Op string `json:"op,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -105,6 +107,9 @@ const (
 	NotFound = "not_found"
 	// Unreachable is a request for the hub when the hub cannot be reached.
 	Unreachable = "unreachable"
+	// Busy is a request the hub did not carry out for now; it may succeed
+	// when tried again later.
+	Busy = "busy"
 )
 
 // Timeout bounds one request on either side, except a Handoff, which is
@@ -344,7 +349,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		}
 		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
-		hubapi.Users, hubapi.DM, hubapi.RequestApproval:
+		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.Ops:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
@@ -457,12 +462,13 @@ var kinds = []struct {
 	{link.ErrDenied, Denied},
 	{link.ErrNotFound, NotFound},
 	{link.ErrUnreachable, Unreachable},
+	{link.ErrBusy, Busy},
 }
 
 // ask hands req to the hub and replies with the hub's answer.
 func (s *Server) ask(ctx context.Context, req Request) Response {
 	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User,
-		Agent: req.Agent, Requester: req.Requester, Action: req.Action})
+		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}

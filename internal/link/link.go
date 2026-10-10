@@ -104,6 +104,9 @@ var (
 	ErrBadRequest = errors.New("link: bad request")
 	ErrDenied     = errors.New("link: denied")
 	ErrNotFound   = errors.New("link: not found")
+	// ErrBusy is a request the hub did not carry out for now: it may
+	// succeed when tried again later.
+	ErrBusy = errors.New("link: busy")
 )
 
 // ErrUnreachable is wrapped by Client.Request when it got no answer from the

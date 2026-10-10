@@ -1,15 +1,19 @@
 package upgrade
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
@@ -50,6 +54,7 @@ func newBench(t *testing.T) *bench {
 		Store: st, Version: "v0.1.0", Releases: b.f.releases(), Slack: b.sl,
 		Request: filepath.Join(t.TempDir(), "upgrade"),
 		Users:   map[string]string{"U1": "maintainer", "U2": "someone"}, Admins: []string{"U1"},
+		Ops:  map[string][]string{OpVersion: {"workstation"}, OpUpgrade: {"workstation"}},
 		Wait: 300 * time.Millisecond, Poll: 5 * time.Millisecond, Interval: 20 * time.Millisecond,
 		Online: func(c string) bool {
 			b.mu.Lock()
@@ -553,4 +558,268 @@ func TestAutoCheck(t *testing.T) {
 		t.Fatal("the releases were never fetched")
 	}
 	b.quiet(t)
+}
+
+// nextN returns the next n things the hub said, in any order: the record
+// of an ops request and the start of the upgrade it begins race.
+func (b *bench) nextN(t *testing.T, n int) string {
+	t.Helper()
+	var said []string
+	for range n {
+		said = append(said, b.next(t))
+	}
+	return strings.Join(said, "\n")
+}
+
+// A client listed for an op gets it; one that is not is refused; every
+// request is said through Alert, refused or not.
+func TestOps(t *testing.T) {
+	b := newBench(t)
+	b.run(t)
+	text, err := b.h.Op(t.Context(), "workstation", OpVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"hub：v0.1.0", "最新 release：v0.2.0", "datamachine：v0.1.0 在线", "workstation：v0.1.0 在线"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("version = %q, want %q in it", text, want)
+		}
+	}
+	if s := b.next(t); s != "ops：workstation 请求 version，已回答" {
+		t.Fatalf("the hub said %q", s)
+	}
+	for _, op := range []string{OpVersion, OpUpgrade} {
+		if _, err := b.h.Op(t.Context(), "datamachine", op); !errors.Is(err, link.ErrDenied) {
+			t.Fatalf("%s from datamachine = %v, want ErrDenied", op, err)
+		}
+		if s := b.next(t); s != "ops：datamachine 请求 "+op+"，被拒：hub 配置的 ops."+op+" 里没有它" {
+			t.Fatalf("the hub said %q", s)
+		}
+	}
+	if _, err := b.h.Op(t.Context(), "workstation", "<!channel> reboot"); !errors.Is(err, link.ErrBadRequest) {
+		t.Fatalf("an unknown op = %v, want ErrBadRequest", err)
+	}
+	if s := b.next(t); s != "ops：workstation 请求 未知操作，被拒：没有这个操作" {
+		t.Fatalf("the hub said %q", s)
+	}
+	b.quiet(t)
+	if n := len(b.told("workstation")) + len(b.told("datamachine")); n != 0 {
+		t.Fatalf("%d notices sent before any upgrade began", n)
+	}
+
+	// upgrade starts the same rollout a confirmed card does, and answers
+	// without waiting for it.
+	text, err = b.h.Op(t.Context(), "workstation", OpUpgrade)
+	if err != nil || text != "开始从 v0.1.0 升到 v0.2.0，过程和结果发到报警 channel" {
+		t.Fatalf("upgrade = %q, %v", text, err)
+	}
+	said := b.nextN(t, 2)
+	for _, want := range []string{"ops：workstation 请求 upgrade，开始从 v0.1.0 升到 v0.2.0", "开始升级到 v0.2.0 (workstation 经 ops 发起)：先升 client datamachine、workstation"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the hub said %q, want %q in it", said, want)
+		}
+	}
+	for _, c := range []string{"datamachine", "workstation"} {
+		if got := b.told(c); len(got) != 1 || got[0] != "v0.2.0" {
+			t.Fatalf("%s was told %q, want v0.2.0 once", c, got)
+		}
+	}
+	if text, err := b.h.Op(t.Context(), "workstation", OpUpgrade); err != nil || text != "正在升级到 v0.2.0" {
+		t.Fatalf("upgrade during an upgrade = %q, %v", text, err)
+	}
+	if s := b.next(t); s != "ops：workstation 请求 upgrade，正在升级到 v0.2.0" {
+		t.Fatalf("the hub said %q", s)
+	}
+}
+
+// On the latest release already, upgrade says so and starts nothing; a
+// hub that cannot upgrade itself refuses, and says so.
+func TestOpsUpgradeNothingToDo(t *testing.T) {
+	b := newBench(t)
+	b.run(t)
+	b.f.publish("v0.1.0", nil)
+	text, err := b.h.Op(t.Context(), "workstation", OpUpgrade)
+	if err != nil || text != "hub 已经是最新的 release：v0.1.0 (最新 v0.1.0)" {
+		t.Fatalf("upgrade on the latest release = %q, %v", text, err)
+	}
+	if s := b.next(t); s != "ops：workstation 请求 upgrade，hub 已经是最新的 release：v0.1.0 (最新 v0.1.0)" {
+		t.Fatalf("the hub said %q", s)
+	}
+	b.quiet(t)
+	if n := len(b.told("workstation")) + len(b.told("datamachine")); n != 0 {
+		t.Fatalf("%d notices sent with nothing to upgrade to", n)
+	}
+	b.h.Request = ""
+	if _, err := b.h.Op(t.Context(), "workstation", OpUpgrade); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "upgrade-request") {
+		t.Fatalf("upgrade on a hub without a request path = %v, want ErrDenied", err)
+	}
+	if s := b.next(t); !strings.HasPrefix(s, "ops：workstation 请求 upgrade，被拒：hub 没有配升级请求的路径") {
+		t.Fatalf("the hub said %q", s)
+	}
+}
+
+// A slow alerts webhook does not hold the answer: upgrade answers that it
+// has started at once, starts once, and the record follows when the
+// webhook takes it.
+func TestOpsAnswerDoesNotWaitForTheRecord(t *testing.T) {
+	b := newBench(t)
+	b.run(t)
+	release := make(chan struct{})
+	alert := b.h.Alert
+	b.h.Alert = func(ctx context.Context, text string) error {
+		if strings.HasPrefix(text, "ops：") {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return alert(ctx, text)
+	}
+	answered := make(chan string, 1)
+	go func() {
+		text, _ := b.h.Op(t.Context(), "workstation", OpUpgrade)
+		answered <- text
+	}()
+	select {
+	case text := <-answered:
+		if !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
+			t.Fatalf("upgrade = %q", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upgrade waited for the webhook")
+	}
+	if s := b.next(t); !strings.HasPrefix(s, "开始升级到 v0.2.0 (workstation 经 ops 发起)") {
+		t.Fatalf("the hub said %q before the record", s)
+	}
+	close(release)
+	if s := b.next(t); s != "ops：workstation 请求 upgrade，开始从 v0.1.0 升到 v0.2.0" {
+		t.Fatalf("the hub said %q", s)
+	}
+	for _, c := range []string{"datamachine", "workstation"} {
+		if got := b.told(c); len(got) != 1 {
+			t.Fatalf("%s was told %q, want one notice", c, got)
+		}
+	}
+}
+
+// lockedBuffer is a bytes.Buffer the log handler and the test share.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// With the webhook stuck, ops requests are answered and logged until the
+// records waiting for it fill every place; the next request is refused
+// as busy and not carried out, and is logged too. Once the webhook takes
+// them, every record of a request answered reaches it, and the hub
+// carries out requests again.
+func TestOpsBusyWhenRecordsBackUp(t *testing.T) {
+	logs := &lockedBuffer{}
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	b := newBench(t)
+	b.run(t)
+	release := make(chan struct{})
+	alert := b.h.Alert
+	b.h.Alert = func(ctx context.Context, text string) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return alert(ctx, text)
+	}
+	for i := range maxResponses {
+		client := []string{"workstation", "datamachine"}[i%2]
+		_, err := b.h.Op(t.Context(), client, OpVersion)
+		if (client == "workstation") != (err == nil) {
+			t.Fatalf("request %d, version from %s = %v", i, client, err)
+		}
+	}
+	if _, err := b.h.Op(t.Context(), "workstation", OpUpgrade); !errors.Is(err, link.ErrBusy) {
+		t.Fatalf("upgrade with every place taken = %v, want ErrBusy", err)
+	}
+	if n := len(b.told("workstation")) + len(b.told("datamachine")); n != 0 {
+		t.Fatalf("a busy hub sent %d upgrade notices", n)
+	}
+	log := logs.String()
+	if n := strings.Count(log, "ops：workstation 请求 version，已回答"); n != maxResponses/2 {
+		t.Errorf("%d answered requests from workstation logged, want %d", n, maxResponses/2)
+	}
+	if n := strings.Count(log, "ops：datamachine 请求 version，被拒"); n != maxResponses/2 {
+		t.Errorf("%d refused requests from datamachine logged, want %d", n, maxResponses/2)
+	}
+	if !strings.Contains(log, "ops：workstation 请求 upgrade，没有执行") {
+		t.Errorf("the busy refusal is not logged:\n%s", log)
+	}
+
+	close(release)
+	var said []string
+	for range maxResponses {
+		said = append(said, b.next(t))
+	}
+	for i, s := range said {
+		if !strings.HasPrefix(s, "ops：") || strings.Contains(s, "upgrade") {
+			t.Errorf("record %d is %q, want one of the version requests", i, s)
+		}
+	}
+	b.quiet(t)
+	if text, err := b.h.Op(t.Context(), "workstation", OpUpgrade); err != nil || !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
+		t.Fatalf("upgrade once the records are out = %q, %v", text, err)
+	}
+}
+
+// logAtLatest is a transport that, on each request for the latest
+// release, notes what the log holds by then.
+type logAtLatest struct {
+	logs *lockedBuffer
+	mu   sync.Mutex
+	seen []string
+}
+
+func (l *logAtLatest) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/latest") {
+		l.mu.Lock()
+		l.seen = append(l.seen, l.logs.String())
+		l.mu.Unlock()
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// An ops request is logged before the hub does anything for it: by the
+// time upgrade asks for the latest release, which comes before the
+// rollout starts, the request is in the log.
+func TestOpsLoggedBeforeCarriedOut(t *testing.T) {
+	logs := &lockedBuffer{}
+	defer slog.SetDefault(slog.Default())
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	b := newBench(t)
+	b.run(t)
+	tr := &logAtLatest{logs: logs}
+	b.h.Releases.HTTP = &http.Client{Transport: tr}
+	if text, err := b.h.Op(t.Context(), "workstation", OpUpgrade); err != nil || !strings.HasPrefix(text, "开始从 v0.1.0 升到 v0.2.0") {
+		t.Fatalf("upgrade = %q, %v", text, err)
+	}
+	tr.mu.Lock()
+	seen := tr.seen
+	tr.mu.Unlock()
+	if len(seen) != 1 || !strings.Contains(seen[0], "ops：workstation 请求 upgrade，收到") || strings.Contains(seen[0], "开始从") {
+		t.Fatalf("when the latest release was asked for, the log held %q; want the request, and not yet its outcome", seen)
+	}
+	if !strings.Contains(logs.String(), "ops：workstation 请求 upgrade，开始从 v0.1.0 升到 v0.2.0") {
+		t.Fatalf("the outcome is not logged:\n%s", logs.String())
+	}
 }

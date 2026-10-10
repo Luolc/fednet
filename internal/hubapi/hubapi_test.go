@@ -520,3 +520,27 @@ func TestUpload(t *testing.T) {
 		t.Fatalf("Upload without Slack = %v, want errNoSlack", err)
 	}
 }
+
+// Ops goes to the hub's Ops as the client the link authenticated: a name
+// the request itself gives is not looked at.
+func TestOps(t *testing.T) {
+	s, _ := testServer(t)
+	if _, err := answer(t, s, "workstation", Request{Cmd: Ops, Op: "version"}); !errors.Is(err, link.ErrDenied) {
+		t.Fatalf("ops on a hub without Ops = %v, want ErrDenied", err)
+	}
+	var asked []string
+	s.Ops = func(_ context.Context, client, op string) (string, error) {
+		asked = append(asked, client+" "+op)
+		return "hub：v0.1.0", nil
+	}
+	if r, err := answer(t, s, "workstation", Request{Cmd: Ops, Op: "version"}); err != nil || r.Text != "hub：v0.1.0" {
+		t.Fatalf("ops version = %+v, %v; want the answer as text", r, err)
+	}
+	req := []byte(`{"cmd": "ops", "op": "upgrade", "client": "workstation", "machine": "workstation"}`)
+	if _, err := s.Answer(t.Context(), "datamachine", req); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"workstation version", "datamachine upgrade"}; !slices.Equal(asked, want) {
+		t.Fatalf("Ops was asked %q, want %q", asked, want)
+	}
+}

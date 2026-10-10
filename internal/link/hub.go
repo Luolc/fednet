@@ -367,6 +367,7 @@ var refusals = []struct {
 	{ErrBadRequest, http.StatusBadRequest},
 	{ErrDenied, http.StatusForbidden},
 	{ErrNotFound, http.StatusNotFound},
+	{ErrBusy, http.StatusServiceUnavailable},
 }
 
 // serveRequest answers one request with 200 and the answer, or with the

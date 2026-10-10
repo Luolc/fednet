@@ -355,6 +355,20 @@ func TestReadHubConfig(t *testing.T) {
 	if cfg, err := readHubConfig(admin); err != nil || !cfg.auto() {
 		t.Fatalf("readHubConfig without an upgrade section = %+v, %v; want auto on", cfg.Upgrade, err)
 	}
+	// ops lists the clients for each op, and knows no other op.
+	ops := filepath.Join(dir, "ops.json")
+	if err := os.WriteFile(ops, []byte(`{"ops": {"upgrade": ["workstation"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := readHubConfig(ops); err != nil || !reflect.DeepEqual(cfg.ops(), map[string][]string{"upgrade": {"workstation"}, "version": nil}) {
+		t.Fatalf("readHubConfig(ops) = %+v, %v; want workstation for upgrade, no one for version", cfg.Ops, err)
+	}
+	if err := os.WriteFile(ops, []byte(`{"ops": {"reboot": ["workstation"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readHubConfig(ops); err == nil || !strings.Contains(err.Error(), "reboot") {
+		t.Fatalf("readHubConfig with an unknown op = %v, want an error naming it", err)
+	}
 }
 
 func TestHubConfigAlerts(t *testing.T) {
@@ -439,7 +453,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
-	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 {
+	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 {
 		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }

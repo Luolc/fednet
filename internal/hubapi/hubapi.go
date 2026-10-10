@@ -53,6 +53,9 @@ const (
 	// card. It returns the approval id; the outcome comes down the link
 	// later.
 	RequestApproval = "request-approval"
+	// Ops carries out Op, one of the fixed operations the hub's config
+	// allows the requesting client, and returns the answer as Text.
+	Ops = "ops"
 )
 
 // Request is one request. Cmd selects the command; the other fields are its
@@ -68,6 +71,8 @@ type Request struct {
 	Agent     string `json:"agent,omitempty"`
 	Requester string `json:"requester,omitempty"`
 	Action    []byte `json:"action,omitempty"`
+	// Op is the argument of Ops.
+	Op string `json:"op,omitempty"`
 }
 
 // User is one person on the user list.
@@ -115,6 +120,10 @@ type Server struct {
 	// BeforeUpload, if set, readies a thread for an upload from a client
 	// before the upload starts: it is outbound.Poster.BeforeUpload.
 	BeforeUpload func(ctx context.Context, client, thread string) error
+	// Ops carries out an op for client, which is the id the link
+	// authenticated, never one the request names: it is upgrade.Hub.Op.
+	// Nil means Ops is refused.
+	Ops func(ctx context.Context, client, op string) (string, error)
 }
 
 // Defaults for the zero limits of Server: the largest file served is 200
@@ -275,6 +284,12 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		err = s.dm(ctx, r)
 	case RequestApproval:
 		reply.ApprovalID, err = s.requestApproval(ctx, client, r)
+	case Ops:
+		if s.Ops == nil {
+			err = link.Refuse(link.ErrDenied, "the hub runs no ops")
+		} else {
+			reply.Text, err = s.Ops(ctx, client, r.Op)
+		}
 	default:
 		err = link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
 	}

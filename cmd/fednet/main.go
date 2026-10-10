@@ -91,7 +91,8 @@ commands:
         Slack that takes no blocks with an upload), and names the users,
         from that list, who may upgrade with /fednet upgrade and whether
         the hub upgrades on its own when it finds a new release (default
-        yes):
+        yes), and, for each operation of client ops, the clients that may
+        ask for it (none unless listed):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
@@ -100,7 +101,8 @@ commands:
          "files": {"prefetch_types": ["image/*", "application/pdf"], "prefetch_max_bytes": 20971520,
                    "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200,
                    "upload_max_bytes": 52428800, "upload_max_files": 10},
-         "upgrade": {"admins": ["U123"], "auto": true}}
+         "upgrade": {"admins": ["U123"], "auto": true},
+         "ops": {"upgrade": ["CLIENT-ID"], "version": ["CLIENT-ID"]}}
         the admin socket takes hub handoff; D is how long a new process may
         take to become ready at a handoff; the upgrade request is the file
         the hub writes to ask the machine's upgrader (fednet upgrade, run
@@ -193,6 +195,20 @@ commands:
         a message of type approval through the hook, signed when approved;
         an action the card cannot show whole is refused; -requester is a
         note on the card, not checked
+  client ops -socket PATH [-json] (upgrade | version)
+        ask the hub for one of two fixed operations, as this machine; run
+        it only when a person asks for it: an agent never decides on its
+        own to upgrade; the hub allows each operation only to the clients
+        its config lists under ops, and posts every request, refused or
+        not, with what came of it, to the alerts channel; version prints
+        what /fednet version shows; upgrade starts the upgrade /fednet
+        upgrade would, to the latest release, never another, and returns
+        as soon as it has started: how it goes is posted to the alerts
+        channel, not printed here, as the hub restarts on the way; when the
+        hub is on the latest release already, upgrade says so and starts
+        nothing; exits 3 when the hub refuses, and 5 when the hub is busy:
+        too many records of earlier requests are still waiting for the
+        alerts channel, so it did nothing; try again later
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   approval verify -pubkey PATH -approval PATH -action PATH -machine CLIENT-ID -agent NAME -used PATH
@@ -274,6 +290,7 @@ const (
 	exitBadRequest  = 2 // the client daemon or the hub refused the request as malformed
 	exitDenied      = 3 // not allowed to use the socket, or not allowed by the hub
 	exitUnreachable = 4 // the client daemon or the hub cannot be reached
+	exitBusy        = 5 // the hub did not carry out the request for now: try again later
 )
 
 // exitCodes maps a failed request's local.Response.Kind to its exit code;
@@ -282,6 +299,7 @@ var exitCodes = map[string]int{
 	local.BadRequest:  exitBadRequest,
 	local.Denied:      exitDenied,
 	local.Unreachable: exitUnreachable,
+	local.Busy:        exitBusy,
 }
 
 // exitError is a failure that run reports with its own exit code.
@@ -394,6 +412,17 @@ type hubConfig struct {
 		// every hour and upgrade to it.
 		Auto *bool `json:"auto"`
 	} `json:"upgrade"`
+	// Ops lists, for each operation of client ops, the clients that may
+	// ask for it.
+	Ops struct {
+		Upgrade []string `json:"upgrade"`
+		Version []string `json:"version"`
+	} `json:"ops"`
+}
+
+// ops is the ops part of the config, as the upgrade package takes it.
+func (c hubConfig) ops() map[string][]string {
+	return map[string][]string{upgrade.OpUpgrade: c.Ops.Upgrade, upgrade.OpVersion: c.Ops.Version}
 }
 
 // auto reports whether the hub upgrades on its own: yes unless the config
@@ -637,7 +666,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Request: *upgradeRequest, HandedOff: proc.Exit(),
-		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Auto: cfg.auto(),
+		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Ops: cfg.ops(), Auto: cfg.auto(),
 		Interval: upgradeTimings.interval, Wait: upgradeTimings.wait, Poll: upgradeTimings.poll, Fetch: upgradeTimings.fetch,
 		Send: func(ctx context.Context, client string, payload []byte) error {
 			_, err := hub.Send(ctx, client, payload)
@@ -648,6 +677,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		upgrades.Alert = webhook.Send
 	}
 	hub.UpgradeTo = upgrades.UpgradeTo
+	api.Ops = upgrades.Op
 	ln, err := proc.ListenTCP(*listen)
 	if err != nil {
 		return err
@@ -896,6 +926,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientRequestApproval(ctx, args[1:], stdout)
 		case "fetch-file":
 			return clientFetchFile(ctx, args[1:], stdout)
+		case "ops":
+			return clientOps(ctx, args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -1550,6 +1582,29 @@ func clientFetchFile(ctx context.Context, args []string, stdout io.Writer) error
 		return json.NewEncoder(stdout).Encode(res)
 	}
 	_, err = fmt.Fprintln(stdout, res.Path)
+	return err
+}
+
+// clientOps asks the hub for one of the fixed operations and prints its
+// answer.
+func clientOps(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client ops", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	op := fs.Arg(0)
+	if *socket == "" || (op != upgrade.OpUpgrade && op != upgrade.OpVersion) {
+		return usageError("fednet client ops: -socket and an operation, upgrade or version, are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Ops, Op: op})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.Text)
 	return err
 }
 
