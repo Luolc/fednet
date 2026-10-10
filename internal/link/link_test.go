@@ -232,6 +232,7 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 	// once the client has given up on it, so the client posts it again and
 	// the message reaches the store twice whatever the client's timeout.
 	var posts atomic.Int32
+	stored := make(chan struct{})
 	h, srv := testHub(t, func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != UplinkPath {
@@ -242,6 +243,7 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 			case n <= 3:
 				http.Error(w, "not now", http.StatusServiceUnavailable)
 			case n == 4:
+				defer close(stored)
 				// The server notices the client hang up only once the
 				// body has been read to the end.
 				body, err := io.ReadAll(r.Body)
@@ -281,6 +283,12 @@ func TestUplinkRetriesUntilStored(t *testing.T) {
 		}
 		return len(ms) == 0
 	})
+	// The fourth may be stored after a later post was: wait for it too.
+	select {
+	case <-stored:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the held post to be stored")
+	}
 	if got := inboxIDs(t, h.Store.Inbox.Inbox); !slices.Equal(got, []string{id}) {
 		t.Fatalf("hub inbox = %v, want [%s]", got, id)
 	}
