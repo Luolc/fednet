@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -19,7 +20,13 @@ const (
 	// KindRoute is a request to change a route, which the hub carries out
 	// itself; Action is the change.
 	KindRoute = "route"
+	// KindChannel is a request to create a channel with a route, which
+	// the hub carries out itself; Action is the channel and its route.
+	KindChannel = "channel"
 )
+
+// approvalKinds are the kinds of Approval, each in its own table.
+var approvalKinds = []string{KindAction, KindRoute, KindChannel}
 
 // Approval is one approval an agent requested, as the hub keeps it. Times
 // read back are in UTC.
@@ -52,7 +59,7 @@ type Approval struct {
 	DecidedAt time.Time
 	// CardFinal is set once the card in Slack shows the outcome.
 	CardFinal bool
-	// Kind is KindAction or KindRoute.
+	// Kind is KindAction, KindRoute or KindChannel.
 	Kind string
 }
 
@@ -60,8 +67,11 @@ const approvalColumns = "approval_id, client_id, agent, requester, summary, acti
 
 // approvalTable is the table that keeps approvals of kind.
 func approvalTable(kind string) string {
-	if kind == KindRoute {
+	switch kind {
+	case KindRoute:
 		return "route_request"
+	case KindChannel:
+		return "channel_request"
 	}
 	return "approval"
 }
@@ -74,7 +84,7 @@ func (h *Hub) PutApproval(ctx context.Context, a Approval) error {
 	return err
 }
 
-// Approval returns the approval with id, of either kind, or ErrNotFound.
+// Approval returns the approval with id, of any kind, or ErrNotFound.
 func (h *Hub) Approval(ctx context.Context, id string) (Approval, error) {
 	as, err := h.approvals(ctx, "WHERE approval_id = ?", id)
 	if err != nil {
@@ -86,21 +96,24 @@ func (h *Hub) Approval(ctx context.Context, id string) (Approval, error) {
 	return as[0], nil
 }
 
-// PendingApprovals returns the approvals of either kind still Pending,
+// PendingApprovals returns the approvals of any kind still Pending,
 // oldest first.
 func (h *Hub) PendingApprovals(ctx context.Context) ([]Approval, error) {
 	return h.approvals(ctx, "WHERE status = ? ORDER BY requested_at", Pending)
 }
 
-// UnfinishedCards returns the decided approvals of either kind whose card
+// UnfinishedCards returns the decided approvals of any kind whose card
 // does not show the outcome yet, oldest first.
 func (h *Hub) UnfinishedCards(ctx context.Context) ([]Approval, error) {
 	return h.approvals(ctx, "WHERE status <> ? AND card_final = 0 ORDER BY decided_at", Pending)
 }
 
 func (h *Hub) approvals(ctx context.Context, where string, args ...any) ([]Approval, error) {
-	rows, err := h.db.QueryContext(ctx, "SELECT * FROM (SELECT "+approvalColumns+", '"+KindAction+"' AS kind FROM approval UNION ALL SELECT "+
-		approvalColumns+", '"+KindRoute+"' FROM route_request) "+where, args...)
+	var tables []string
+	for _, kind := range approvalKinds {
+		tables = append(tables, "SELECT "+approvalColumns+", '"+kind+"' AS kind FROM "+approvalTable(kind))
+	}
+	rows, err := h.db.QueryContext(ctx, "SELECT * FROM ("+strings.Join(tables, " UNION ALL ")+") "+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +188,7 @@ var errNoDecision = errors.New("store: no decision")
 // outcome.
 func (h *Hub) MarkCardFinal(ctx context.Context, id string) error {
 	return h.transact(ctx, func(tx *Hub) error {
-		for _, kind := range []string{KindAction, KindRoute} {
+		for _, kind := range approvalKinds {
 			if _, err := tx.db.ExecContext(ctx, "UPDATE "+approvalTable(kind)+" SET card_final = 1 WHERE approval_id = ?", id); err != nil {
 				return err
 			}

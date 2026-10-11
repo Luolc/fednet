@@ -107,8 +107,9 @@ func TestImportRoutes(t *testing.T) {
 const releasedHubMigrations = 9
 
 // A hub of the release before the routes opens a database this one has
-// written routes, route requests and scopes to, and sees no route request
-// among its approvals.
+// written routes, route requests, channel requests and scopes to, and
+// sees no route request among its approvals; a hub of the release after
+// it, which reads route requests, sees no channel request among them.
 func TestOlderHubOpensTheDatabase(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "hub.db")
@@ -119,6 +120,10 @@ func TestOlderHubOpensTheDatabase(t *testing.T) {
 	}
 	if err := h.PutApproval(ctx, Approval{ID: "r1", Kind: KindRoute, Client: "workstation", Agent: "lead", Summary: "move C1", Action: []byte(`{}`),
 		Nonce: []byte{}, RequestedAt: at, ExpiresAt: at.Add(time.Hour), Channel: "C9", TS: "1.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.PutApproval(ctx, Approval{ID: "c1", Kind: KindChannel, Client: "workstation", Agent: "lead", Summary: "new repo", Action: []byte(`{"create":{"name":"repo-x"}}`),
+		Nonce: []byte{}, RequestedAt: at, ExpiresAt: at.Add(time.Hour), Channel: "C9", TS: "1.2"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := h.ClaimAndEnqueue(ctx, "C1/1.1", "workstation", "", "data", []byte("x")); err != nil {
@@ -134,6 +139,9 @@ func TestOlderHubOpensTheDatabase(t *testing.T) {
 	var n int
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM approval").Scan(&n); err != nil || n != 0 {
 		t.Fatalf("the older hub's approval table has %d rows, %v; want none", n, err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM route_request").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("route_request has %d rows, %v; want only the route request, not the channel request", n, err)
 	}
 }
 

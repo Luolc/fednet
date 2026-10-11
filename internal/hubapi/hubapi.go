@@ -708,7 +708,7 @@ func (s *Server) noneWaiting(ctx context.Context, what string, match func(approv
 	}
 	for _, a := range pending {
 		var c approval.RouteChange
-		if a.Kind == store.KindRoute && json.Unmarshal(a.Action, &c) == nil && match(c) {
+		if (a.Kind == store.KindRoute || a.Kind == store.KindChannel) && json.Unmarshal(a.Action, &c) == nil && match(c) {
 			return link.Refuse(link.ErrBusy, "%s has a request waiting for approval (%s); ask again once it is decided", what, a.ID)
 		}
 	}
