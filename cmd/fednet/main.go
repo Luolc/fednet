@@ -85,10 +85,10 @@ commands:
         route requests go to and the users, from that list, who may
         approve, bounds the thread history a message that mentions the bot
         carries (how many messages, how many characters in all, how many
-        in one message before it is cut; the defaults are shown), says which uploaded files a client fetches
-        before it hands a message to its hook (the types, "image/*" for
-        all images, the largest file, the most one message's files add up
-        to), the largest file a client may fetch at all, the largest file
+        in one message before it is cut; the defaults are shown), says
+        which uploaded files a client fetches before it hands a message to
+        its hook (the types, "image/*" for all images, the largest file,
+        the most one message's files add up to), the largest file a client may fetch at all, the largest file
         and how many files a post may upload, in bytes (the defaults are
         shown: 20 MiB, 50 MiB, 200 MiB, 50 MiB, 10), whether an upload
         names the machine in its comment rather than in a block (for a

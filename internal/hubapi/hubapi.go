@@ -379,8 +379,9 @@ func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {
 var deleteTimeout = 30 * time.Second
 
 // openThread posts the thread, then records its owner, with the channel's
-// name when Slack gives it and the scope of the channel's route. If recording fails it deletes the message it
-// posted, so no thread is left in Slack without an owner, and fails.
+// name when Slack gives it and the scope of the channel's route. If
+// recording fails it deletes the message it posted, so no thread is left
+// in Slack without an owner, and fails.
 func (s *Server) openThread(ctx context.Context, client string, r Request) (Reply, error) {
 	if r.Channel == "" || r.Text == "" {
 		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
@@ -600,6 +601,19 @@ func (s *Server) requestRoute(ctx context.Context, client string, r Request) (st
 		return "", link.Refuse(link.ErrBadRequest, "%q is neither a Slack channel id nor %s", q.Channel, store.DMRoute)
 	case s.Approvals == nil:
 		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
+	}
+	// A card shows the whole route the channel will have, which its
+	// approval writes; a second card for the channel, made from the same
+	// route, would undo the first's change when approved after it.
+	pending, err := s.Store.PendingApprovals(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, a := range pending {
+		var c approval.RouteChange
+		if a.Kind == store.KindRoute && json.Unmarshal(a.Action, &c) == nil && c.Channel == q.Channel {
+			return "", link.Refuse(link.ErrBusy, "the route of %s has a request waiting for approval (%s); ask again once it is decided", q.Channel, a.ID)
+		}
 	}
 	current, err := s.Store.Route(ctx, q.Channel)
 	exists := err == nil

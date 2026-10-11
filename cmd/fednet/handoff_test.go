@@ -786,9 +786,10 @@ func TestHubReadyWaitsForSlack(t *testing.T) {
 	}
 }
 
-// Importing the config's routes is part of a new hub's start: while it
-// fails, the new hub is never ready, the handoff fails and the old hub
-// serves on; once it succeeds, the routes are in the database, and the
+// Importing the config's routes is part of a new hub's start, in one
+// transaction: while it fails, the new hub is never ready, the handoff
+// fails, the old hub serves on and no route is left half imported; once
+// it succeeds, the routes are in the database, and the
 // next hub leaves them be and warns that the config's are ignored.
 func TestHubHandoffImportsRoutes(t *testing.T) {
 	ctx := t.Context()
@@ -808,7 +809,9 @@ func TestHubHandoffImportsRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.ExecContext(ctx, "CREATE TRIGGER no_route BEFORE INSERT ON route BEGIN SELECT RAISE(ABORT, 'no route'); END"); err != nil {
+	// The import fails at its second route, dm, after C1 is written: the
+	// transaction leaves neither.
+	if _, err := db.ExecContext(ctx, "CREATE TRIGGER no_route BEFORE INSERT ON route WHEN NEW.channel = 'dm' BEGIN SELECT RAISE(ABORT, 'no route'); END"); err != nil {
 		t.Fatal(err)
 	}
 	writeConfig(`{"channels": {"C1": {"machine": "workstation", "open_thread": ["workstation"]}}, "dm": {"machine": "workstation"}}`)

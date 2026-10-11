@@ -664,6 +664,15 @@ func TestRequestRoute(t *testing.T) {
 		if c.ID != reply.ApprovalID || params.String() != tt.params || c.Summary != "改路由：new repo" || c.Machine != "workstation" || c.Agent != "lead" {
 			t.Errorf("card for %+v = %+v, want %s with %s", tt.req.Route, c, reply.ApprovalID, tt.params)
 		}
+		// While the card waits, the channel takes no other request.
+		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, link.ErrBusy) {
+			t.Errorf("a second request for %s while one waits = %v, want busy", tt.req.Route.Channel, err)
+		}
+		if _, err := s.Store.DecideApproval(ctx, reply.ApprovalID, func(*store.Hub, store.Approval) (store.Decision, error) {
+			return store.Decision{Status: payload.Rejected, By: "U1", At: time.Now()}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// Nothing changes before an approval.
 	if got, err := answer(t, s, "datamachine", Request{Cmd: Routes}); err != nil || len(got.Routes) != 1 || got.Routes[0].Machine != "datamachine" {
