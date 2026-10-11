@@ -16,7 +16,7 @@
 - `fednet_vX.Y.Z_linux_amd64`、`fednet_vX.Y.Z_linux_arm64`：静态链接的裸二进制 (`CGO_ENABLED=0`)，`fednet version` 打印的就是 `vX.Y.Z`。
 - `SHA256SUMS`：`sha256sum` 的标准格式，每行是哈希、两个空格、文件名。
 
-发布之前流水线先跑和 PR 相同的检查，再确认 tag 指向的 commit 已经在 `main` 上，每个架构的二进制在同架构的 runner 上构建，跑一遍 `fednet version`，打出的版本不等于 tag 就不发布。
+发布之前流水线先确认 tag 指向的 commit 已经在 `main` 上，而且这个 commit 推上 `main` 时触发的 CI 第一次就通过 (还在跑就等它跑完，不在发版时重跑)；每个架构的二进制在同架构的 runner 上构建，跑一遍 `fednet version`，打出的版本不等于 tag 就不发布。
 
 在要装的机器上下载、校验，再放到单元模板用的 `/usr/local/bin/fednet`：
 
