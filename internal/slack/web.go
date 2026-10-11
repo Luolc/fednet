@@ -334,10 +334,31 @@ func (w *Web) PostReply(ctx context.Context, channel, ts, text string) (string, 
 	return w.postMarkdown(ctx, channel, text, slackgo.MsgOptionTS(ts))
 }
 
+// PostReplyMentioning is PostReply with users mentioned before text, in
+// a rich_text block of their own: in the markdown block a mention would
+// show as written and notify no one. The plain text starts with them too.
+func (w *Web) PostReplyMentioning(ctx context.Context, channel, ts, text string, users []string) (string, error) {
+	var els []slackgo.RichTextSectionElement
+	var plain strings.Builder
+	for i, u := range users {
+		if i > 0 {
+			els = append(els, slackgo.NewRichTextSectionTextElement(" ", nil))
+		}
+		els = append(els, slackgo.NewRichTextSectionUserElement(u, nil))
+		plain.WriteString("<@" + u + "> ")
+	}
+	return w.post(ctx, channel, slackgo.MsgOptionTS(ts), slackgo.MsgOptionText(plain.String()+text, false),
+		slackgo.MsgOptionBlocks(slackgo.NewRichTextBlock("", slackgo.NewRichTextSection(els...)), slackgo.NewMarkdownBlock("", text)))
+}
+
 // postMarkdown posts text in channel in a markdown block, with text as
 // the plain text too, and opts.
 func (w *Web) postMarkdown(ctx context.Context, channel, text string, opts ...slackgo.MsgOption) (string, error) {
-	opts = append(opts, slackgo.MsgOptionText(text, false), slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", text)))
+	return w.post(ctx, channel, append(opts, slackgo.MsgOptionText(text, false), slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", text)))...)
+}
+
+// post posts a message with opts in channel and returns its ts.
+func (w *Web) post(ctx context.Context, channel string, opts ...slackgo.MsgOption) (string, error) {
 	var posted string
 	err := w.call(ctx, "chat.postMessage", func() (err error) {
 		_, posted, err = w.c.PostMessageContext(ctx, channel, opts...)

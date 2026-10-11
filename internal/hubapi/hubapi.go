@@ -22,6 +22,7 @@ import (
 	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/outbound"
+	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -62,6 +63,13 @@ const (
 	// Ops carries out Op, one of the fixed operations the hub's config
 	// allows the requesting client, and returns the answer as Text.
 	Ops = "ops"
+	// Delete deletes from Slack the post with MsgID, which the requesting
+	// client posted: every message it went out as.
+	Delete = "delete"
+	// CheckMentions checks that every one of Mentions is on the user
+	// list, before a client queues a post that mentions them. A hub that
+	// answers it also mentions them when it posts.
+	CheckMentions = "check-mentions"
 )
 
 // Request is one request. Cmd selects the command; the other fields are its
@@ -79,6 +87,11 @@ type Request struct {
 	Action    []byte `json:"action,omitempty"`
 	// Op is the argument of Ops.
 	Op string `json:"op,omitempty"`
+	// MsgID is the argument of Delete: the msg_id the post was queued
+	// under.
+	MsgID string `json:"msg_id,omitempty"`
+	// Mentions is the argument of CheckMentions: Slack user ids.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // User is one person on the user list.
@@ -296,6 +309,10 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		} else {
 			reply.Text, err = s.Ops(ctx, client, r.Op)
 		}
+	case Delete:
+		err = s.delete(ctx, client, r)
+	case CheckMentions:
+		err = s.checkMentions(r)
 	default:
 		err = link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
 	}
@@ -439,6 +456,68 @@ func (s *Server) dm(ctx context.Context, r Request) error {
 		return errNoSlack
 	}
 	return s.Slack.DM(ctx, r.User, r.Text)
+}
+
+func (s *Server) checkMentions(r Request) error {
+	if len(r.Mentions) == 0 {
+		return link.Refuse(link.ErrBadRequest, "no users to mention")
+	}
+	for _, u := range r.Mentions {
+		if _, ok := s.Users[u]; !ok {
+			return link.Refuse(link.ErrDenied, "user %s is not on the user list", u)
+		}
+	}
+	return nil
+}
+
+// delete deletes the messages a post from client went out as. Only the
+// client that posted it may; one still on its way to Slack is refused for
+// now. A message gone from Slack already counts as deleted, so a delete
+// that failed half way can be tried again, but a post with all of them
+// gone is not found.
+func (s *Server) delete(ctx context.Context, client string, r Request) error {
+	if r.MsgID == "" {
+		return link.Refuse(link.ErrBadRequest, "needs a msg_id")
+	}
+	p, err := s.Store.Posted(ctx, r.MsgID)
+	if errors.Is(err, store.ErrNotFound) {
+		return link.Refuse(link.ErrNotFound, "no post %s on the hub", r.MsgID)
+	}
+	if err != nil {
+		return err
+	}
+	if p.Client != client {
+		return link.Refuse(link.ErrDenied, "post %s is not from client %s", r.MsgID, client)
+	}
+	var m payload.Message
+	if json.Unmarshal(p.Payload, &m) != nil || m.Type != payload.Post {
+		return link.Refuse(link.ErrBadRequest, "%s is not a post", r.MsgID)
+	}
+	channel, _, ok := slack.ParseThreadKey(m.Thread)
+	switch {
+	case !p.Delivered:
+		return link.Refuse(link.ErrBusy, "post %s is not in Slack yet", r.MsgID)
+	case !ok || len(p.TS) == 0:
+		return link.Refuse(link.ErrNotFound, "post %s has no message in Slack the hub knows of", r.MsgID)
+	}
+	if s.Slack == nil {
+		return errNoSlack
+	}
+	gone := 0
+	for _, ts := range p.TS {
+		err := s.Slack.Delete(ctx, channel, ts)
+		if errors.Is(err, slack.ErrNotFound) {
+			gone++
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if gone == len(p.TS) {
+		return link.Refuse(link.ErrNotFound, "post %s is no longer in Slack", r.MsgID)
+	}
+	return nil
 }
 
 // checkLength refuses a text over MaxTextChars.

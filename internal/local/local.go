@@ -71,6 +71,12 @@ type Request struct {
 	Files []link.FileHeader `json:"files,omitempty"`
 	// Footer makes a Post one line of small grey text.
 	Footer bool `json:"footer,omitempty"`
+	// Mentions are the Slack user ids a Post mentions at its start. The
+	// daemon has the hub check them before it queues the post, so such a
+	// post needs the hub.
+	Mentions []string `json:"mentions,omitempty"`
+	// MsgID is the argument of hubapi.Delete.
+	MsgID string `json:"msg_id,omitempty"`
 	// Title, Items and Close are the arguments of Progress, as
 	// payload.Message has them.
 	Title string               `json:"title,omitempty"`
@@ -349,7 +355,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		}
 		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
-		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.Ops:
+		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.Ops, hubapi.Delete:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
@@ -383,7 +389,19 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 	if req.Footer && !slack.FooterFits(slack.MachineFooter(req.Text, s.Machine)) {
 		return badRequest(fmt.Sprintf("post: a footer takes at most %d characters, links written out and the machine's name added", slack.MaxFooterChars))
 	}
-	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text, Footer: req.Footer})
+	if len(req.Mentions) > 0 {
+		if req.Footer {
+			return badRequest("post: a footer mentions no one")
+		}
+		if s.Request == nil {
+			return badRequest("post with mentions is not served on this socket")
+		}
+		if res := s.ask(ctx, Request{Cmd: hubapi.CheckMentions, Mentions: req.Mentions}); res.Error != "" {
+			res.Error = "post: " + res.Error
+			return res
+		}
+	}
+	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text, Footer: req.Footer, Mentions: req.Mentions})
 }
 
 func (s *Server) progress(ctx context.Context, req Request) Response {
@@ -468,7 +486,7 @@ var kinds = []struct {
 // ask hands req to the hub and replies with the hub's answer.
 func (s *Server) ask(ctx context.Context, req Request) Response {
 	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User,
-		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op})
+		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op, MsgID: req.MsgID, Mentions: req.Mentions})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -476,7 +494,11 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	defer cancel()
 	answer, err := s.Request(ctx, b)
 	if err != nil {
-		return failed(req.Cmd, err)
+		res := failed(req.Cmd, err)
+		if errors.Is(err, link.ErrBadRequest) && err.Error() == fmt.Sprintf("unknown command %q", req.Cmd) {
+			res.Error += " (the hub runs an older fednet than this client; upgrade the hub)"
+		}
+		return res
 	}
 	var reply hubapi.Reply
 	if err := json.Unmarshal(answer, &reply); err != nil {

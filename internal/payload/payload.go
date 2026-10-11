@@ -152,6 +152,9 @@ type Message struct {
 	// Footer is set on a post whose Text goes out as one line of small
 	// grey text.
 	Footer bool `json:"footer,omitempty"`
+	// Mentions are the Slack user ids a post mentions at its start, each
+	// on the hub's user list; a footer has none.
+	Mentions []string `json:"mentions,omitempty"`
 	// Title and Items are, on a Progress, the whole card; Close is
 	// slack.Done or slack.Failed on one that closes the card, when Title
 	// and Items may be left out to keep them as they are.

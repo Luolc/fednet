@@ -159,6 +159,44 @@ func TestLongPostIsSplit(t *testing.T) {
 	}
 }
 
+// A post mentions, at the start of its first message only, the people
+// it names who are on the user list; the Slack ts of each of its
+// messages is recorded, footers' too, for a delete.
+func TestPostMentionsAndRecordsWhere(t *testing.T) {
+	f := newFixture(t)
+	f.p.MaxChars = 10
+	f.p.Users = map[string]string{"U1": "Ann", "U2": ""}
+	b, err := json.Marshal(payload.Message{Type: payload.Post, Thread: f.thread, Text: "abcdefghijklm", Mentions: []string{"U1", "U9", "U2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := f.putRaw("workstation", b)
+	b, err = json.Marshal(payload.Message{Type: payload.Post, Thread: f.thread, Text: "done", Footer: true, Mentions: []string{"U1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer := f.putRaw("workstation", b)
+	if err := f.p.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ms := f.replies()
+	if got, want := texts(ms[:2]), []string{"<@U1> <@U2> abcdefghij", "klm"}; !slices.Equal(got, want) {
+		t.Fatalf("thread = %q, want %q", got, want)
+	}
+	if slack.Mentions(ms[2].Text, "U1") {
+		t.Fatalf("footer %q mentions U1", ms[2].Text)
+	}
+	for _, c := range []struct {
+		id   string
+		want []string
+	}{{long, []string{ms[0].TS, ms[1].TS}}, {footer, []string{ms[2].TS}}} {
+		p, err := f.st.Posted(t.Context(), c.id)
+		if err != nil || !p.Delivered || !slices.Equal(p.TS, c.want) {
+			t.Fatalf("Posted(%s) = %+v, %v; want delivered at %v", c.id, p, err, c.want)
+		}
+	}
+}
+
 func TestSplit(t *testing.T) {
 	tests := []struct {
 		text string

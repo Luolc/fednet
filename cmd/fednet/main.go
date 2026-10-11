@@ -140,7 +140,7 @@ commands:
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
-  client post -socket PATH -thread KEY [-file PATH]... [-footer] [-json] [--] [TEXT]
+  client post -socket PATH -thread KEY [-file PATH]... [-footer] [-mention USER-ID]... [-json] [--] [TEXT]
         post TEXT to a thread; prints the msg_id once the client has queued it;
         put -- before a TEXT that starts with -; with -file (repeatable) the
         files are uploaded to the thread with TEXT, which may then be left
@@ -155,8 +155,18 @@ commands:
         -footer TEXT goes out instead as one line of small grey text, with
         its links [text](url) kept and the rest as it is, and the hub adds
         " · " and this machine's name at the end; at most 3000 characters
-        with the links written out and the name added; any post first
-        closes the thread's progress card, as progress -done does
+        with the links written out and the name added; with -mention
+        (repeatable) the hub mentions each user, who must be on the user
+        list, at the start of the post, which then needs the hub reachable
+        to check them before it is queued; @ written in TEXT mentions no
+        one; -mention takes no -footer or -file; any post first closes the
+        thread's progress card, as progress -done does
+  client delete -socket PATH [-json] MSG-ID
+        delete from Slack the post that client post queued under MSG-ID,
+        every message it went out as; only a post from this machine; exits
+        1 when the hub knows no such post in Slack (one from before the hub
+        recorded where its posts go included), 3 for a post from another
+        machine, and 5 for a post not in Slack yet: try again later
   client progress -socket PATH -thread KEY -title TITLE [-item TEXT:STATE]... [-json]
   client progress -socket PATH -thread KEY (-done | -error) [-title TITLE] [-item TEXT:STATE]... [-json]
         show what the agent is doing in a progress card in the thread; the
@@ -649,7 +659,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		return err
 	}
 	defer st.Close()
-	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval}
+	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval, Users: cfg.Users}
 	hub := &link.Hub{
 		Store:         st,
 		Identify:      (&auth.Authenticator{Store: st}).Identify,
@@ -920,6 +930,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientThreads(ctx, args[1:], stdout)
 		case "adopt":
 			return clientAdopt(ctx, args[1:], stdout)
+		case "delete":
+			return clientDelete(ctx, args[1:], stdout)
 		case "channel-context":
 			return clientChannelContext(ctx, args[1:], stdout)
 		case "users":
@@ -1244,6 +1256,11 @@ func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 		return nil
 	})
 	footer := fs.Bool("footer", false, "post TEXT as one line of small grey text")
+	var mentions []string
+	fs.Func("mention", "Slack id of a user on the user list to mention at the start (repeatable)", func(user string) error {
+		mentions = append(mentions, user)
+		return nil
+	})
 	if err := parseFlags(fs, args, -1); err != nil {
 		return err
 	}
@@ -1256,7 +1273,10 @@ func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 	if *footer && !slack.FooterFits(fs.Arg(0)) {
 		return usageError(fmt.Sprintf("fednet client post: a -footer TEXT takes at most %d characters, links written out", slack.MaxFooterChars))
 	}
-	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0), Footer: *footer}
+	if len(mentions) > 0 && (*footer || len(paths) > 0 || fs.Arg(0) == "") {
+		return usageError("fednet client post: -mention takes a non-empty TEXT, and no -footer or -file")
+	}
+	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0), Footer: *footer, Mentions: mentions}
 	var files []io.Reader
 	for _, path := range paths {
 		f, err := os.Open(path)
@@ -1454,6 +1474,24 @@ func clientAdopt(ctx context.Context, args []string, stdout io.Writer) error {
 		return usageError("fednet client adopt: -socket and THREAD-KEY are required")
 	}
 	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Adopt, Thread: fs.Arg(0)})
+	if err != nil || !*asJSON {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(res)
+}
+
+// clientDelete deletes from Slack a post this machine made, by the msg_id
+// post printed.
+func clientDelete(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client delete", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || fs.Arg(0) == "" {
+		return usageError("fednet client delete: -socket and MSG-ID are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Delete, MsgID: fs.Arg(0)})
 	if err != nil || !*asJSON {
 		return err
 	}

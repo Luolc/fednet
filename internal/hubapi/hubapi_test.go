@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"reflect"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/link"
+	"github.com/Luolc/fednet/internal/outbound"
+	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -386,6 +389,114 @@ func TestDM(t *testing.T) {
 	}
 	if got := f.DMs("U1"); len(got) != 1 {
 		t.Fatalf("DMs to U1 = %q, want only the report", got)
+	}
+}
+
+func TestCheckMentions(t *testing.T) {
+	s, _ := testServer(t)
+	s.Users = map[string]string{"U1": "maintainer", "U2": ""}
+	if _, err := answer(t, s, "workstation", Request{Cmd: CheckMentions, Mentions: []string{"U1", "U2"}}); err != nil {
+		t.Fatalf("check-mentions of users on the list = %v", err)
+	}
+	if _, err := answer(t, s, "workstation", Request{Cmd: CheckMentions, Mentions: []string{"U1", "U9"}}); !errors.Is(err, link.ErrDenied) {
+		t.Fatalf("check-mentions of a user not on the list = %v, want ErrDenied", err)
+	}
+	if _, err := answer(t, s, "workstation", Request{Cmd: CheckMentions}); !errors.Is(err, link.ErrBadRequest) {
+		t.Fatalf("check-mentions of no one = %v, want ErrBadRequest", err)
+	}
+}
+
+// A client deletes its own post, every message it went out as, and
+// nothing else: not another client's post, not a post still on its way,
+// not a progress card.
+func TestDelete(t *testing.T) {
+	s, f := testServer(t)
+	root, err := f.Start("C1", "U1", "please fix the build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := slack.ThreadKey("C1", root)
+	poster := &outbound.Poster{Store: s.Store, Slack: f, MaxChars: 5}
+	n := 0
+	put := func(client string, m payload.Message) string {
+		t.Helper()
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+		id := fmt.Sprintf("m%d", n)
+		if _, err := s.Store.Inbox.PutFrom(t.Context(), client, store.Message{MsgID: id, Payload: b}); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	post := func(client, text string) string {
+		return put(client, payload.Message{Type: payload.Post, Thread: key, Text: text})
+	}
+	long := post("workstation", "abcdefgh")
+	other := post("datamachine", "mine")
+	card := put("workstation", payload.Message{Type: payload.Progress, Thread: key, Title: "building"})
+	cut := post("workstation", "ijklmnop")
+	if err := poster.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pending := post("workstation", "later")
+	thread := func() []string {
+		t.Helper()
+		ms, err := f.Replies(t.Context(), "C1", root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var texts []string
+		for _, m := range ms {
+			texts = append(texts, m.Text)
+		}
+		return texts
+	}
+	if got, want := thread(), []string{"please fix the build", "abcde", "fgh", "mine", "进度：building", "ijklm", "nop"}; !slices.Equal(got, want) {
+		t.Fatalf("thread = %q, want %q", got, want)
+	}
+
+	if _, err := answer(t, s, "workstation", Request{Cmd: Delete, MsgID: long}); err != nil {
+		t.Fatal(err)
+	}
+	// One message of a post already gone from Slack does not stop the
+	// rest from going.
+	p, err := s.Store.Posted(t.Context(), cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Delete(t.Context(), "C1", p.TS[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := answer(t, s, "workstation", Request{Cmd: Delete, MsgID: cut}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := thread(), []string{"please fix the build", "mine", "进度：building"}; !slices.Equal(got, want) {
+		t.Fatalf("thread after the deletes = %q, want %q", got, want)
+	}
+
+	tests := []struct {
+		name   string
+		client string
+		msgID  string
+		want   error
+	}{
+		{"another client's post", "workstation", other, link.ErrDenied},
+		{"a post deleted already", "workstation", long, link.ErrNotFound},
+		{"no such msg_id", "workstation", "m99", link.ErrNotFound},
+		{"a post not in Slack yet", "workstation", pending, link.ErrBusy},
+		{"a progress card", "workstation", card, link.ErrBadRequest},
+		{"no msg_id", "workstation", "", link.ErrBadRequest},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, tt.client, Request{Cmd: Delete, MsgID: tt.msgID}); !errors.Is(err, tt.want) {
+			t.Errorf("%s: delete = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if got := thread(); !slices.Contains(got, "mine") {
+		t.Fatalf("thread = %q, want the other client's post still there", got)
 	}
 }
 

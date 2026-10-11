@@ -400,6 +400,101 @@ func TestAsk(t *testing.T) {
 	}
 }
 
+// testHub serves answer on a hub for client workstation and returns the
+// hub's URL.
+func testHub(t *testing.T, answer func(ctx context.Context, client string, req []byte) ([]byte, error)) string {
+	t.Helper()
+	hub := &link.Hub{Answer: answer}
+	srv := httptest.NewServer(hub.Handler())
+	t.Cleanup(func() {
+		hub.Close()
+		srv.Close()
+	})
+	return srv.URL
+}
+
+// A post that mentions people is queued, mentions and all, only once the
+// hub has found them all on its user list; the hub must be reachable.
+func TestPostWithMentions(t *testing.T) {
+	ctx := t.Context()
+	st := openClientStore(t)
+	hub := testHub(t, (&hubapi.Server{Users: map[string]string{"U1": "maintainer", "U2": ""}}).Answer)
+	path := serve(t, &link.Client{Store: st, ID: "workstation", Hub: hub})
+	thread := "C1/1700000000.000100"
+
+	res, err := Do(ctx, path, Request{Cmd: Post, Thread: thread, Text: "your review", Mentions: []string{"U1", "U2"}})
+	if err != nil || res.Error != "" || res.MsgID == "" {
+		t.Fatalf("Do(post -mention) = %+v, %v; want a msg_id", res, err)
+	}
+	tests := []struct {
+		name string
+		req  Request
+		kind string
+	}{
+		{"a user not on the list", Request{Cmd: Post, Thread: thread, Text: "x", Mentions: []string{"U1", "U9"}}, Denied},
+		{"a footer", Request{Cmd: Post, Thread: thread, Text: "x", Footer: true, Mentions: []string{"U1"}}, BadRequest},
+	}
+	for _, tt := range tests {
+		res, err := Do(ctx, path, tt.req)
+		if err != nil || res.Error == "" || res.Kind != tt.kind || res.MsgID != "" {
+			t.Errorf("%s: Do = %+v, %v; want kind %q", tt.name, res, err, tt.kind)
+		}
+	}
+	ms, err := st.Outbox.Pending(ctx)
+	if err != nil || len(ms) != 1 || ms[0].MsgID != res.MsgID {
+		t.Fatalf("outbox = %+v, %v; want just %s", ms, err, res.MsgID)
+	}
+	var got payload.Message
+	if err := json.Unmarshal(ms[0].Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if want := (payload.Message{Type: payload.Post, Thread: thread, Text: "your review", Mentions: []string{"U1", "U2"}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("payload = %+v, want %+v", got, want)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := "http://" + ln.Addr().String()
+	ln.Close()
+	st = openClientStore(t)
+	path = serve(t, &link.Client{Store: st, ID: "workstation", Hub: down})
+	res, err = Do(ctx, path, Request{Cmd: Post, Thread: thread, Text: "x", Mentions: []string{"U1"}})
+	if err != nil || res.Kind != Unreachable {
+		t.Fatalf("Do(post -mention) with the hub down = %+v, %v; want kind %q", res, err, Unreachable)
+	}
+	if ms, err := st.Outbox.Pending(ctx); err != nil || len(ms) != 0 {
+		t.Fatalf("outbox = %+v, %v; want empty", ms, err)
+	}
+}
+
+// A hub older than the client does not know delete or mentions: the
+// client says so, and queues nothing.
+func TestOlderHub(t *testing.T) {
+	st := openClientStore(t)
+	hub := testHub(t, func(_ context.Context, _ string, req []byte) ([]byte, error) {
+		var r hubapi.Request
+		if err := json.Unmarshal(req, &r); err != nil {
+			return nil, err
+		}
+		return nil, link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
+	})
+	path := serve(t, &link.Client{Store: st, ID: "workstation", Hub: hub})
+	for _, req := range []Request{
+		{Cmd: hubapi.Delete, MsgID: "m1"},
+		{Cmd: Post, Thread: "C1/1700000000.000100", Text: "x", Mentions: []string{"U1"}},
+	} {
+		res, err := Do(t.Context(), path, req)
+		if err != nil || res.Kind != BadRequest || !strings.Contains(res.Error, "older fednet") {
+			t.Errorf("Do(%s) = %+v, %v; want a bad request that names the older hub", req.Cmd, res, err)
+		}
+	}
+	if ms, err := st.Outbox.Pending(t.Context()); err != nil || len(ms) != 0 {
+		t.Fatalf("outbox = %+v, %v; want empty", ms, err)
+	}
+}
+
 // With the hub down a request for it fails at once; it is not queued.
 func TestAskWhileHubDown(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
