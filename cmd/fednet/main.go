@@ -228,7 +228,8 @@ commands:
         channel; once approved the hub makes the change itself, for the
         threads started after it, and the outcome comes as a message of type
         approval through the hook, unsigned; -requester is a note on the
-        card, not checked
+        card, not checked; exits 5 while the route has a request waiting
+        for approval: ask again once it is decided
   client routes -socket PATH [-json]
         print the routes: each channel (dm for direct messages), the client
         that takes its new threads, the scope, and who may open threads

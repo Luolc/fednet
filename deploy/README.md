@@ -52,7 +52,7 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 
 审批要有 Slack，还要在配置里的 `approvals` 写上审批卡发到哪个 channel (`channel`) 和谁能批 (`approvers`，Slack 用户 id，每个都得在 `users` 名单上)；缺一样，agent 的 `request-approval` 和 `request-route` 都直接被拒绝，不发卡。`request-approval` 还要私钥，没给私钥时它被拒绝、不签名，启动日志里有一句 `no approval key, only route requests are approved`；`request-route` 不签名，不要私钥。
 
-路由 (每个 channel 里人新开的线程交给哪台 client、这些线程的消息带什么 `scope`、哪些 client 能在这个 channel 开线程，以及私信交给哪台 client) 存在 hub 的数据库里。agent 用 `fednet client request-route` 提议增加、修改或删除一条，审批人在审批卡上点批准后 hub 改它自己的库，并在审批 channel 发一条改前改后的留痕；改动只影响之后新开的线程。`fednet client routes` 列出现有路由。配置里的 `channels` 和 `dm` 只在库里还没有路由时导入一次：导入在 hub 报告就绪之前、在一个事务里做完，失败就不启动 (交接时旧进程继续服务)；导入后日志和审批 channel 各留一条痕，以后启动时这两段被忽略，还在就记一条警告。从旧版本升上来时，只要还可能回滚到不从库里读路由的版本，就保留配置里的这两段，代价只是每次启动一条警告：旧版本只从这两段读路由，删了之后回滚，它一条路由都没有，所有新线程都没人接。回滚之后它也看不到导入之后批准的改动；要用这些改动，回滚前先照 `fednet client routes` 的输出把这两段改好。
+路由 (每个 channel 里人新开的线程交给哪台 client、这些线程的消息带什么 `scope`、哪些 client 能在这个 channel 开线程，以及私信交给哪台 client) 存在 hub 的数据库里。agent 用 `fednet client request-route` 提议增加、修改或删除一条，审批人在审批卡上点批准后 hub 改它自己的库，并在审批 channel 发一条改前改后的留痕；改动只影响之后新开的线程。卡上是这条路由改完之后的完整样子，批准时整条写入，所以同一条路由已有一张待批的卡时，新的请求被拒 (退 5)，等那张卡有了结果再提。`fednet client routes` 列出现有路由。配置里的 `channels` 和 `dm` 只在库里还没有路由时导入一次：导入在 hub 报告就绪之前、在一个事务里做完，失败就不启动 (交接时旧进程继续服务)；导入后日志和审批 channel 各留一条痕，以后启动时这两段被忽略，还在就记一条警告。从旧版本升上来时，只要还可能回滚到不从库里读路由的版本，就保留配置里的这两段，代价只是每次启动一条警告：旧版本只从这两段读路由，删了之后回滚，它一条路由都没有，所有新线程都没人接。回滚之后它也看不到导入之后批准的改动；要用这些改动，回滚前先照 `fednet client routes` 的输出把这两段改好。
 
 channel 里的消息只有 @ 了 bot 才交给 agent，@ 的那条带上线程里之前的消息作为上下文；配置里的 `history` 定上下文的上限：`max_messages` 最多几条，`max_chars` 这几条的正文合计最多几个字符，`max_message_chars` 单条正文超过几个字符就截断 (@ 的那条本身也按它截)。不写就用示例里的默认值 (10、4000、2000)。hub 启动时用 bot token 调一次 `auth.test` 认自己的用户 id，调不到就不启动。
 
