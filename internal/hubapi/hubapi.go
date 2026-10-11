@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -174,7 +175,26 @@ type Server struct {
 	// authenticated, never one the request names: it is upgrade.Hub.Op.
 	// Nil means Ops is refused.
 	Ops func(ctx context.Context, client, op string) (string, error)
+
+	// names holds the names of the routes' channels as Slack last gave
+	// them, by channel id.
+	namesMu sync.Mutex
+	names   map[string]channelNameAt
 }
+
+type channelNameAt struct {
+	name string
+	at   time.Time
+}
+
+// nameTTL is how long the hub answers routes with the name Slack gave
+// for a channel before it asks again, so a renamed channel may keep its
+// old name that long. nameBudget bounds the lookups of one answer, well
+// within the time the client waits for it.
+const (
+	nameTTL    = 10 * time.Minute
+	nameBudget = 2 * time.Second
+)
 
 // Defaults for the zero limits of Server: the largest file served is 200
 // MiB, the largest uploaded 50 MiB, ten to an upload.
@@ -339,7 +359,7 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 	case RequestChannel:
 		reply.ApprovalID, err = s.requestChannel(ctx, client, r)
 	case Routes:
-		reply.Routes, err = s.Store.Routes(ctx)
+		reply.Routes, err = s.routes(ctx)
 	case Ops:
 		if s.Ops == nil {
 			err = link.Refuse(link.ErrDenied, "the hub runs no ops")
@@ -357,6 +377,47 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		return nil, err
 	}
 	return json.Marshal(reply)
+}
+
+// routes returns every route, each but that of direct messages with its
+// channel's name. A name Slack does not give in time is left empty, with
+// a warning, and the routes go without it.
+func (s *Server) routes(ctx context.Context) ([]store.Route, error) {
+	rs, err := s.Store.Routes(ctx)
+	if err != nil || s.Slack == nil {
+		return rs, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, nameBudget)
+	defer cancel()
+	for i := range rs {
+		if rs[i].Channel != store.DMRoute {
+			rs[i].Name = s.nameOf(ctx, rs[i].Channel)
+		}
+	}
+	return rs, nil
+}
+
+// nameOf returns the name of channel, asking Slack unless it gave the
+// name within nameTTL; empty when Slack does not give it.
+func (s *Server) nameOf(ctx context.Context, channel string) string {
+	s.namesMu.Lock()
+	n, ok := s.names[channel]
+	s.namesMu.Unlock()
+	if ok && time.Since(n.at) < nameTTL {
+		return n.name
+	}
+	info, err := s.Slack.ChannelInfo(ctx, channel)
+	if err != nil {
+		slog.Warn("hubapi: reading the name of a route's channel, answering routes without it", "channel", channel, "err", err)
+		return ""
+	}
+	s.namesMu.Lock()
+	if s.names == nil {
+		s.names = make(map[string]channelNameAt)
+	}
+	s.names[channel] = channelNameAt{info.Name, time.Now()}
+	s.namesMu.Unlock()
+	return info.Name
 }
 
 // thread checks that r names a thread and returns its channel and ts.

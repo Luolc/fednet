@@ -118,6 +118,10 @@ type Route struct {
 	Scope string `json:"scope,omitempty"`
 	// OpenThread lists the clients that may open threads in the channel.
 	OpenThread []string `json:"open_thread,omitempty"`
+	// Name is the channel's Slack name, without the #. Only the hub's
+	// answer to routes has it, looked up then; it is not stored, and
+	// empty when the lookup failed.
+	Name string `json:"name,omitempty"`
 }
 
 // Route returns the route of channel, or ErrNotFound.

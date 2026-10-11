@@ -585,6 +585,27 @@ func TestRequestApproval(t *testing.T) {
 	}
 }
 
+// routes answers each route with its channel's name, but not the route
+// of direct messages; a channel Slack gives no name for goes without one,
+// and the routes go anyway. A name is not asked for again at once, so a
+// rename shows later.
+func TestRoutesWithNames(t *testing.T) {
+	s, f := testServer(t)
+	f.RenameChannel("C1", "repo-fednet")
+	for _, ch := range []string{"C1", "C8", store.DMRoute} {
+		setRoute(t, s.Store, store.Route{Channel: ch, Machine: "workstation"})
+	}
+	want := []store.Route{{Channel: "C1", Machine: "workstation", Name: "repo-fednet"}, {Channel: "C8", Machine: "workstation"}, {Channel: store.DMRoute, Machine: "workstation"}}
+	got, err := answer(t, s, "workstation", Request{Cmd: Routes})
+	if err != nil || !reflect.DeepEqual(got.Routes, want) {
+		t.Fatalf("routes = %+v, %v; want %+v", got.Routes, err, want)
+	}
+	f.RenameChannel("C1", "repo-renamed")
+	if got, err := answer(t, s, "workstation", Request{Cmd: Routes}); err != nil || got.Routes[0].Name != "repo-fednet" {
+		t.Fatalf("routes right after a rename = %+v, %v; want the name as it was", got.Routes, err)
+	}
+}
+
 // request-route checks the change against the routes and the clients the
 // hub knows, makes it whole and posts its card; the hub needs no key for
 // it, but approvers and their channel.
