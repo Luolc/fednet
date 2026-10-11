@@ -19,14 +19,14 @@ fednet 是用户与各台机器上的 coding agent 之间的 Slack 消息桥：�
 
 ## 检查与测试
 
-- 本地检查：`uvx pre-commit run --all-files`，裸跑，看退出码。新文件先 `git add`。
+- push 之前先过钩子 (`uvx pre-commit run --all-files`)，再跑这次改动涉及的检查；全量只在 CI 跑，PR 上以 required check 那次 run 为准。检查都裸跑，看退出码。新文件先 `git add`。
 - clone 之后执行一次 `uvx pre-commit install`，装上 git 钩子。
-- 钩子不跑 Go 的检查，本地要另外跑：`gofmt -l .` 输出必须为空 (它列出文件时退出码仍是 0)，`go vet ./...` 和 `go test -race ./...` 看退出码。
+- 钩子不跑 Go 的检查，改了 Go 代码要另外跑：`gofmt -l .` 输出必须为空 (它列出文件时退出码仍是 0)，`go vet ./...` 和 `go test -race ./...` 看退出码。
 - 钩子按顺序是 `gitleaks` (扫暂存区的 diff) 和 `limae` (检查中文 Markdown 的排版)，`rev` 固定在 tag 上，升级要单独开 PR。
 
 ## CI
 
-`.github/workflows/ci.yml` 的 `check` 是 `main` 上的 required status check：对完整历史跑 gitleaks，跑 `pre-commit run --all-files` (跳过 gitleaks 钩子)，检查 `docs/design.md` 的长度，最后跑 gofmt、vet 和带 `-race` 的测试。
+`.github/workflows/ci.yml` 的 `check` 是 `main` 上的 required status check：用 gitleaks 扫这次 PR 或 push 的提交，跑 `pre-commit run --all-files` (跳过 gitleaks 钩子)，检查 `docs/design.md` 的长度，跑发版守卫的测试，最后跑 gofmt、vet 和带 `-race` 的测试。完整历史由 `.github/workflows/gitleaks.yml` 每周扫一次。
 
 ## 审查
 
