@@ -636,13 +636,19 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	}
 	var sl slack.API
 	var bot string
+	var scopes []string
 	if botToken != "" {
 		sl = newSlack(botToken)
 		// Which user the bot is decides which messages mention it; a
 		// hub that cannot find out serves no channel.
-		if bot, err = sl.Self(ctx); err != nil {
+		if bot, scopes, err = sl.Self(ctx); err != nil {
 			return fmt.Errorf("asking Slack which user the bot is: %w", err)
 		}
+		logged := "unknown"
+		if scopes != nil {
+			logged = strings.Join(scopes, ",")
+		}
+		slog.Info("slack: the bot token's scopes", "scopes", logged)
 	}
 	var webhook *alert.Webhook
 	if webhookURL != "" {
@@ -681,7 +687,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		BeforeUpload: poster.BeforeUpload}
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
-		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Request: *upgradeRequest, HandedOff: proc.Exit(),
+		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Scopes: scopes, Request: *upgradeRequest, HandedOff: proc.Exit(),
 		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Ops: cfg.ops(), Auto: cfg.auto(),
 		Interval: upgradeTimings.interval, Wait: upgradeTimings.wait, Poll: upgradeTimings.poll, Fetch: upgradeTimings.fetch,
 		Send: func(ctx context.Context, client string, payload []byte) error {

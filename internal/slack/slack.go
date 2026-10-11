@@ -87,8 +87,9 @@ type ChannelInfo struct {
 
 // API is what the hub needs from Slack.
 type API interface {
-	// Self returns the Slack user id of the bot the token belongs to.
-	Self(ctx context.Context) (string, error)
+	// Self returns the Slack user id of the bot the token belongs to,
+	// and the scopes the token has; nil scopes means Slack did not say.
+	Self(ctx context.Context) (bot string, scopes []string, err error)
 	// Replies returns the messages of the thread that starts at ts in
 	// channel, the first message included, oldest first.
 	Replies(ctx context.Context, channel, ts string) ([]Message, error)
@@ -343,6 +344,8 @@ const FakeBot = "fednet"
 // Fake is an API kept in memory, for tests. Its zero value has no
 // channels; AddChannel adds one.
 type Fake struct {
+	// Scopes is what Self reports; it is set before use.
+	Scopes   []string
 	mu       sync.Mutex
 	channels map[string]*fakeChannel
 	dms      map[string][]string
@@ -468,7 +471,7 @@ func (f *Fake) Conversations(context.Context) ([]Conversation, error) {
 	return cs, nil
 }
 
-func (f *Fake) Self(context.Context) (string, error) { return FakeBot, nil }
+func (f *Fake) Self(context.Context) (string, []string, error) { return FakeBot, f.Scopes, nil }
 
 // Post posts as the bot.
 func (f *Fake) Post(_ context.Context, channel, text string) (string, error) {

@@ -35,11 +35,13 @@ type request struct {
 
 // testSlack stands in for Slack's Web API. answer gets each request and
 // returns the HTTP status and the JSON body; a 429 comes with retryAfter
-// in Retry-After. answer runs with mu held, so a test changes what it
+// in Retry-After, and every response with scopes, when set, in
+// X-OAuth-Scopes. answer runs with mu held, so a test changes what it
 // answers under mu.
 type testSlack struct {
 	mu         sync.Mutex
 	retryAfter string
+	scopes     string
 	requests   []request
 	waits      []time.Duration
 }
@@ -59,13 +61,16 @@ func newTestWeb(t *testing.T, answer func(r request) (int, string)) (*Web, *test
 		if status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", ts.retryAfter)
 		}
+		if ts.scopes != "" {
+			w.Header().Set("X-OAuth-Scopes", ts.scopes)
+		}
 		ts.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-	w := &Web{c: slackgo.New(testToken, slackgo.OptionAPIURL(srv.URL+"/")), token: testToken, base: srv.URL + "/", files: &http.Client{}}
+	w := &Web{c: newClient(testToken, slackgo.OptionAPIURL(srv.URL+"/")), token: testToken, base: srv.URL + "/", files: &http.Client{}}
 	w.sleep = func(_ context.Context, d time.Duration) error {
 		ts.mu.Lock()
 		defer ts.mu.Unlock()
@@ -114,7 +119,7 @@ func TestWeb(t *testing.T) {
 		return 200, `{"ok":false,"error":"unknown_method"}`
 	})
 
-	if self, err := w.Self(ctx); err != nil || self != "UBOT" {
+	if self, _, err := w.Self(ctx); err != nil || self != "UBOT" {
 		t.Errorf("Self = %q, %v; want UBOT", self, err)
 	}
 	ms, err := w.Replies(ctx, "C1", "1.1")
@@ -182,6 +187,27 @@ func TestWeb(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, wantSent) {
 		t.Errorf("requests = %v, want %v", got, wantSent)
+	}
+}
+
+// Self reads the token's scopes off the X-OAuth-Scopes header of the
+// auth.test response, and reports nil when Slack sends none.
+func TestWebSelfScopes(t *testing.T) {
+	w, ts, _ := newTestWeb(t, func(request) (int, string) {
+		return 200, `{"ok":true,"user_id":"UBOT"}`
+	})
+	ts.mu.Lock()
+	ts.scopes = "chat:write, channels:history,groups:read"
+	ts.mu.Unlock()
+	bot, scopes, err := w.Self(t.Context())
+	if want := []string{"chat:write", "channels:history", "groups:read"}; err != nil || bot != "UBOT" || !slices.Equal(scopes, want) {
+		t.Errorf("Self = %q, %q, %v; want UBOT, %q", bot, scopes, err, want)
+	}
+	ts.mu.Lock()
+	ts.scopes = ""
+	ts.mu.Unlock()
+	if bot, scopes, err := w.Self(t.Context()); err != nil || bot != "UBOT" || scopes != nil {
+		t.Errorf("without the header Self = %q, %q, %v; want UBOT and nil scopes", bot, scopes, err)
 	}
 }
 

@@ -82,7 +82,7 @@ hub 和 client 都不改自己的二进制。要升级时它们只写一个升�
 
 升级怎么触发，三条路都走上面这套单元：
 
-- Slack 里的 slash command `/fednet`。正式 app 的 manifest 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
+- Slack 里的 slash command `/fednet`。正式 app 的 manifest 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、bot token 已有的 scope (hub 启动时从 `auth.test` 响应的 `X-OAuth-Scopes` 头读到，读不到就是 `unknown`，启动日志里也记一行)、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
 - hub 每小时查一次最新的 release，有新的就自己开始升级；配置里 `upgrade.auto` 设成 `false` 就只留手动。hub 跑的不是发布版 (`fednet version` 打出 `dev`) 时不查，也不能从 Slack 升级。
 - agent 机器上的 `fednet client ops -socket <client 的 socket> upgrade`，例如用户在 Slack 里让 workstation 上的 agent 把 fednet 升级一下。hub 配置里 `ops.upgrade` 列出的 client 才能用 (`ops.version` 管同一条命令的 `version`，读数和 `/fednet version` 一样)，没列的一律拒绝，认的是 client 连 hub 用的凭证，不是请求里写的名字。它和点「升级」走同一条路、只能升到最新的 release，hub 开始升级就返回，不等做完，进度看报警 channel；已是最新就只回一句。每次请求，不论成功、失败还是被拒，hub 都在执行之前先写一行日志、执行完再写一行结果，再在报警 channel 发一条，写明哪台 client、什么操作、结果；报警 channel 积压太多条没发出去时，hub 不执行新的请求，回「hub 忙」(退 5)，过一会儿再试。这条命令只在人要求时用，agent 不自己决定升级。
 

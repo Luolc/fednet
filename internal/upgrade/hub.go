@@ -72,6 +72,9 @@ type Hub struct {
 	// Slack answers the clicks through their response URLs; nil means
 	// the clicker is not answered.
 	Slack slack.API
+	// Scopes is what Slack.Self reported of the bot token's scopes; nil
+	// means unknown.
+	Scopes []string
 	// Request is the path the hub's own upgrade request is written to;
 	// empty means the hub cannot upgrade itself, and `/fednet upgrade` is
 	// refused.
@@ -175,7 +178,8 @@ func (h *Hub) Command(ctx context.Context, c slack.Command) (slack.CommandReply,
 }
 
 // version answers `/fednet version`: the hub's version, the latest
-// release, and each client's version and whether it is online.
+// release, the bot token's scopes, and each client's version and whether
+// it is online.
 func (h *Hub) version(ctx context.Context) (slack.CommandReply, error) {
 	text, err := h.versionText(ctx)
 	return slack.CommandReply{Text: text}, err
@@ -193,6 +197,13 @@ func (h *Hub) versionText(ctx context.Context) (string, error) {
 	h.mu.Unlock()
 	if target != "" {
 		lines = append(lines, "正在升级到 "+target)
+	}
+	if h.Slack != nil {
+		scopes := "unknown"
+		if h.Scopes != nil {
+			scopes = strings.Join(h.Scopes, ", ")
+		}
+		lines = append(lines, "Slack scope："+scopes)
 	}
 	clients, err := h.clients(ctx)
 	if err != nil {
