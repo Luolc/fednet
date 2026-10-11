@@ -340,7 +340,8 @@ func TestApprovalExpires(t *testing.T) {
 	rig.stop(t)
 }
 
-// Without the key the hub refuses a request outright: no card, exit 3.
+// Without the key the hub refuses a request for approval outright: no
+// card, exit 3.
 func TestApprovalOffWithoutKey(t *testing.T) {
 	ctx := t.Context()
 	rig := startApprovalRig(t, false)
@@ -358,8 +359,8 @@ func TestApprovalOffWithoutKey(t *testing.T) {
 	if _, cards := rig.f.Cards("C9"); len(cards) != 0 {
 		t.Fatalf("cards = %+v, want none", cards)
 	}
-	if !strings.Contains(rig.stderr.String(), "approvals are off") {
-		t.Fatal("the hub did not log that approvals are off")
+	if !strings.Contains(rig.stderr.String(), "no approval key, only route requests are approved") {
+		t.Fatal("the hub did not log that it approves only route requests")
 	}
 	rig.stop(t)
 }

@@ -60,6 +60,15 @@ const (
 	// card. It returns the approval id; the outcome comes down the link
 	// later.
 	RequestApproval = "request-approval"
+	// RequestRoute asks the people on the approver list to approve
+	// Route, a change of one route: Text says why, Agent is the agent
+	// that asks and Requester, if set, the person it says it asks on
+	// behalf of, as for RequestApproval. It returns the approval id; once
+	// approved, the hub makes the change itself, and the outcome comes
+	// down the link as an approval's does, unsigned.
+	RequestRoute = "request-route"
+	// Routes returns every route.
+	Routes = "routes"
 	// Ops carries out Op, one of the fixed operations the hub's config
 	// allows the requesting client, and returns the answer as Text.
 	Ops = "ops"
@@ -92,6 +101,23 @@ type Request struct {
 	MsgID string `json:"msg_id,omitempty"`
 	// Mentions is the argument of CheckMentions: Slack user ids.
 	Mentions []string `json:"mentions,omitempty"`
+	// Route is the argument of RequestRoute.
+	Route *RouteRequest `json:"route,omitempty"`
+}
+
+// RouteRequest is a change of one route that RequestRoute asks for: the
+// route of Channel becomes Machine, Scope and OpenThread, or, with Delete,
+// goes.
+type RouteRequest struct {
+	// Channel is a Slack channel id, or store.DMRoute.
+	Channel string `json:"channel"`
+	Machine string `json:"machine,omitempty"`
+	Scope   string `json:"scope,omitempty"`
+	// OpenThread replaces the clients that may open threads in the
+	// channel; nil keeps those of the route there is, and gives a new
+	// route Machine alone.
+	OpenThread *[]string `json:"open_thread,omitempty"`
+	Delete     bool      `json:"delete,omitempty"`
 }
 
 // User is one person on the user list.
@@ -110,6 +136,7 @@ type Reply struct {
 	Threads    []string        `json:"threads,omitempty"`
 	Users      []User          `json:"users,omitempty"`
 	ApprovalID string          `json:"approval_id,omitempty"`
+	Routes     []store.Route   `json:"routes,omitempty"`
 }
 
 // Server answers requests on the hub. Its Answer is meant for
@@ -119,15 +146,12 @@ type Server struct {
 	// Slack is nil until the hub is connected to Slack; requests that need
 	// it fail until then.
 	Slack slack.API
-	// OpenThread maps a channel to the clients that may open threads in
-	// it. A client may open threads only in the channels that list it.
-	OpenThread map[string][]string
 	// Users is the user list: the Slack user id of each person fednet
 	// serves, mapped to a name for the agents, which may be empty. Only
 	// people on it get direct messages.
 	Users map[string]string
 	// Approvals runs the approvals; nil means the hub cannot give any, and
-	// RequestApproval is refused.
+	// RequestApproval and RequestRoute are refused.
 	Approvals *approval.Flow
 	// MaxFetchBytes is the largest file Fetch serves. Zero means
 	// DefaultMaxFetchBytes.
@@ -303,6 +327,10 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		err = s.dm(ctx, r)
 	case RequestApproval:
 		reply.ApprovalID, err = s.requestApproval(ctx, client, r)
+	case RequestRoute:
+		reply.ApprovalID, err = s.requestRoute(ctx, client, r)
+	case Routes:
+		reply.Routes, err = s.Store.Routes(ctx)
 	case Ops:
 		if s.Ops == nil {
 			err = link.Refuse(link.ErrDenied, "the hub runs no ops")
@@ -351,8 +379,9 @@ func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {
 var deleteTimeout = 30 * time.Second
 
 // openThread posts the thread, then records its owner, with the channel's
-// name when Slack gives it. If recording fails it deletes the message it
-// posted, so no thread is left in Slack without an owner, and fails.
+// name when Slack gives it and the scope of the channel's route. If
+// recording fails it deletes the message it posted, so no thread is left
+// in Slack without an owner, and fails.
 func (s *Server) openThread(ctx context.Context, client string, r Request) (Reply, error) {
 	if r.Channel == "" || r.Text == "" {
 		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
@@ -360,7 +389,11 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	if err := checkLength(r.Text); err != nil {
 		return Reply{}, err
 	}
-	if !slices.Contains(s.OpenThread[r.Channel], client) {
+	rt, err := s.Store.Route(ctx, r.Channel)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return Reply{}, err
+	}
+	if r.Channel == store.DMRoute || !slices.Contains(rt.OpenThread, client) {
 		return Reply{}, link.Refuse(link.ErrDenied, "client %s may not open threads in %s", client, r.Channel)
 	}
 	if s.Slack == nil {
@@ -380,7 +413,7 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	} else {
 		name = info.Name
 	}
-	if err := s.Store.Claim(ctx, key, client, name); err != nil {
+	if err := s.Store.Claim(ctx, key, client, name, rt.Scope); err != nil {
 		// The caller may have given up already; the message goes anyway,
 		// within deleteTimeout.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteTimeout)
@@ -541,6 +574,98 @@ func (s *Server) requestApproval(ctx context.Context, client string, r Request) 
 		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
 	}
 	id, err := s.Approvals.Request(ctx, client, r.Agent, r.Requester, r.Text, r.Action)
+	switch {
+	case errors.Is(err, approval.ErrOff):
+		return "", link.Refuse(link.ErrDenied, "%v", err)
+	case errors.Is(err, approval.ErrTooBig):
+		return "", link.Refuse(link.ErrBadRequest, "%v", err)
+	}
+	return id, err
+}
+
+// Patterns of a route's channel and scope.
+var (
+	channelID = regexp.MustCompile(`^[A-Z0-9]+$`)
+	scopeName = regexp.MustCompile(`^[a-z0-9-]+$`)
+)
+
+// requestRoute checks the change r asks for against the routes as they
+// are, makes it whole, and posts its card; the card shows the route the
+// channel will have, which is what an approval sets.
+func (s *Server) requestRoute(ctx context.Context, client string, r Request) (string, error) {
+	q := r.Route
+	switch {
+	case r.Agent == "" || r.Text == "" || q == nil:
+		return "", link.Refuse(link.ErrBadRequest, "needs an agent, a text and a route")
+	case q.Channel != store.DMRoute && !channelID.MatchString(q.Channel):
+		return "", link.Refuse(link.ErrBadRequest, "%q is neither a Slack channel id nor %s", q.Channel, store.DMRoute)
+	case s.Approvals == nil:
+		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
+	}
+	// A card shows the whole route the channel will have, which its
+	// approval writes; a second card for the channel, made from the same
+	// route, would undo the first's change when approved after it.
+	pending, err := s.Store.PendingApprovals(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, a := range pending {
+		var c approval.RouteChange
+		if a.Kind == store.KindRoute && json.Unmarshal(a.Action, &c) == nil && c.Channel == q.Channel {
+			return "", link.Refuse(link.ErrBusy, "the route of %s has a request waiting for approval (%s); ask again once it is decided", q.Channel, a.ID)
+		}
+	}
+	current, err := s.Store.Route(ctx, q.Channel)
+	exists := err == nil
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return "", err
+	}
+	change := approval.RouteChange{Route: store.Route{Channel: q.Channel}, Delete: q.Delete}
+	if q.Delete {
+		switch {
+		case q.Machine != "" || q.Scope != "" || q.OpenThread != nil:
+			return "", link.Refuse(link.ErrBadRequest, "a delete takes nothing but the channel")
+		case !exists:
+			return "", link.Refuse(link.ErrNotFound, "no route for %s", q.Channel)
+		}
+		return s.postRouteRequest(ctx, client, r, change)
+	}
+	if q.Scope != "" && !scopeName.MatchString(q.Scope) {
+		return "", link.Refuse(link.ErrBadRequest, "scope %q is not [a-z0-9-]", q.Scope)
+	}
+	change.Machine, change.Scope = q.Machine, q.Scope
+	switch {
+	case q.Channel == store.DMRoute:
+		if q.Machine == "" || q.OpenThread != nil {
+			return "", link.Refuse(link.ErrBadRequest, "the route of direct messages needs a machine and takes no open_thread")
+		}
+	case q.OpenThread != nil:
+		change.OpenThread = *q.OpenThread
+	case exists:
+		change.OpenThread = current.OpenThread
+	case q.Machine != "":
+		change.OpenThread = []string{q.Machine}
+	}
+	if q.Machine == "" && len(change.OpenThread) == 0 {
+		return "", link.Refuse(link.ErrBadRequest, "the route would do nothing: give a machine or open_thread, or delete it")
+	}
+	for _, c := range append([]string{q.Machine}, change.OpenThread...) {
+		if c == "" {
+			continue
+		}
+		reg, err := s.Store.Registration(ctx, c)
+		if errors.Is(err, store.ErrNotFound) || err == nil && reg.Revoked {
+			return "", link.Refuse(link.ErrBadRequest, "no client %s", c)
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return s.postRouteRequest(ctx, client, r, change)
+}
+
+func (s *Server) postRouteRequest(ctx context.Context, client string, r Request, change approval.RouteChange) (string, error) {
+	id, err := s.Approvals.RequestRoute(ctx, client, r.Agent, r.Requester, r.Text, change)
 	switch {
 	case errors.Is(err, approval.ErrOff):
 		return "", link.Refuse(link.ErrDenied, "%v", err)

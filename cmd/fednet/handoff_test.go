@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -781,5 +783,78 @@ func TestHubReadyWaitsForSlack(t *testing.T) {
 				t.Fatal("the hub reported ready although Slack rejected its token")
 			}
 		})
+	}
+}
+
+// Importing the config's routes is part of a new hub's start, in one
+// transaction: while it fails, the new hub is never ready, the handoff
+// fails, the old hub serves on and no route is left half imported; once
+// it succeeds, the routes are in the database, and the
+// next hub leaves them be and warns that the config's are ignored.
+func TestHubHandoffImportsRoutes(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	config := filepath.Join(dir, "hub.json")
+	writeConfig := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(config, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig(`{}`)
+	old, _, admin := startHub(t, dir, "-config", config)
+	path := filepath.Join(dir, "hub.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// The import fails at its second route, dm, after C1 is written: the
+	// transaction leaves neither.
+	if _, err := db.ExecContext(ctx, "CREATE TRIGGER no_route BEFORE INSERT ON route WHEN NEW.channel = 'dm' BEGIN SELECT RAISE(ABORT, 'no route'); END"); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(`{"channels": {"C1": {"machine": "workstation", "open_thread": ["workstation"]}}, "dm": {"machine": "workstation"}}`)
+	code, _, stderr := handoffThrough(t, "hub", admin)
+	if code != 1 || !strings.Contains(stderr, "importing the config's routes") {
+		t.Fatalf("handoff with the import failing exited %d with %q, want 1 and the import's error", code, stderr)
+	}
+	if got := versionThrough(t, admin); got.PID != old.cmd.Process.Pid {
+		t.Fatalf("version through the admin socket = %+v, want the old hub, pid %d", got, old.cmd.Process.Pid)
+	}
+	hs := openHubStore(t, path)
+	if rs, err := hs.Routes(ctx); err != nil || len(rs) != 0 {
+		t.Fatalf("routes after the failed import = %+v, %v; want none", rs, err)
+	}
+
+	if _, err := db.ExecContext(ctx, "DROP TRIGGER no_route"); err != nil {
+		t.Fatal(err)
+	}
+	code, res, stderr := handoffThrough(t, "hub", admin)
+	if code != 0 {
+		t.Fatalf("handoff exited %d: %s", code, stderr)
+	}
+	if code := old.wait(t); code != 0 {
+		t.Fatalf("the old hub exited %d, want 0", code)
+	}
+	want := []store.Route{{Channel: "C1", Machine: "workstation", OpenThread: []string{"workstation"}}, {Channel: store.DMRoute, Machine: "workstation"}}
+	if rs, err := hs.Routes(ctx); err != nil || !reflect.DeepEqual(rs, want) {
+		t.Fatalf("routes after the handoff = %+v, %v; want %+v", rs, err, want)
+	}
+	if !strings.Contains(old.out.String(), "imported the config's routes into the database") {
+		t.Fatal("the new hub did not log the import")
+	}
+
+	code, res2, stderr := handoffThrough(t, "hub", admin)
+	if code != 0 {
+		t.Fatalf("second handoff exited %d: %s", code, stderr)
+	}
+	waitFor(t, "the first successor to exit", func() bool { return processGone(res.To.PID) })
+	defer terminate(t, res2.To.PID)
+	if !strings.Contains(old.out.String(), "ignoring the config's channels and dm") {
+		t.Fatal("the next hub did not warn that the config's routes are ignored")
+	}
+	if changes, err := hs.UnpostedRouteChanges(ctx); err != nil || len(changes) != 1 {
+		t.Fatalf("changes = %+v, %v; want the one import", changes, err)
 	}
 }

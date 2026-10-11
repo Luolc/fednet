@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,7 +27,13 @@ import (
 
 func testServer(t *testing.T) (*Server, *slack.Fake) {
 	t.Helper()
-	st, err := store.OpenHub(t.Context(), filepath.Join(t.TempDir(), "hub.db"))
+	return testServerAt(t, filepath.Join(t.TempDir(), "hub.db"))
+}
+
+// testServerAt is testServer with its database at path.
+func testServerAt(t *testing.T, path string) (*Server, *slack.Fake) {
+	t.Helper()
+	st, err := store.OpenHub(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +41,14 @@ func testServer(t *testing.T) (*Server, *slack.Fake) {
 	f := &slack.Fake{}
 	f.AddChannel("C1", "repo: fednet")
 	return &Server{Store: st, Slack: f}, f
+}
+
+// setRoute makes rt the route of its channel.
+func setRoute(t *testing.T, h *store.Hub, rt store.Route) {
+	t.Helper()
+	if err := h.SetRoute(t.Context(), rt.Channel, &rt, store.RouteChange{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // answer sends r to s as client and decodes the reply.
@@ -95,7 +110,7 @@ func TestAdopt(t *testing.T) {
 	s, _ := testServer(t)
 	ctx := t.Context()
 	const key = "C1/1700000000.000100"
-	if _, _, err := s.Store.ClaimAndEnqueue(ctx, key, "old-workstation", "", []byte("first")); err != nil {
+	if _, _, err := s.Store.ClaimAndEnqueue(ctx, key, "old-workstation", "", "", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := answer(t, s, "workstation", Request{Cmd: Adopt, Thread: key}); err != nil {
@@ -151,7 +166,7 @@ func TestWithoutSlack(t *testing.T) {
 	s, _ := testServer(t)
 	s.Slack = nil
 	const key = "C1/1700000000.000100"
-	if _, _, err := s.Store.ClaimAndEnqueue(t.Context(), key, "old-workstation", "", []byte("first")); err != nil {
+	if _, _, err := s.Store.ClaimAndEnqueue(t.Context(), key, "old-workstation", "", "", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := answer(t, s, "workstation", Request{Cmd: ReadThread, Thread: key}); !errors.Is(err, errNoSlack) {
@@ -179,7 +194,9 @@ func TestOpenThread(t *testing.T) {
 	f.AddChannel("C2", "")
 	posts := &countPosts{API: f}
 	s.Slack = posts
-	s.OpenThread = map[string][]string{"C1": {"workstation"}, "C9": {"workstation"}}
+	setRoute(t, s.Store, store.Route{Channel: "C1", Scope: "control-plane", OpenThread: []string{"workstation"}})
+	setRoute(t, s.Store, store.Route{Channel: "C9", OpenThread: []string{"workstation"}})
+	setRoute(t, s.Store, store.Route{Channel: store.DMRoute, Machine: "workstation"})
 	ctx := t.Context()
 
 	got, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
@@ -199,6 +216,9 @@ func TestOpenThread(t *testing.T) {
 	if name, err := s.Store.ChannelName(ctx, got.Thread); err != nil || name != "example-one" {
 		t.Fatalf("channel name of the new thread = %q, %v; want example-one", name, err)
 	}
+	if scope, err := s.Store.ThreadScope(ctx, got.Thread); err != nil || scope != "control-plane" {
+		t.Fatalf("scope of the new thread = %q, %v; want control-plane, its channel's", scope, err)
+	}
 
 	tests := []struct {
 		name   string
@@ -207,7 +227,8 @@ func TestOpenThread(t *testing.T) {
 		want   error
 	}{
 		{"a client the channel does not list", "datamachine", Request{Cmd: OpenThread, Channel: "C1", Text: "x"}, link.ErrDenied},
-		{"a channel the config does not list", "workstation", Request{Cmd: OpenThread, Channel: "C2", Text: "x"}, link.ErrDenied},
+		{"a channel with no route", "workstation", Request{Cmd: OpenThread, Channel: "C2", Text: "x"}, link.ErrDenied},
+		{"direct messages", "workstation", Request{Cmd: OpenThread, Channel: store.DMRoute, Text: "x"}, link.ErrDenied},
 		{"a channel Slack does not know", "workstation", Request{Cmd: OpenThread, Channel: "C9", Text: "x"}, link.ErrNotFound},
 		{"no text", "workstation", Request{Cmd: OpenThread, Channel: "C1"}, link.ErrBadRequest},
 		{"a text over MaxTextChars", "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: strings.Repeat("字", MaxTextChars+1)}, link.ErrBadRequest},
@@ -237,7 +258,7 @@ func TestOpenThreadWithoutChannelName(t *testing.T) {
 	s, f := testServer(t)
 	f.RenameChannel("C1", "example-one")
 	s.Slack = noChannelInfo{f}
-	s.OpenThread = map[string][]string{"C1": {"workstation"}}
+	setRoute(t, s.Store, store.Route{Channel: "C1", OpenThread: []string{"workstation"}})
 	got, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
 	if err != nil {
 		t.Fatal(err)
@@ -258,11 +279,17 @@ type lastPost struct {
 	failDelete bool
 	// hangDelete makes Delete wait until its context is done.
 	hangDelete bool
+	// posted, if set, is called after a Post, once.
+	posted func()
 }
 
 func (l *lastPost) Post(ctx context.Context, channel, text string) (string, error) {
 	ts, err := l.API.Post(ctx, channel, text)
 	l.ts = ts
+	if l.posted != nil {
+		l.posted()
+		l.posted = nil
+	}
 	return ts, err
 }
 
@@ -283,14 +310,23 @@ func (l *lastPost) Delete(ctx context.Context, channel, ts string) error {
 // When the owner of a new thread cannot be recorded, its message is
 // deleted and the caller gets an error.
 func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
-	s, f := testServer(t)
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "hub.db")
+	s, f := testServerAt(t, path)
 	posts := &lastPost{API: f}
 	s.Slack = posts
-	s.OpenThread = map[string][]string{"C1": {"workstation"}}
-	s.Store.Close()
-	ctx := t.Context()
+	setRoute(t, s.Store, store.Route{Channel: "C1", OpenThread: []string{"workstation"}})
+	// Every owner the hub records fails, after the route is read.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "CREATE TRIGGER no_owner BEFORE INSERT ON owner BEGIN SELECT RAISE(ABORT, 'no owner'); END"); err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
+	_, err = answer(t, s, "workstation", Request{Cmd: OpenThread, Channel: "C1", Text: "nightly report"})
 	if err == nil || !strings.Contains(err.Error(), "deleted") {
 		t.Fatalf("open-thread with a failing store = %v, want an error saying the message was deleted", err)
 	}
@@ -301,11 +337,15 @@ func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
 		t.Fatalf("the thread is still in Slack: %v", err)
 	}
 
-	// The caller has given up: the message is deleted all the same.
+	// The caller gives up once the message is posted: it is deleted all
+	// the same.
 	req := []byte(`{"cmd":"open-thread","channel":"C1","text":"nightly report"}`)
-	canceled, cancel := context.WithCancel(ctx)
-	cancel()
-	if _, err := s.Answer(canceled, "workstation", req); err == nil || !strings.Contains(err.Error(), "deleted") {
+	givesUp := func() context.Context {
+		c, cancel := context.WithCancel(ctx)
+		posts.posted = cancel
+		return c
+	}
+	if _, err := s.Answer(givesUp(), "workstation", req); err == nil || !strings.Contains(err.Error(), "deleted") {
 		t.Fatalf("open-thread for a caller that gave up = %v, want the message deleted", err)
 	}
 	if _, err := f.Replies(ctx, "C1", posts.ts); !errors.Is(err, slack.ErrNotFound) {
@@ -323,7 +363,7 @@ func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
 	posts.failDelete, posts.hangDelete = false, true
 	defer func(d time.Duration) { deleteTimeout = d }(deleteTimeout)
 	deleteTimeout = 10 * time.Millisecond
-	if _, err := s.Answer(canceled, "workstation", req); err == nil || !strings.Contains(err.Error(), "stays in Slack") {
+	if _, err := s.Answer(givesUp(), "workstation", req); err == nil || !strings.Contains(err.Error(), "stays in Slack") {
 		t.Fatalf("open-thread when the delete hangs = %v, want an error saying the thread stays", err)
 	}
 }
@@ -331,7 +371,7 @@ func TestOpenThreadUndoneWhenClaimFails(t *testing.T) {
 func TestThreads(t *testing.T) {
 	s, _ := testServer(t)
 	for thread, client := range map[string]string{"C1/2": "workstation", "C1/1": "workstation", "C1/3": "datamachine"} {
-		if err := s.Store.Claim(t.Context(), thread, client, ""); err != nil {
+		if err := s.Store.Claim(t.Context(), thread, client, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -542,6 +582,101 @@ func TestRequestApproval(t *testing.T) {
 	_, cards := f.Cards("C9")
 	if len(cards) != 1 || cards[0].ID != reply.ApprovalID || cards[0].Params != string(action) || cards[0].Machine != "workstation" || cards[0].Agent != "ops-exec" {
 		t.Fatalf("cards = %+v, want one for %s from ops-exec on workstation with the action as given", cards, reply.ApprovalID)
+	}
+}
+
+// request-route checks the change against the routes and the clients the
+// hub knows, makes it whole and posts its card; the hub needs no key for
+// it, but approvers and their channel.
+func TestRequestRoute(t *testing.T) {
+	s, f := testServer(t)
+	f.AddChannel("C9", "approvals")
+	ctx := t.Context()
+	for _, c := range []string{"workstation", "datamachine", "retired"} {
+		if err := s.Store.Register(ctx, c, []byte("h")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Store.Revoke(ctx, "retired"); err != nil {
+		t.Fatal(err)
+	}
+	setRoute(t, s.Store, store.Route{Channel: "C2", Machine: "datamachine", OpenThread: []string{"datamachine", "workstation"}})
+	req := func(q RouteRequest) Request {
+		return Request{Cmd: RequestRoute, Agent: "lead", Text: "new repo", Route: &q}
+	}
+	add := req(RouteRequest{Channel: "C1", Machine: "workstation", Scope: "control-plane"})
+	if _, err := answer(t, s, "workstation", add); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "not set up") {
+		t.Fatalf("request-route without approvals = %v, want denied as not set up", err)
+	}
+	s.Approvals = &approval.Flow{Store: s.Store, Slack: f, Channel: "C9", Approvers: []string{"U1"}}
+	none := []string{}
+	tests := []struct {
+		name string
+		req  Request
+		want error
+	}{
+		{"no agent", Request{Cmd: RequestRoute, Text: "x", Route: &RouteRequest{Channel: "C1", Machine: "workstation"}}, link.ErrBadRequest},
+		{"no text", Request{Cmd: RequestRoute, Agent: "a", Route: &RouteRequest{Channel: "C1", Machine: "workstation"}}, link.ErrBadRequest},
+		{"no route", Request{Cmd: RequestRoute, Agent: "a", Text: "x"}, link.ErrBadRequest},
+		{"not a channel id", req(RouteRequest{Channel: "#repo-fednet", Machine: "workstation"}), link.ErrBadRequest},
+		{"a scope out of [a-z0-9-]", req(RouteRequest{Channel: "C1", Machine: "workstation", Scope: "Control_Plane"}), link.ErrBadRequest},
+		{"an unknown machine", req(RouteRequest{Channel: "C1", Machine: "nobody"}), link.ErrBadRequest},
+		{"a revoked machine", req(RouteRequest{Channel: "C1", Machine: "retired"}), link.ErrBadRequest},
+		{"an unknown client to open threads", req(RouteRequest{Channel: "C1", Machine: "workstation", OpenThread: &[]string{"nobody"}}), link.ErrBadRequest},
+		{"a route that does nothing", req(RouteRequest{Channel: "C1", OpenThread: &none}), link.ErrBadRequest},
+		{"direct messages with no machine", req(RouteRequest{Channel: store.DMRoute}), link.ErrBadRequest},
+		{"direct messages with open_thread", req(RouteRequest{Channel: store.DMRoute, Machine: "workstation", OpenThread: &none}), link.ErrBadRequest},
+		{"a delete of no route", req(RouteRequest{Channel: "C1", Delete: true}), link.ErrNotFound},
+		{"a delete with a machine", req(RouteRequest{Channel: "C2", Machine: "workstation", Delete: true}), link.ErrBadRequest},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, tt.want) {
+			t.Errorf("%s: request-route = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if _, cards := f.Cards("C9"); len(cards) != 0 {
+		t.Fatalf("cards after refused requests = %+v, want none", cards)
+	}
+
+	// The card shows the route the channel will have: a new route lists
+	// its machine to open threads, one there is keeps its list unless
+	// given another.
+	for _, tt := range []struct {
+		req    Request
+		params string
+	}{
+		{add, `{"channel":"C1","machine":"workstation","scope":"control-plane","open_thread":["workstation"]}`},
+		{req(RouteRequest{Channel: "C2", Machine: "workstation"}), `{"channel":"C2","machine":"workstation","open_thread":["datamachine","workstation"]}`},
+		{req(RouteRequest{Channel: "C2", Machine: "workstation", OpenThread: &none}), `{"channel":"C2","machine":"workstation"}`},
+		{req(RouteRequest{Channel: store.DMRoute, Machine: "datamachine", Scope: "personal"}), `{"channel":"dm","machine":"datamachine","scope":"personal"}`},
+		{req(RouteRequest{Channel: "C2", Delete: true}), `{"channel":"C2","delete":true}`},
+	} {
+		reply, err := answer(t, s, "workstation", tt.req)
+		if err != nil || reply.ApprovalID == "" {
+			t.Fatalf("request-route %+v = %+v, %v; want an approval id", tt.req.Route, reply, err)
+		}
+		_, cards := f.Cards("C9")
+		c := cards[len(cards)-1]
+		var params bytes.Buffer
+		if err := json.Compact(&params, []byte(c.Params)); err != nil {
+			t.Fatal(err)
+		}
+		if c.ID != reply.ApprovalID || params.String() != tt.params || c.Summary != "改路由：new repo" || c.Machine != "workstation" || c.Agent != "lead" {
+			t.Errorf("card for %+v = %+v, want %s with %s", tt.req.Route, c, reply.ApprovalID, tt.params)
+		}
+		// While the card waits, the channel takes no other request.
+		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, link.ErrBusy) {
+			t.Errorf("a second request for %s while one waits = %v, want busy", tt.req.Route.Channel, err)
+		}
+		if _, err := s.Store.DecideApproval(ctx, reply.ApprovalID, func(*store.Hub, store.Approval) (store.Decision, error) {
+			return store.Decision{Status: payload.Rejected, By: "U1", At: time.Now()}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Nothing changes before an approval.
+	if got, err := answer(t, s, "datamachine", Request{Cmd: Routes}); err != nil || len(got.Routes) != 1 || got.Routes[0].Machine != "datamachine" {
+		t.Fatalf("routes = %+v, %v; want C2 to the data machine as before", got.Routes, err)
 	}
 }
 

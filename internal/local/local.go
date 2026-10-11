@@ -26,6 +26,7 @@ import (
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
+	"github.com/Luolc/fednet/internal/store"
 )
 
 // Commands a Request can carry besides those of hubapi, which the daemon
@@ -84,6 +85,8 @@ type Request struct {
 	Close string               `json:"close,omitempty"`
 	// Op is the argument of hubapi.Ops.
 	Op string `json:"op,omitempty"`
+	// Route is the argument of hubapi.RequestRoute.
+	Route *hubapi.RouteRequest `json:"route,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -96,6 +99,7 @@ type Response struct {
 	Threads    []string        `json:"threads,omitempty"`
 	Users      []hubapi.User   `json:"users,omitempty"`
 	ApprovalID string          `json:"approval_id,omitempty"`
+	Routes     []store.Route   `json:"routes,omitempty"`
 	Path       string          `json:"path,omitempty"`
 	Version    string          `json:"version,omitempty"`
 	PID        int             `json:"pid,omitempty"`
@@ -355,7 +359,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		}
 		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
-		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.Ops, hubapi.Delete:
+		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.Routes, hubapi.Ops, hubapi.Delete:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
@@ -486,7 +490,7 @@ var kinds = []struct {
 // ask hands req to the hub and replies with the hub's answer.
 func (s *Server) ask(ctx context.Context, req Request) Response {
 	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User,
-		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op, MsgID: req.MsgID, Mentions: req.Mentions})
+		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op, MsgID: req.MsgID, Mentions: req.Mentions, Route: req.Route})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -504,7 +508,7 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err := json.Unmarshal(answer, &reply); err != nil {
 		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
 	}
-	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID}
+	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID, Routes: reply.Routes}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An

@@ -141,6 +141,10 @@ func OpenHub(ctx context.Context, path string) (*Hub, error) {
 	if err != nil {
 		return nil, err
 	}
+	if _, err := db.ExecContext(ctx, routeSchema); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Hub{db: db, conn: db, Outbox: HubOutbox{db}, Inbox: HubInbox{Inbox{db}}}, nil
 }
 
@@ -169,14 +173,22 @@ func (h *Hub) transact(ctx context.Context, f func(tx *Hub) error) error {
 // transaction: client becomes the owner of thread unless it already has one,
 // and payload is queued for whichever client the owner then is. It returns
 // that owner. Of several concurrent calls on a new thread, the first wins and
-// all of them queue for its client. channelName is recorded with the owner
-// it makes, as Claim records it.
-func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client, channelName string, payload []byte) (owner string, d Downlink, err error) {
+// all of them queue for its client. channelName and scope are recorded with
+// the owner it makes, as Claim records them.
+func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client, channelName, scope string, payload []byte) (owner string, d Downlink, err error) {
 	err = h.transact(ctx, func(tx *Hub) error {
-		if _, err := tx.db.ExecContext(ctx,
+		res, err := tx.db.ExecContext(ctx,
 			"INSERT INTO owner (thread, client_id, channel_name) VALUES (?, ?, ?) ON CONFLICT (thread) DO NOTHING",
-			thread, client, channelName); err != nil {
+			thread, client, channelName)
+		if err != nil {
 			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 1 {
+			if err := putScope(ctx, tx.db, thread, scope); err != nil {
+				return err
+			}
 		}
 		if err := tx.db.QueryRowContext(ctx, "SELECT client_id FROM owner WHERE thread = ?", thread).Scan(&owner); err != nil {
 			return err
@@ -192,11 +204,16 @@ func (h *Hub) ClaimAndEnqueue(ctx context.Context, thread, client, channelName s
 
 // Claim makes client the owner of thread, a thread that has just been
 // started and has no owner yet; it fails if thread already has one.
-// channelName, the name of the thread's channel, is recorded with the
-// owner and stays with the thread whoever owns it later.
-func (h *Hub) Claim(ctx context.Context, thread, client, channelName string) error {
-	_, err := h.db.ExecContext(ctx, "INSERT INTO owner (thread, client_id, channel_name) VALUES (?, ?, ?)", thread, client, channelName)
-	return err
+// channelName, the name of the thread's channel, and scope, the scope of
+// its messages, are recorded with the owner and stay with the thread
+// whoever owns it later.
+func (h *Hub) Claim(ctx context.Context, thread, client, channelName, scope string) error {
+	return h.transact(ctx, func(tx *Hub) error {
+		if _, err := tx.db.ExecContext(ctx, "INSERT INTO owner (thread, client_id, channel_name) VALUES (?, ?, ?)", thread, client, channelName); err != nil {
+			return err
+		}
+		return putScope(ctx, tx.db, thread, scope)
+	})
 }
 
 // Threads returns the threads client owns, in order of their keys.
