@@ -51,7 +51,7 @@ func TestRouteFlow(t *testing.T) {
 	if m := rig.outcomes(t)[0]; m.ApprovalID != id || m.Outcome != payload.Approved || len(m.Approval) != 0 {
 		t.Fatalf("outcome = %+v, want %s approved, unsigned", m, id)
 	}
-	if got := routes(); got != "C2 workstation data workstation\n" {
+	if got := routes(); got != "C2 workstation data workstation -\n" {
 		t.Fatalf("routes after the approval = %q", got)
 	}
 	waitFor(t, "the change told in C9", func() bool {
@@ -116,8 +116,14 @@ func TestCreateChannelFlow(t *testing.T) {
 		t.Fatalf("created %q, private %v, members %q; want public repo-example with U2", name, private, members)
 	}
 	out = syncBuffer{}
-	if code := run(ctx, []string{"client", "routes", "-socket", rig.socket}, &out, rig.stderr); code != 0 || out.String() != m.Channel+" workstation data workstation\n" {
+	if code := run(ctx, []string{"client", "routes", "-socket", rig.socket}, &out, rig.stderr); code != 0 || out.String() != m.Channel+" workstation data workstation repo-example\n" {
 		t.Fatalf("client routes: exit %d, printed %q; want the new channel's route", code, out.String())
+	}
+	out = syncBuffer{}
+	var routes struct{ Routes []map[string]any }
+	if code := run(ctx, []string{"client", "routes", "-socket", rig.socket, "-json"}, &out, rig.stderr); code != 0 || json.Unmarshal([]byte(out.String()), &routes) != nil ||
+		len(routes.Routes) != 1 || routes.Routes[0]["channel"] != m.Channel || routes.Routes[0]["name"] != "repo-example" {
+		t.Fatalf("client routes -json: exit %d, printed %q; want the new channel's route with its name", code, out.String())
 	}
 	waitFor(t, "the card to say the channel is there", func() bool {
 		c, _ := rig.f.Card("C9", tss[0])

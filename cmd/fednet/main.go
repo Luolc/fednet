@@ -245,7 +245,8 @@ commands:
         for the same name waits for approval
   client routes -socket PATH [-json]
         print the routes: each channel (dm for direct messages), the client
-        that takes its new threads, the scope, and who may open threads
+        that takes its new threads, the scope, who may open threads, and
+        the channel's name as Slack gives it
   client ops -socket PATH [-json] (upgrade | version)
         ask the hub for one of two fixed operations, as this machine; run
         it only when a person asks for it: an agent never decides on its
@@ -1767,8 +1768,8 @@ func clientRequestChannel(ctx context.Context, args []string, stdout io.Writer) 
 }
 
 // clientRoutes prints the hub's routes, one a line: the channel, the
-// client that takes its new threads, the scope and who may open threads,
-// with - for what is not set.
+// client that takes its new threads, the scope, who may open threads and
+// the channel's name, with - for what is not set.
 func clientRoutes(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet client routes", flag.ContinueOnError)
 	socket, asJSON := socketFlags(fs)
@@ -1792,7 +1793,7 @@ func clientRoutes(ctx context.Context, args []string, stdout io.Writer) error {
 		return s
 	}
 	for _, r := range res.Routes {
-		if _, err := fmt.Fprintln(stdout, r.Channel, or(r.Machine), or(r.Scope), or(strings.Join(r.OpenThread, ","))); err != nil {
+		if _, err := fmt.Fprintln(stdout, r.Channel, or(r.Machine), or(r.Scope), or(strings.Join(r.OpenThread, ",")), or(r.Name)); err != nil {
 			return err
 		}
 	}
