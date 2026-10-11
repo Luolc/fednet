@@ -180,7 +180,7 @@ func TestCommand(t *testing.T) {
 		t.Fatalf("someone off the user list got %q", r.Text)
 	}
 	r := b.cmd(t, "U2", "version")
-	for _, want := range []string{"hub：v0.1.0", "最新 release：v0.2.0", "datamachine：v0.1.0 在线", "workstation：v0.1.0 在线"} {
+	for _, want := range []string{"hub：v0.1.0", "最新 release：v0.2.0", "Slack scope：unknown", "datamachine：v0.1.0 在线", "workstation：v0.1.0 在线"} {
 		if !strings.Contains(r.Text, want) {
 			t.Errorf("version = %q, want %q in it", r.Text, want)
 		}
@@ -575,12 +575,13 @@ func (b *bench) nextN(t *testing.T, n int) string {
 // request is said through Alert, refused or not.
 func TestOps(t *testing.T) {
 	b := newBench(t)
+	b.h.Scopes = []string{"chat:write", "channels:history"}
 	b.run(t)
 	text, err := b.h.Op(t.Context(), "workstation", OpVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"hub：v0.1.0", "最新 release：v0.2.0", "datamachine：v0.1.0 在线", "workstation：v0.1.0 在线"} {
+	for _, want := range []string{"hub：v0.1.0", "最新 release：v0.2.0", "Slack scope：chat:write, channels:history", "datamachine：v0.1.0 在线", "workstation：v0.1.0 在线"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("version = %q, want %q in it", text, want)
 		}

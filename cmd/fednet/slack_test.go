@@ -116,7 +116,7 @@ func TestHubWithSlack(t *testing.T) {
 	outboundInterval = time.Hour
 	t.Cleanup(func() { hookRetry, outboundInterval = hook.Retry{}, 0 })
 
-	f := &slack.Fake{}
+	f := &slack.Fake{Scopes: []string{"chat:write", "channels:history"}}
 	f.AddChannel("C1", "repo: fednet")
 	slackFlags, runs := fakeSlack(t, dir, f, nil)
 	wh := &webhook{}
@@ -209,8 +209,12 @@ func TestHubWithSlack(t *testing.T) {
 		reply, err = sr.r.Commands.Command(ctx, slack.Command{Name: "/fednet", Text: "version", User: "U1"})
 		return err == nil && strings.Contains(reply.Text, "workstation：dev 在线")
 	})
-	if !strings.Contains(reply.Text, "hub：dev") || !strings.Contains(reply.Text, "最新 release：查不到") {
+	if !strings.Contains(reply.Text, "hub：dev") || !strings.Contains(reply.Text, "最新 release：查不到") || !strings.Contains(reply.Text, "Slack scope：chat:write, channels:history") {
 		t.Fatalf("/fednet version = %q", reply.Text)
+	}
+	// The hub logged the scopes once at start, and the token nowhere.
+	if logs := stderr.String(); !strings.Contains(logs, `msg="slack: the bot token's scopes" scopes=chat:write,channels:history`) || strings.Contains(logs, testBotToken) {
+		t.Fatal("the hub's logs miss the scopes, or show the bot token")
 	}
 	if reply, _ := sr.r.Commands.Command(ctx, slack.Command{Name: "/fednet", Text: "upgrade", User: "U1"}); !strings.Contains(reply.Text, "不是发布版") {
 		t.Fatalf("/fednet upgrade on a dev hub = %q", reply.Text)
@@ -411,7 +415,9 @@ func TestHubStopsWhenSlackRejectsToken(t *testing.T) {
 // noSelf is a Slack that cannot say which user the bot is.
 type noSelf struct{ slack.API }
 
-func (noSelf) Self(context.Context) (string, error) { return "", errors.New("auth.test: not_authed") }
+func (noSelf) Self(context.Context) (string, []string, error) {
+	return "", nil, errors.New("auth.test: not_authed")
+}
 
 // With Slack, a hub that cannot learn which user its bot is does not
 // start: it could not tell a mention.

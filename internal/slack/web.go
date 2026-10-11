@@ -43,7 +43,30 @@ type Web struct {
 
 // New returns a Web that calls Slack with token, a bot token.
 func New(token string) *Web {
-	return &Web{c: slackgo.New(token), token: token, base: slackgo.APIURL, http: &http.Client{Timeout: responseTimeout}, files: &http.Client{}, sleep: sleep}
+	return &Web{c: newClient(token), token: token, base: slackgo.APIURL, http: &http.Client{Timeout: responseTimeout}, files: &http.Client{}, sleep: sleep}
+}
+
+// newClient returns the Web API client for token, which hands each call
+// the scopes Slack reports for the token; see scopesClient.
+func newClient(token string, options ...slackgo.Option) *slackgo.Client {
+	return slackgo.New(token, append(options, slackgo.OptionHTTPClient(scopesClient{&http.Client{}}))...)
+}
+
+// scopesClient sends the Web API's requests. Slack lists the scopes the
+// token has in the X-OAuth-Scopes header of every response, which
+// slack-go does not return; scopesClient stores that header's value in the
+// *string a call puts in its context under scopesKey, and reads no other
+// header.
+type scopesClient struct{ c *http.Client }
+
+type scopesKey struct{}
+
+func (s scopesClient) Do(r *http.Request) (*http.Response, error) {
+	res, err := s.c.Do(r)
+	if p, ok := r.Context().Value(scopesKey{}).(*string); ok && err == nil {
+		*p = res.Header.Get("X-OAuth-Scopes")
+	}
+	return res, err
 }
 
 // responseTimeout bounds one post to a response URL.
@@ -260,17 +283,26 @@ func redact(token string, err error) error {
 	return errors.New(strings.ReplaceAll(err.Error(), token, "<token>"))
 }
 
-// Self asks auth.test which user the token belongs to.
-func (w *Web) Self(ctx context.Context) (string, error) {
+// Self asks auth.test which user the token belongs to, and reads the
+// token's scopes off the response.
+func (w *Web) Self(ctx context.Context) (string, []string, error) {
 	var res *slackgo.AuthTestResponse
+	var header string
+	ctx = context.WithValue(ctx, scopesKey{}, &header)
 	err := w.call(ctx, "auth.test", func() (err error) {
 		res, err = w.c.AuthTestContext(ctx)
 		return err
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return res.UserID, nil
+	var scopes []string
+	for s := range strings.SplitSeq(header, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			scopes = append(scopes, s)
+		}
+	}
+	return res.UserID, scopes, nil
 }
 
 // History pages through conversations.history, which Slack returns newest
