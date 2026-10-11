@@ -98,6 +98,16 @@ CREATE TABLE progress (
 	ts     TEXT NOT NULL,
 	card   BLOB NOT NULL
 );
+`, `
+-- The Slack ts of each part of a post that is in Slack, recorded with
+-- parts_sent, so that the client that posted it can delete it. Posts that
+-- went out before this table existed have no rows.
+CREATE TABLE post_part (
+	msg_id TEXT NOT NULL,
+	part   INTEGER NOT NULL,
+	ts     TEXT NOT NULL,
+	PRIMARY KEY (msg_id, part)
+);
 `}
 
 // ErrNotFound is returned when a looked-up row does not exist.

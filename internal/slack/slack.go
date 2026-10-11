@@ -108,6 +108,9 @@ type API interface {
 	// PostReply posts text in the thread that starts at ts in channel and
 	// returns the new message's ts.
 	PostReply(ctx context.Context, channel, ts, text string) (string, error)
+	// PostReplyMentioning is PostReply with each of users, Slack user
+	// ids, mentioned at the start of the message.
+	PostReplyMentioning(ctx context.Context, channel, ts, text string, users []string) (string, error)
 	// Delete deletes the message at ts in channel.
 	Delete(ctx context.Context, channel, ts string) error
 	// DM sends text to user as a direct message, which belongs to no
@@ -489,6 +492,16 @@ func (f *Fake) PostReply(_ context.Context, channel, ts, text string) (string, e
 	m := Message{TS: f.next(), User: FakeBot, Text: text}
 	c.threads[ts] = append(c.threads[ts], m)
 	return m.TS, nil
+}
+
+// PostReplyMentioning posts as the bot; the message's Text starts with
+// the mentions, as Slack's plain text does.
+func (f *Fake) PostReplyMentioning(ctx context.Context, channel, ts, text string, users []string) (string, error) {
+	var b strings.Builder
+	for _, u := range users {
+		b.WriteString("<@" + u + "> ")
+	}
+	return f.PostReply(ctx, channel, ts, b.String()+text)
 }
 
 // Delete deletes the message at ts in channel; deleting the first message

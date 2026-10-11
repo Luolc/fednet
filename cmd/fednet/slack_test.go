@@ -344,6 +344,35 @@ func TestHubWithSlack(t *testing.T) {
 		t.Fatalf("footer = %q, %v; want the machine's name at the end", m, ok)
 	}
 
+	// The agent mentions the maintainer, who is on the user list, and
+	// then deletes that post by its msg_id; someone not on the list is
+	// not mentioned, and the post is not queued.
+	var posted syncBuffer
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "-mention", "U1", "your turn"}, &posted, &stderr); code != 0 {
+		t.Fatalf("client post -mention: exit %d", code)
+	}
+	msgID := strings.TrimSpace(posted.String())
+	waitFor(t, "the mention in Slack", func() bool {
+		p, err := hs.Posted(ctx, msgID)
+		return err == nil && p.Delivered
+	})
+	ms, _ = f.Replies(ctx, "C1", ts)
+	if ms[5].Text != "<@U1> your turn" {
+		t.Fatalf("Slack thread ends with %q, want the post mentioning U1", ms[5].Text)
+	}
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "-mention", "U9", "your turn"}, &stdout, &stderr); code != 3 {
+		t.Fatalf("client post -mention of a user not on the list: exit %d, want 3", code)
+	}
+	if code := run(ctx, []string{"client", "delete", "-socket", socket, msgID}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client delete: exit %d", code)
+	}
+	if ms, _ = f.Replies(ctx, "C1", ts); len(ms) != 5 {
+		t.Fatalf("Slack thread after the delete = %+v, want the mention gone", ms)
+	}
+	if code := run(ctx, []string{"client", "delete", "-socket", socket, msgID}, &stdout, &stderr); code != 1 {
+		t.Fatalf("client delete of a post deleted already: exit %d, want 1", code)
+	}
+
 	if code := stopClient(); code != 0 {
 		t.Errorf("client exited %d", code)
 	}

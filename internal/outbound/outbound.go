@@ -1,7 +1,10 @@
 // Package outbound posts to Slack what the clients posted: the hub's inbox
 // holds each post until it is in Slack. Posts go out in the order they
 // reached the hub, each in its thread. A post longer than MaxChars is
-// split into consecutive messages in the same thread.
+// split into consecutive messages in the same thread. A post may mention
+// people on the user list at its start. The Slack ts of every message a
+// post goes out as is recorded, so that the client that posted it can
+// delete it.
 //
 // A post Slack does not take is left in the inbox and tried again later,
 // after the Slack API's own waits on rate limits; nothing behind it goes
@@ -71,6 +74,8 @@ type Poster struct {
 	// UploadWait bounds how long BeforeUpload waits for a client's
 	// earlier posts. Zero means DefaultUploadWait.
 	UploadWait time.Duration
+	// Users is the user list: a post mentions only the people on it.
+	Users map[string]string
 
 	// cards is held over each change to a progress card, which Run and
 	// BeforeUpload make.
@@ -268,15 +273,20 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 		}
 		parts = []string{footer}
 	}
+	mentions := p.mentions(u.MsgID, m)
 	if err := p.close(ctx, m.Thread, slack.Done, "", nil); err != nil {
 		return err
 	}
 	for i := u.PartsSent; i < len(parts); i++ {
+		var posted string
 		var err error
-		if m.Footer {
-			_, err = p.Slack.PostFooter(ctx, channel, ts, parts[i])
-		} else {
-			_, err = p.Slack.PostReply(ctx, channel, ts, parts[i])
+		switch {
+		case m.Footer:
+			posted, err = p.Slack.PostFooter(ctx, channel, ts, parts[i])
+		case i == 0 && len(mentions) > 0:
+			posted, err = p.Slack.PostReplyMentioning(ctx, channel, ts, parts[i], mentions)
+		default:
+			posted, err = p.Slack.PostReply(ctx, channel, ts, parts[i])
 		}
 		if errors.Is(err, slack.ErrNotFound) {
 			return fmt.Errorf("%w: %v", errPermanent, err)
@@ -284,11 +294,29 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 		if err != nil {
 			return err
 		}
-		if err := p.record(ctx, func() error { return p.Store.Inbox.SetPartsSent(ctx, u.MsgID, i+1) }); err != nil {
+		if err := p.record(ctx, func() error { return p.Store.PartSent(ctx, u.MsgID, i, posted) }); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// mentions returns the people m mentions who are on the user list. The
+// client checked them with the hub before it queued m; one who has left
+// the list since is not mentioned, and m goes out all the same.
+func (p *Poster) mentions(msgID string, m payload.Message) []string {
+	if m.Footer {
+		return nil
+	}
+	var users []string
+	for _, u := range m.Mentions {
+		if _, ok := p.Users[u]; !ok {
+			slog.Warn("outbound: not mentioning a user who is not on the user list", "msg_id", msgID, "user", u)
+			continue
+		}
+		users = append(users, u)
+	}
+	return users
 }
 
 // Split cuts text into parts of at most max characters, in order. A part

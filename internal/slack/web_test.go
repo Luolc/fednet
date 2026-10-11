@@ -343,6 +343,28 @@ func TestWebPostReplyAndDelete(t *testing.T) {
 	}
 }
 
+// A mention goes in a rich_text block before the markdown one, where it
+// would show as written; the plain text starts with it too.
+func TestWebPostReplyMentioning(t *testing.T) {
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		return 200, `{"ok":true,"channel":"C1","ts":"1.5"}`
+	})
+	if got, err := w.PostReplyMentioning(t.Context(), "C1", "1.1", "your **review** is due", []string{"U1", "U2"}); err != nil || got != "1.5" {
+		t.Fatalf("PostReplyMentioning = %q, %v; want 1.5", got, err)
+	}
+	rs, _ := ts.got()
+	post := rs[0].form
+	if rs[0].method != "chat.postMessage" || post.Get("thread_ts") != "1.1" || post.Get("text") != "<@U1> <@U2> your **review** is due" {
+		t.Fatalf("PostReplyMentioning sent %s %v", rs[0].method, post)
+	}
+	want := `[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[` +
+		`{"type":"user","user_id":"U1"},{"type":"text","text":" "},{"type":"user","user_id":"U2"}]}]},` +
+		`{"type":"markdown","text":"your **review** is due"}]`
+	if got := post.Get("blocks"); got != want {
+		t.Fatalf("blocks = %s\nwant     %s", got, want)
+	}
+}
+
 // blocksJSON writes bs as JSON without escaping < and >, which Slack's
 // date and user tokens are made of.
 func blocksJSON(t *testing.T, bs []slackgo.Block) string {
