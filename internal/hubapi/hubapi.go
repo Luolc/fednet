@@ -67,6 +67,11 @@ const (
 	// approved, the hub makes the change itself, and the outcome comes
 	// down the link as an approval's does, unsigned.
 	RequestRoute = "request-route"
+	// RequestChannel is RequestRoute for a channel to create: Route.Create
+	// names it, and the rest of Route is its route. Once the card is
+	// approved, the hub creates the channel, writes its route and sends
+	// the outcome down, with the channel's id or why it failed.
+	RequestChannel = "request-channel"
 	// Routes returns every route.
 	Routes = "routes"
 	// Ops carries out Op, one of the fixed operations the hub's config
@@ -118,6 +123,8 @@ type RouteRequest struct {
 	// route Machine alone.
 	OpenThread *[]string `json:"open_thread,omitempty"`
 	Delete     bool      `json:"delete,omitempty"`
+	// Create is the channel RequestChannel creates; Channel is empty then.
+	Create *approval.NewChannel `json:"create,omitempty"`
 }
 
 // User is one person on the user list.
@@ -329,6 +336,8 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		reply.ApprovalID, err = s.requestApproval(ctx, client, r)
 	case RequestRoute:
 		reply.ApprovalID, err = s.requestRoute(ctx, client, r)
+	case RequestChannel:
+		reply.ApprovalID, err = s.requestChannel(ctx, client, r)
 	case Routes:
 		reply.Routes, err = s.Store.Routes(ctx)
 	case Ops:
@@ -597,6 +606,8 @@ func (s *Server) requestRoute(ctx context.Context, client string, r Request) (st
 	switch {
 	case r.Agent == "" || r.Text == "" || q == nil:
 		return "", link.Refuse(link.ErrBadRequest, "needs an agent, a text and a route")
+	case q.Create != nil:
+		return "", link.Refuse(link.ErrBadRequest, "%s creates no channel; %s does", RequestRoute, RequestChannel)
 	case q.Channel != store.DMRoute && !channelID.MatchString(q.Channel):
 		return "", link.Refuse(link.ErrBadRequest, "%q is neither a Slack channel id nor %s", q.Channel, store.DMRoute)
 	case s.Approvals == nil:
@@ -605,15 +616,8 @@ func (s *Server) requestRoute(ctx context.Context, client string, r Request) (st
 	// A card shows the whole route the channel will have, which its
 	// approval writes; a second card for the channel, made from the same
 	// route, would undo the first's change when approved after it.
-	pending, err := s.Store.PendingApprovals(ctx)
-	if err != nil {
+	if err := s.noneWaiting(ctx, "the route of "+q.Channel, func(c approval.RouteChange) bool { return c.Channel == q.Channel }); err != nil {
 		return "", err
-	}
-	for _, a := range pending {
-		var c approval.RouteChange
-		if a.Kind == store.KindRoute && json.Unmarshal(a.Action, &c) == nil && c.Channel == q.Channel {
-			return "", link.Refuse(link.ErrBusy, "the route of %s has a request waiting for approval (%s); ask again once it is decided", q.Channel, a.ID)
-		}
 	}
 	current, err := s.Store.Route(ctx, q.Channel)
 	exists := err == nil
@@ -649,19 +653,84 @@ func (s *Server) requestRoute(ctx context.Context, client string, r Request) (st
 	if q.Machine == "" && len(change.OpenThread) == 0 {
 		return "", link.Refuse(link.ErrBadRequest, "the route would do nothing: give a machine or open_thread, or delete it")
 	}
-	for _, c := range append([]string{q.Machine}, change.OpenThread...) {
+	if err := s.checkClients(ctx, append([]string{q.Machine}, change.OpenThread...)); err != nil {
+		return "", err
+	}
+	return s.postRouteRequest(ctx, client, r, change)
+}
+
+// channelName is the pattern of the name of a channel Slack creates.
+var channelName = regexp.MustCompile(`^[a-z0-9_-]{1,80}$`)
+
+// requestChannel checks the channel r asks to create and its route, makes
+// the route whole as requestRoute does for a new one, and posts the card;
+// the channel is created once the card is approved.
+func (s *Server) requestChannel(ctx context.Context, client string, r Request) (string, error) {
+	q := r.Route
+	switch {
+	case r.Agent == "" || r.Text == "" || q == nil || q.Create == nil:
+		return "", link.Refuse(link.ErrBadRequest, "needs an agent, a text and a channel to create")
+	case !channelName.MatchString(q.Create.Name):
+		return "", link.Refuse(link.ErrBadRequest, "channel name %q is not 1 to 80 of a-z, 0-9, - and _", q.Create.Name)
+	case q.Channel != "" || q.Delete:
+		return "", link.Refuse(link.ErrBadRequest, "a channel to create has no id yet and nothing to delete")
+	case q.Machine == "":
+		return "", link.Refuse(link.ErrBadRequest, "needs the machine that takes the channel")
+	case q.Scope != "" && !scopeName.MatchString(q.Scope):
+		return "", link.Refuse(link.ErrBadRequest, "scope %q is not [a-z0-9-]", q.Scope)
+	case s.Approvals == nil:
+		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
+	}
+	for _, u := range q.Create.Invite {
+		if _, ok := s.Users[u]; !ok {
+			return "", link.Refuse(link.ErrBadRequest, "%s is not on the user list", u)
+		}
+	}
+	if err := s.noneWaiting(ctx, "#"+q.Create.Name, func(c approval.RouteChange) bool { return c.Create != nil && c.Create.Name == q.Create.Name }); err != nil {
+		return "", err
+	}
+	open := []string{q.Machine}
+	if q.OpenThread != nil {
+		open = *q.OpenThread
+	}
+	if err := s.checkClients(ctx, append([]string{q.Machine}, open...)); err != nil {
+		return "", err
+	}
+	return s.postRouteRequest(ctx, client, r, approval.RouteChange{Route: store.Route{Machine: q.Machine, Scope: q.Scope, OpenThread: open}, Create: q.Create})
+}
+
+// noneWaiting refuses, as busy, when a route request that match picks
+// waits for approval; what names it in the refusal.
+func (s *Server) noneWaiting(ctx context.Context, what string, match func(approval.RouteChange) bool) error {
+	pending, err := s.Store.PendingApprovals(ctx)
+	if err != nil {
+		return err
+	}
+	for _, a := range pending {
+		var c approval.RouteChange
+		if a.Kind == store.KindRoute && json.Unmarshal(a.Action, &c) == nil && match(c) {
+			return link.Refuse(link.ErrBusy, "%s has a request waiting for approval (%s); ask again once it is decided", what, a.ID)
+		}
+	}
+	return nil
+}
+
+// checkClients refuses any of ids, empty ones aside, that is not a client
+// the hub knows and has not revoked.
+func (s *Server) checkClients(ctx context.Context, ids []string) error {
+	for _, c := range ids {
 		if c == "" {
 			continue
 		}
 		reg, err := s.Store.Registration(ctx, c)
 		if errors.Is(err, store.ErrNotFound) || err == nil && reg.Revoked {
-			return "", link.Refuse(link.ErrBadRequest, "no client %s", c)
+			return link.Refuse(link.ErrBadRequest, "no client %s", c)
 		}
 		if err != nil {
-			return "", err
+			return err
 		}
 	}
-	return s.postRouteRequest(ctx, client, r, change)
+	return nil
 }
 
 func (s *Server) postRouteRequest(ctx context.Context, client string, r Request, change approval.RouteChange) (string, error) {

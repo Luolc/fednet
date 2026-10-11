@@ -425,6 +425,25 @@ func (w *Web) SetPurpose(ctx context.Context, channel, purpose string) error {
 	})
 }
 
+func (w *Web) CreateChannel(ctx context.Context, name string, private bool) (string, error) {
+	var c *slackgo.Channel
+	err := w.call(ctx, "conversations.create", func() (err error) {
+		c, err = w.c.CreateConversationContext(ctx, slackgo.CreateConversationParams{ChannelName: name, IsPrivate: private})
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return c.ID, nil
+}
+
+func (w *Web) Invite(ctx context.Context, channel string, users []string) error {
+	return w.call(ctx, "conversations.invite", func() error {
+		_, err := w.c.InviteUsersToConversationContext(ctx, channel, users...)
+		return err
+	})
+}
+
 // PostCard posts the card's blocks; the summary is the message's plain
 // text, for notifications.
 func (w *Web) PostCard(ctx context.Context, channel string, c Card) (string, error) {
@@ -535,7 +554,11 @@ func blocks(c Card) []slackgo.Block {
 			slackgo.NewButtonBlockElement(RejectAction, c.ID, plain("拒绝")).WithStyle(slackgo.StyleDanger),
 		))
 	}
-	return append(bs, slackgo.NewSectionBlock(mrkdwn(outcomeText(c)), nil, nil))
+	bs = append(bs, slackgo.NewSectionBlock(mrkdwn(outcomeText(c)), nil, nil))
+	if c.Note != "" {
+		bs = append(bs, slackgo.NewSectionBlock(plain(c.Note), nil, nil))
+	}
+	return bs
 }
 
 // outcomeText says how a decided card ended, in one line.

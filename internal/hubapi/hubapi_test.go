@@ -680,6 +680,68 @@ func TestRequestRoute(t *testing.T) {
 	}
 }
 
+// request-channel checks the channel to create and its route, and posts
+// a card that shows both; while one waits, another for the same name is
+// refused.
+func TestRequestChannel(t *testing.T) {
+	s, f := testServer(t)
+	f.AddChannel("C9", "approvals")
+	ctx := t.Context()
+	s.Users = map[string]string{"U1": "maintainer", "U2": "colleague"}
+	for _, c := range []string{"workstation", "datamachine"} {
+		if err := s.Store.Register(ctx, c, []byte("h")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := func(q RouteRequest) Request {
+		return Request{Cmd: RequestChannel, Agent: "lead", Text: "new repo", Route: &q}
+	}
+	good := req(RouteRequest{Machine: "workstation", Scope: "data", Create: &approval.NewChannel{Name: "repo-example", Purpose: "the example repo", Invite: []string{"U2"}}})
+	if _, err := answer(t, s, "workstation", good); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "not set up") {
+		t.Fatalf("request-channel without approvals = %v, want denied as not set up", err)
+	}
+	s.Approvals = &approval.Flow{Store: s.Store, Slack: f, Channel: "C9", Approvers: []string{"U1"}}
+	named := func(name string) *approval.NewChannel { return &approval.NewChannel{Name: name} }
+	tests := []struct {
+		name string
+		req  Request
+	}{
+		{"no channel to create", req(RouteRequest{Machine: "workstation"})},
+		{"upper case in the name", req(RouteRequest{Machine: "workstation", Create: named("Repo-Example")})},
+		{"a name over 80", req(RouteRequest{Machine: "workstation", Create: named(strings.Repeat("a", 81))})},
+		{"a channel id given", req(RouteRequest{Channel: "C1", Machine: "workstation", Create: named("repo-example")})},
+		{"no machine", req(RouteRequest{Create: named("repo-example")})},
+		{"an unknown machine", req(RouteRequest{Machine: "nobody", Create: named("repo-example")})},
+		{"a bad scope", req(RouteRequest{Machine: "workstation", Scope: "Data", Create: named("repo-example")})},
+		{"someone off the user list to invite", req(RouteRequest{Machine: "workstation", Create: &approval.NewChannel{Name: "repo-example", Invite: []string{"U9"}}})},
+		{"a create through request-route", Request{Cmd: RequestRoute, Agent: "lead", Text: "x", Route: &RouteRequest{Channel: "C1", Machine: "workstation", Create: named("repo-example")}}},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, link.ErrBadRequest) {
+			t.Errorf("%s: %v, want a bad request", tt.name, err)
+		}
+	}
+	reply, err := answer(t, s, "workstation", good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cards := f.Cards("C9")
+	var params bytes.Buffer
+	if len(cards) != 1 || json.Compact(&params, []byte(cards[0].Params)) != nil {
+		t.Fatalf("cards = %+v, want one", cards)
+	}
+	want := `{"machine":"workstation","scope":"data","open_thread":["workstation"],"create":{"name":"repo-example","purpose":"the example repo","invite":["U2"]}}`
+	if cards[0].ID != reply.ApprovalID || params.String() != want || cards[0].Summary != "建 channel 并写路由：new repo" {
+		t.Fatalf("card = %+v, want %s with %s", cards[0], reply.ApprovalID, want)
+	}
+	if _, err := answer(t, s, "workstation", good); !errors.Is(err, link.ErrBusy) {
+		t.Fatalf("a second request for repo-example while one waits = %v, want busy", err)
+	}
+	if _, err := answer(t, s, "workstation", req(RouteRequest{Machine: "workstation", Create: named("repo-other")})); err != nil {
+		t.Fatalf("a request for another name = %v, want it taken", err)
+	}
+}
+
 // Fetch serves any file the bot can see to any client, within the size
 // limit; a file Slack no longer has is not found, and nothing is served
 // without Slack.

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	slackgo "github.com/slack-go/slack"
 )
 
 // ErrNotFound is returned for a channel, thread or message Slack does not
@@ -106,6 +108,11 @@ type API interface {
 	ChannelInfo(ctx context.Context, channel string) (ChannelInfo, error)
 	// SetPurpose replaces channel's purpose.
 	SetPurpose(ctx context.Context, channel, purpose string) error
+	// CreateChannel creates a channel named name, private or public, with
+	// the bot in it, and returns its id.
+	CreateChannel(ctx context.Context, name string, private bool) (string, error)
+	// Invite adds users, Slack user ids, to channel.
+	Invite(ctx context.Context, channel string, users []string) error
 	// PostReply posts text in the thread that starts at ts in channel and
 	// returns the new message's ts.
 	PostReply(ctx context.Context, channel, ts, text string) (string, error)
@@ -227,6 +234,9 @@ type Card struct {
 	Approver string
 	// DecidedAt is when Outcome was reached.
 	DecidedAt time.Time
+	// Note says, under the outcome, what came of carrying it out; empty
+	// when there is nothing to say.
+	Note string
 }
 
 // Click is a press on one of a card's buttons, as the interactive callback
@@ -252,11 +262,12 @@ type Click struct {
 // Limits of a card: Slack takes at most maxBlocks blocks in one message
 // and about 3000 characters in one text. The card has fixedBlocks blocks
 // besides the parameters (the header, the two labels, the summary, who
-// asks, the expiry with the id, and the buttons or the outcome), so the
-// parameters get the rest, ParamChunk characters each.
+// asks, the expiry with the id, the buttons or the outcome, and the note
+// under the outcome), so the parameters get the rest, ParamChunk
+// characters each.
 const (
 	maxBlocks      = 50
-	fixedBlocks    = 7
+	fixedBlocks    = 8
 	ParamChunk     = 2900
 	MaxParamChunks = maxBlocks - fixedBlocks
 )
@@ -337,6 +348,16 @@ func splitTS(ts string) (sec, usec int64) {
 	return sec, usec
 }
 
+// Code returns the error code Slack answered with in err, such as
+// "missing_scope" or "name_taken"; empty when err is not such an answer.
+func Code(err error) string {
+	var e slackgo.SlackErrorResponse
+	if errors.As(err, &e) {
+		return e.Err
+	}
+	return ""
+}
+
 // FakeBot is the user id of the Fake's bot: Self returns it, and Post,
 // PostReply and PostCard post as it.
 const FakeBot = "fednet"
@@ -374,6 +395,9 @@ type fakeChannel struct {
 	purpose string
 	im      bool
 	threads map[string][]Message
+	// private and members are what CreateChannel and Invite were given.
+	private bool
+	members []string
 }
 
 // AddChannel adds an empty channel with purpose.
@@ -547,6 +571,49 @@ func (f *Fake) RenameChannel(channel, name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.channels[channel].name = name
+}
+
+// CreateChannel adds a channel named name, with no purpose, unless a
+// channel has that name already, which Slack calls name_taken.
+func (f *Fake) CreateChannel(_ context.Context, name string, private bool) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.channels {
+		if c.name == name {
+			return "", fmt.Errorf("slack: conversations.create: %w", slackgo.SlackErrorResponse{Err: "name_taken"})
+		}
+	}
+	if f.channels == nil {
+		f.channels = make(map[string]*fakeChannel)
+	}
+	f.clock++
+	id := fmt.Sprintf("C%08d", f.clock)
+	f.channels[id] = &fakeChannel{name: name, private: private, threads: make(map[string][]Message)}
+	return id, nil
+}
+
+// Invite adds users to channel's members.
+func (f *Fake) Invite(_ context.Context, channel string, users []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.channels[channel]
+	if !ok {
+		return ErrNotFound
+	}
+	c.members = append(c.members, users...)
+	return nil
+}
+
+// Created returns the name of channel, whether it is private and the
+// users invited to it.
+func (f *Fake) Created(channel string) (name string, private bool, members []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.channels[channel]
+	if !ok {
+		return "", false, nil
+	}
+	return c.name, c.private, slices.Clone(c.members)
 }
 
 func (f *Fake) SetPurpose(_ context.Context, channel, purpose string) error {

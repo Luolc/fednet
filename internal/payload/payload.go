@@ -35,6 +35,9 @@ const (
 	Approved = "approved"
 	Rejected = "rejected"
 	Expired  = "expired"
+	// Failed is a route request that creates a channel, approved, that
+	// the hub could not carry out: Note says why.
+	Failed = "failed"
 )
 
 // Triggers of an inbound message, for Message.Trigger: why the hub sent
@@ -149,6 +152,11 @@ type Message struct {
 	// Approver is the Slack user id of the person who approved or
 	// rejected; empty when the approval expired.
 	Approver string `json:"approver,omitempty"`
+	// Channel and Note are set on the outcome of a route request that
+	// creates a channel: the id of the channel created, empty when it
+	// failed, and what came of the request.
+	Channel string `json:"channel,omitempty"`
+	Note    string `json:"note,omitempty"`
 	// Approval is, on an approved outcome, the signed approval document
 	// as `fednet approval verify` reads it, to be written to a file as is.
 	Approval json.RawMessage `json:"approval,omitempty"`

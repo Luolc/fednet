@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS route_request (
 	card_final   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS route_request_status ON route_request (status);
+-- The approved route requests that create a channel, by request:
+-- attempted is set before the hub asks Slack to create it, done once the
+-- request is carried out, with channel the id Slack gave (empty when it
+-- failed) and note what came of it.
+CREATE TABLE IF NOT EXISTS channel_request (
+	approval_id TEXT PRIMARY KEY,
+	attempted   INTEGER NOT NULL DEFAULT 0,
+	done        INTEGER NOT NULL DEFAULT 0,
+	channel     TEXT NOT NULL DEFAULT '',
+	note        TEXT NOT NULL DEFAULT ''
+);
 -- The scope of each thread that had one when it got its owner.
 CREATE TABLE IF NOT EXISTS thread_scope (
 	thread TEXT PRIMARY KEY,
@@ -77,8 +88,9 @@ const DMRoute = "dm"
 
 // Route is where the new threads of a channel go.
 type Route struct {
-	// Channel is the Slack channel id, or DMRoute.
-	Channel string `json:"channel"`
+	// Channel is the Slack channel id, or DMRoute; empty in a request
+	// to create the channel.
+	Channel string `json:"channel,omitempty"`
 	// Machine is the client that takes the channel's new threads; empty
 	// when none does.
 	Machine string `json:"machine,omitempty"`
@@ -284,4 +296,82 @@ func putScope(ctx context.Context, db dbtx, thread, scope string) error {
 	}
 	_, err := db.ExecContext(ctx, "INSERT INTO thread_scope (thread, scope) VALUES (?, ?) ON CONFLICT (thread) DO NOTHING", thread, scope)
 	return err
+}
+
+// ChannelRequest is an approved route request that creates a channel, as
+// channel_request keeps it.
+type ChannelRequest struct {
+	ID string
+	// Attempted is set once the hub has asked Slack to create the
+	// channel, or is about to; Done once the request is carried out.
+	Attempted, Done bool
+	// Channel is the id of the channel created, empty when it failed;
+	// Note says what came of the request.
+	Channel, Note string
+}
+
+// PutChannelRequest records that the route request id, approved, has a
+// channel to create. A Hub bound to a transaction records it in that one.
+func (h *Hub) PutChannelRequest(ctx context.Context, id string) error {
+	_, err := h.db.ExecContext(ctx, "INSERT INTO channel_request (approval_id) VALUES (?)", id)
+	return err
+}
+
+// ChannelRequest returns the channel request id, or ErrNotFound.
+func (h *Hub) ChannelRequest(ctx context.Context, id string) (ChannelRequest, error) {
+	cs, err := h.channelRequests(ctx, "WHERE approval_id = ?", id)
+	if err != nil {
+		return ChannelRequest{}, err
+	}
+	if len(cs) == 0 {
+		return ChannelRequest{}, ErrNotFound
+	}
+	return cs[0], nil
+}
+
+// ChannelRequestsToDo returns the channel requests not carried out yet,
+// oldest first.
+func (h *Hub) ChannelRequestsToDo(ctx context.Context) ([]ChannelRequest, error) {
+	return h.channelRequests(ctx, "WHERE done = 0 ORDER BY rowid")
+}
+
+func (h *Hub) channelRequests(ctx context.Context, where string, args ...any) ([]ChannelRequest, error) {
+	rows, err := h.db.QueryContext(ctx, "SELECT approval_id, attempted, done, channel, note FROM channel_request "+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cs []ChannelRequest
+	for rows.Next() {
+		var c ChannelRequest
+		if err := rows.Scan(&c.ID, &c.Attempted, &c.Done, &c.Channel, &c.Note); err != nil {
+			return nil, err
+		}
+		cs = append(cs, c)
+	}
+	return cs, rows.Err()
+}
+
+// MarkChannelAttempted records that the hub asks Slack to create the
+// channel of request id.
+func (h *Hub) MarkChannelAttempted(ctx context.Context, id string) error {
+	_, err := h.db.ExecContext(ctx, "UPDATE channel_request SET attempted = 1 WHERE approval_id = ?", id)
+	return err
+}
+
+// FinishChannelRequest records that request id is carried out, with
+// channel and note, and runs then against a Hub bound to the same
+// transaction, so that what then writes commits with it. A request
+// carried out before is left as it is, and then does not run.
+func (h *Hub) FinishChannelRequest(ctx context.Context, id, channel, note string, then func(tx *Hub) error) error {
+	return h.transact(ctx, func(tx *Hub) error {
+		res, err := tx.db.ExecContext(ctx, "UPDATE channel_request SET done = 1, channel = ?, note = ? WHERE approval_id = ? AND done = 0", channel, note, id)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return err
+		}
+		return then(tx)
+	})
 }
