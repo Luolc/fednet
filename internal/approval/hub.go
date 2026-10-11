@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,15 +42,17 @@ var ErrOff = errors.New("approval: approvals are not set up on the hub")
 var ErrTooBig = errors.New("approval: the action does not fit in one card")
 
 // Flow runs approvals on the hub: Request records what an agent asks and
-// posts the card; Click applies a press on a card's button; Run expires
-// what nobody decided, finishes cards and delivers the hints clicks left. Every outcome goes down to the
-// client that asked, signed when approved. Its exported fields are set
-// before use and not changed after.
+// posts the card, RequestRoute the same for a change of a route; Click
+// applies a press on a card's button; Run expires what nobody decided,
+// finishes cards, delivers the hints clicks left and tells the changes of
+// the routes in Channel. Every outcome goes down to the client that asked,
+// signed when an approved action. Its exported fields are set before use
+// and not changed after.
 type Flow struct {
 	Store *store.Hub
 	Slack slack.API
 	// Key signs approvals. Nil means the hub cannot sign: Request fails
-	// with ErrOff.
+	// with ErrOff, and RequestRoute, which needs no signature, works.
 	Key ed25519.PrivateKey
 	// Channel is where the cards go.
 	Channel string
@@ -88,18 +91,44 @@ type hintFor struct{ channel, user, text string }
 // shows them as such, and no check reads them. The hash the signature
 // will cover is of action byte for byte.
 func (f *Flow) Request(ctx context.Context, client, agent, requester, summary string, action []byte) (string, error) {
-	if f.Key == nil || f.Slack == nil || f.Channel == "" || len(f.Approvers) == 0 {
+	if f.Key == nil {
 		return "", ErrOff
 	}
-	if _, ok := slack.ParamBlocks(string(action)); !ok {
+	a := store.Approval{Kind: store.KindAction, Client: client, Agent: agent, Requester: requester, Summary: summary, Action: action, Nonce: make([]byte, 32)}
+	rand.Read(a.Nonce)
+	return f.request(ctx, a)
+}
+
+// RouteChange is what a route request asks for: Route to become the
+// route of its channel, or, with Delete, the route of Route.Channel to go.
+type RouteChange struct {
+	store.Route
+	Delete bool `json:"delete,omitempty"`
+}
+
+// RequestRoute records the request of client's agent to make change, with
+// summary saying why, and posts the card, as Request does; an approval of
+// it makes the change in the hub's routes, and nothing is signed, so the
+// hub needs no Key for it.
+func (f *Flow) RequestRoute(ctx context.Context, client, agent, requester, summary string, change RouteChange) (string, error) {
+	action, err := json.MarshalIndent(change, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return f.request(ctx, store.Approval{Kind: store.KindRoute, Client: client, Agent: agent, Requester: requester, Summary: summary, Action: action, Nonce: []byte{}})
+}
+
+// request records a, an approval of either kind with its request filled
+// in, and posts its card.
+func (f *Flow) request(ctx context.Context, a store.Approval) (string, error) {
+	if f.Slack == nil || f.Channel == "" || len(f.Approvers) == 0 {
+		return "", ErrOff
+	}
+	if _, ok := slack.ParamBlocks(string(a.Action)); !ok {
 		return "", ErrTooBig
 	}
 	now := f.now()
-	a := store.Approval{
-		ID: rand.Text(), Client: client, Agent: agent, Requester: requester, Summary: summary, Action: action,
-		Nonce: make([]byte, 32), RequestedAt: now, ExpiresAt: now.Add(f.ttl()), Channel: f.Channel, Status: store.Pending,
-	}
-	rand.Read(a.Nonce)
+	a.ID, a.RequestedAt, a.ExpiresAt, a.Channel, a.Status = rand.Text(), now, now.Add(f.ttl()), f.Channel, store.Pending
 	ts, err := f.Slack.PostCard(ctx, f.Channel, card(a))
 	if err != nil {
 		return "", fmt.Errorf("approval: posting the card: %w", err)
@@ -221,7 +250,19 @@ func (f *Flow) decide(ctx context.Context, id, outcome, by string) (d store.Deci
 		}
 		d = store.Decision{Status: outcome, By: by, At: now}
 		m := payload.Message{Type: payload.Approval, ApprovalID: a.ID, Agent: a.Agent, Outcome: outcome, Approver: by, Text: a.Summary}
-		if outcome == payload.Approved {
+		if outcome == payload.Approved && a.Kind == store.KindRoute {
+			var c RouteChange
+			if err := json.Unmarshal(a.Action, &c); err != nil {
+				return store.Decision{}, err
+			}
+			after := &c.Route
+			if c.Delete {
+				after = nil
+			}
+			if err := tx.SetRoute(ctx, c.Channel, after, store.RouteChange{RequestID: a.ID, Client: a.Client, Agent: a.Agent, Approver: by, At: now}); err != nil {
+				return store.Decision{}, err
+			}
+		} else if outcome == payload.Approved {
 			c := Content{
 				ApprovalID: a.ID, ParamsSHA256: sha256.Sum256(a.Action), TargetMachine: a.Client, TargetAgent: a.Agent,
 				Approver: by, ApprovedAt: now, ExpiresAt: now.Add(f.ttl()), Nonce: a.Nonce,
@@ -268,7 +309,11 @@ func (f *Flow) finishCard(ctx context.Context, a store.Approval) {
 
 // card is a's card as it should look now.
 func card(a store.Approval) slack.Card {
-	c := slack.Card{ID: a.ID, Summary: a.Summary, Params: string(a.Action), Machine: a.Client, Agent: a.Agent, Requester: a.Requester, Expires: a.ExpiresAt}
+	summary := a.Summary
+	if a.Kind == store.KindRoute {
+		summary = "改路由：" + summary
+	}
+	c := slack.Card{ID: a.ID, Summary: summary, Params: string(a.Action), Machine: a.Client, Agent: a.Agent, Requester: a.Requester, Expires: a.ExpiresAt}
 	if a.Status != store.Pending {
 		c.Outcome, c.Approver, c.DecidedAt = a.Status, a.DecidedBy, a.DecidedAt
 	}
@@ -343,7 +388,74 @@ func (f *Flow) Pass(ctx context.Context) error {
 			slog.Warn("approval: telling the clicker why the click did not count", "user", h.user, "err", err)
 		}
 	}
+	return f.postRouteChanges(ctx)
+}
+
+// postRouteChanges tells each change of the routes not told yet in
+// Channel, oldest first, and stops at the first Slack does not take, to
+// try again next Pass.
+func (f *Flow) postRouteChanges(ctx context.Context) error {
+	if f.Channel == "" {
+		return nil
+	}
+	changes, err := f.Store.UnpostedRouteChanges(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range changes {
+		sctx, cancel := context.WithTimeout(ctx, f.slackTimeout())
+		_, err := f.Slack.Post(sctx, f.Channel, routeChangeText(c))
+		cancel()
+		if err != nil {
+			slog.Warn("approval: telling a change of the routes, will retry", "change", c.Seq, "err", err)
+			return nil
+		}
+		if err := f.Store.MarkRouteChangePosted(ctx, c.Seq); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// routeChangeText says c in the approvals channel. The agent's own words
+// are left out: the card showed them, and the markdown this text is
+// posted in would not show them as they are. The approver goes as a
+// Slack user id.
+func routeChangeText(c store.RouteChange) string {
+	lines := func(rs []store.Route) string {
+		if len(rs) == 0 {
+			return "无"
+		}
+		var ls []string
+		for _, r := range rs {
+			ls = append(ls, routeLine(r))
+		}
+		return strings.Join(ls, "\n")
+	}
+	if c.RequestID == "" {
+		return fmt.Sprintf("路由：从 hub 配置导入了 %d 条路由，配置里的 channels 和 dm 以后不再读\n%s", len(c.After), lines(c.After))
+	}
+	return fmt.Sprintf("路由已改：%s 提议，%s 批准，编号 %s\n改前：%s\n改后：%s", c.Client, c.Approver, c.RequestID, lines(c.Before), lines(c.After))
+}
+
+// routeLine says r in one line.
+func routeLine(r store.Route) string {
+	s := r.Channel
+	if r.Channel == store.DMRoute {
+		s = "私信"
+	}
+	machine := r.Machine
+	if machine == "" {
+		machine = "(没有机器接新线程)"
+	}
+	s += " → " + machine
+	if r.Scope != "" {
+		s += "，scope " + r.Scope
+	}
+	if len(r.OpenThread) > 0 {
+		s += "，可开线程：" + strings.Join(r.OpenThread, ", ")
+	}
+	return s
 }
 
 func (f *Flow) now() time.Time {

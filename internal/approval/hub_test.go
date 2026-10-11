@@ -588,3 +588,70 @@ func TestPassBoundsSlackCalls(t *testing.T) {
 		t.Fatalf("%d hints still waiting after the pass, want none: a hint Slack does not take is dropped", n)
 	}
 }
+
+// An approved route request changes the route, in the hub's database, and
+// is told in the card channel with the import before it; a rejected one
+// changes nothing. Neither needs the key, and the outcome is not signed.
+func TestFlowRoute(t *testing.T) {
+	tf := newFlow(t)
+	tf.Key = nil
+	ctx := t.Context()
+	c1 := store.Route{Channel: "C1", Machine: "workstation", OpenThread: []string{"workstation"}}
+	if _, err := tf.Store.ImportRoutes(ctx, []store.Route{c1}, tf.now); err != nil {
+		t.Fatal(err)
+	}
+	c2 := store.Route{Channel: "C2", Machine: "datamachine", Scope: "data"}
+	routeCard := func(change RouteChange) (id, ts string) {
+		t.Helper()
+		id, err := tf.RequestRoute(ctx, "workstation", "lead", "", "new repo", change)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tss, cards := tf.f.Cards("C9")
+		return id, tss[len(cards)-1]
+	}
+	id, ts := routeCard(RouteChange{Route: c2})
+	tf.click(t, id, ts, "U1", true)
+	if got, err := tf.Store.Route(ctx, "C2"); err != nil || got.Machine != "datamachine" || got.Scope != "data" {
+		t.Fatalf("Route(C2) after the approval = %+v, %v; want %+v", got, err, c2)
+	}
+	out := tf.outcomes(t, "workstation")
+	if len(out) != 1 || out[0].ApprovalID != id || out[0].Outcome != payload.Approved || out[0].Approver != "U1" || out[0].Approval != nil {
+		t.Fatalf("outcomes = %+v, want %s approved by U1, unsigned", out, id)
+	}
+	if c := tf.card(t, ts); c.Outcome != payload.Approved || c.Summary != "改路由：new repo" {
+		t.Fatalf("card = %+v, want it approved", c)
+	}
+
+	id, ts = routeCard(RouteChange{Route: store.Route{Channel: "C1"}, Delete: true})
+	tf.click(t, id, ts, "U2", false)
+	if got, err := tf.Store.Route(ctx, "C1"); err != nil || got.Machine != "workstation" {
+		t.Fatalf("Route(C1) after a rejection = %+v, %v; want it as it was", got, err)
+	}
+
+	ms, err := tf.f.History(ctx, "C9", "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var told []string
+	for _, m := range ms {
+		if m.Text != "改路由：new repo" { // the cards
+			told = append(told, m.Text)
+		}
+	}
+	want := []string{
+		"路由：从 hub 配置导入了 1 条路由，配置里的 channels 和 dm 以后不再读\nC1 → workstation，可开线程：workstation",
+		"路由已改：workstation 提议，U1 批准，编号 " + out[0].ApprovalID + "\n改前：无\n改后：C2 → datamachine，scope data",
+	}
+	if strings.Join(told, "\n---\n") != strings.Join(want, "\n---\n") {
+		t.Fatalf("told in C9 = %q, want %q", told, want)
+	}
+	if left, err := tf.Store.UnpostedRouteChanges(ctx); err != nil || len(left) != 0 {
+		t.Fatalf("changes left to tell = %+v, %v; want none", left, err)
+	}
+
+	tf.Channel = ""
+	if _, err := tf.RequestRoute(ctx, "workstation", "lead", "", "x", RouteChange{Route: c2}); !errors.Is(err, ErrOff) {
+		t.Fatalf("RequestRoute without the card channel = %v, want ErrOff", err)
+	}
+}

@@ -13,7 +13,6 @@ import (
 
 	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/inbound"
-	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -54,7 +53,7 @@ func TestHubRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { hs.Close() })
-	if _, _, err := hs.ClaimAndEnqueue(ctx, thread, "old-workstation", "", []byte("first")); err != nil {
+	if _, _, err := hs.ClaimAndEnqueue(ctx, thread, "old-workstation", "", "", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -321,12 +320,13 @@ func TestReadHubConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := readHubConfig(good)
-	if err != nil || !slices.Equal(cfg.openThread()["C1"], []string{"workstation"}) || cfg.Users["U1"] != "maintainer" {
-		t.Fatalf("readHubConfig(good) = %+v, %v; want workstation allowed in C1 and U1 on the user list", cfg, err)
+	if err != nil || cfg.Users["U1"] != "maintainer" {
+		t.Fatalf("readHubConfig(good) = %+v, %v; want U1 on the user list", cfg, err)
 	}
-	// A channel without a machine is left out of the routing defaults.
-	if rt := cfg.route(); !reflect.DeepEqual(rt, route.Config{Defaults: map[string]string{"C1": "workstation"}, DM: "datamachine"}) {
-		t.Fatalf("route() = %+v, want C1 to workstation, direct messages to datamachine", rt)
+	// A channel that routes nothing is left out of the routes.
+	want := []store.Route{{Channel: "C1", Machine: "workstation", OpenThread: []string{"workstation"}}, {Channel: store.DMRoute, Machine: "datamachine"}}
+	if rs := cfg.routes(); !reflect.DeepEqual(rs, want) {
+		t.Fatalf("routes() = %+v, want %+v", rs, want)
 	}
 	if _, err := readHubConfig(typo); err == nil || !strings.Contains(err.Error(), "open_threads") {
 		t.Fatalf("readHubConfig(typo) = %v, want an error naming the unknown field", err)
@@ -462,7 +462,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
-	if r := cfg.route(); r.DM == "" || len(r.Defaults) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 {
+	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 {
 		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }

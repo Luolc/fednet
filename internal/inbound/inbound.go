@@ -75,9 +75,10 @@ type Status struct {
 // Receiver takes in message events. Its exported fields are set before use
 // and not changed after.
 type Receiver struct {
+	// Store holds the routes, read as each message comes, and takes the
+	// messages in.
 	Store *store.Hub
 	Slack slack.API
-	Route route.Config
 	// Users is the user list: only messages from people on it are taken
 	// in.
 	Users map[string]string
@@ -199,7 +200,7 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		info, history = r.channelInfo(ctx, ev.Channel), r.history(ev, thread, before)
 	}
 	_, err = r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
-		rt := route.New(tx, r.Route)
+		rt := route.New(tx)
 		name, err := tx.ChannelName(ctx, thread)
 		owned := err == nil
 		if errors.Is(err, store.ErrNotFound) {
@@ -216,17 +217,13 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		default:
 			m.Trigger, m.Context, m.ChannelName, m.History = payload.Mention, info.Purpose, info.Name, history
 		}
-		b, err := json.Marshal(m)
-		if err != nil {
-			return err
-		}
 		switch {
 		case m.Trigger == payload.Mention:
-			_, err = rt.RouteNew(ctx, ev.Channel, info.Name, thread, b)
+			_, err = rt.RouteNew(ctx, ev.Channel, info.Name, thread, m)
 		case ev.IM && ev.ThreadTS == "":
-			_, err = rt.RouteNewDM(ctx, thread, b)
+			_, err = rt.RouteNewDM(ctx, thread, m)
 		default:
-			_, err = rt.RouteReply(ctx, thread, b)
+			_, err = rt.RouteReply(ctx, thread, m)
 		}
 		switch {
 		case errors.Is(err, route.ErrNoMachine) && !ev.IM:

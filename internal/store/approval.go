@@ -11,6 +11,16 @@ const (
 	Pending = "pending"
 )
 
+// Kinds of Approval.
+const (
+	// KindAction is an approval of an action the agent carries out, which
+	// the hub signs.
+	KindAction = ""
+	// KindRoute is a request to change a route, which the hub carries out
+	// itself; Action is the change.
+	KindRoute = "route"
+)
+
 // Approval is one approval an agent requested, as the hub keeps it. Times
 // read back are in UTC.
 type Approval struct {
@@ -42,19 +52,29 @@ type Approval struct {
 	DecidedAt time.Time
 	// CardFinal is set once the card in Slack shows the outcome.
 	CardFinal bool
+	// Kind is KindAction or KindRoute.
+	Kind string
 }
 
 const approvalColumns = "approval_id, client_id, agent, requester, summary, action, nonce, requested_at, expires_at, channel, ts, status, decided_by, decided_at, card_final"
 
+// approvalTable is the table that keeps approvals of kind.
+func approvalTable(kind string) string {
+	if kind == KindRoute {
+		return "route_request"
+	}
+	return "approval"
+}
+
 // PutApproval records a, which must be Pending.
 func (h *Hub) PutApproval(ctx context.Context, a Approval) error {
 	_, err := h.db.ExecContext(ctx,
-		"INSERT INTO approval (approval_id, client_id, agent, requester, summary, action, nonce, requested_at, expires_at, channel, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO "+approvalTable(a.Kind)+" (approval_id, client_id, agent, requester, summary, action, nonce, requested_at, expires_at, channel, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		a.ID, a.Client, a.Agent, a.Requester, a.Summary, a.Action, a.Nonce, a.RequestedAt.UnixNano(), a.ExpiresAt.UnixNano(), a.Channel, a.TS)
 	return err
 }
 
-// Approval returns the approval with id, or ErrNotFound.
+// Approval returns the approval with id, of either kind, or ErrNotFound.
 func (h *Hub) Approval(ctx context.Context, id string) (Approval, error) {
 	as, err := h.approvals(ctx, "WHERE approval_id = ?", id)
 	if err != nil {
@@ -66,19 +86,21 @@ func (h *Hub) Approval(ctx context.Context, id string) (Approval, error) {
 	return as[0], nil
 }
 
-// PendingApprovals returns the approvals still Pending, oldest first.
+// PendingApprovals returns the approvals of either kind still Pending,
+// oldest first.
 func (h *Hub) PendingApprovals(ctx context.Context) ([]Approval, error) {
 	return h.approvals(ctx, "WHERE status = ? ORDER BY requested_at", Pending)
 }
 
-// UnfinishedCards returns the decided approvals whose card does not show
-// the outcome yet, oldest first.
+// UnfinishedCards returns the decided approvals of either kind whose card
+// does not show the outcome yet, oldest first.
 func (h *Hub) UnfinishedCards(ctx context.Context) ([]Approval, error) {
 	return h.approvals(ctx, "WHERE status <> ? AND card_final = 0 ORDER BY decided_at", Pending)
 }
 
 func (h *Hub) approvals(ctx context.Context, where string, args ...any) ([]Approval, error) {
-	rows, err := h.db.QueryContext(ctx, "SELECT "+approvalColumns+" FROM approval "+where, args...)
+	rows, err := h.db.QueryContext(ctx, "SELECT * FROM (SELECT "+approvalColumns+", '"+KindAction+"' AS kind FROM approval UNION ALL SELECT "+
+		approvalColumns+", '"+KindRoute+"' FROM route_request) "+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +109,7 @@ func (h *Hub) approvals(ctx context.Context, where string, args ...any) ([]Appro
 	for rows.Next() {
 		var a Approval
 		var requested, expires, decided int64
-		if err := rows.Scan(&a.ID, &a.Client, &a.Agent, &a.Requester, &a.Summary, &a.Action, &a.Nonce, &requested, &expires, &a.Channel, &a.TS, &a.Status, &a.DecidedBy, &decided, &a.CardFinal); err != nil {
+		if err := rows.Scan(&a.ID, &a.Client, &a.Agent, &a.Requester, &a.Summary, &a.Action, &a.Nonce, &requested, &expires, &a.Channel, &a.TS, &a.Status, &a.DecidedBy, &decided, &a.CardFinal, &a.Kind); err != nil {
 			return nil, err
 		}
 		a.RequestedAt, a.ExpiresAt = time.Unix(0, requested).UTC(), time.Unix(0, expires).UTC()
@@ -132,7 +154,7 @@ func (h *Hub) DecideApproval(ctx context.Context, id string, decide func(tx *Hub
 			return errNoDecision
 		}
 		if _, err := tx.db.ExecContext(ctx,
-			"UPDATE approval SET status = ?, decided_by = ?, decided_at = ? WHERE approval_id = ? AND status = ?",
+			"UPDATE "+approvalTable(a.Kind)+" SET status = ?, decided_by = ?, decided_at = ? WHERE approval_id = ? AND status = ?",
 			d.Status, d.By, d.At.UnixNano(), id, Pending); err != nil {
 			return err
 		}
@@ -152,6 +174,12 @@ var errNoDecision = errors.New("store: no decision")
 // MarkCardFinal records that the card of the approval with id shows its
 // outcome.
 func (h *Hub) MarkCardFinal(ctx context.Context, id string) error {
-	_, err := h.db.ExecContext(ctx, "UPDATE approval SET card_final = 1 WHERE approval_id = ?", id)
-	return err
+	return h.transact(ctx, func(tx *Hub) error {
+		for _, kind := range []string{KindAction, KindRoute} {
+			if _, err := tx.db.ExecContext(ctx, "UPDATE "+approvalTable(kind)+" SET card_final = 1 WHERE approval_id = ?", id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

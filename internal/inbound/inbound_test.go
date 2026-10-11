@@ -22,7 +22,6 @@ import (
 	"github.com/Luolc/fednet/internal/approval"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
-	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	"github.com/Luolc/fednet/internal/watch"
@@ -60,12 +59,30 @@ func newReceiver(t *testing.T) (*Receiver, *slack.Fake) {
 	r := &Receiver{
 		Store: openHub(t, filepath.Join(t.TempDir(), "hub.db")),
 		Slack: f,
-		Route: route.Config{Defaults: map[string]string{"C1": "workstation", "C2": "datamachine"}, DM: "workstation"},
 		Users: users,
 		Bot:   slack.FakeBot,
 		Now:   func() time.Time { return epoch.Add(time.Hour) },
 	}
+	routed(t, r.Store)
 	return r, f
+}
+
+// routed routes C1 to the workstation, C2 to the data machine and direct
+// messages to the workstation in h, and returns h.
+func routed(t *testing.T, h *store.Hub) *store.Hub {
+	t.Helper()
+	setRoute(t, h, store.Route{Channel: "C1", Machine: "workstation"})
+	setRoute(t, h, store.Route{Channel: "C2", Machine: "datamachine"})
+	setRoute(t, h, store.Route{Channel: store.DMRoute, Machine: "workstation"})
+	return h
+}
+
+// setRoute makes rt the route of its channel.
+func setRoute(t *testing.T, h *store.Hub, rt store.Route) {
+	t.Helper()
+	if err := h.SetRoute(t.Context(), rt.Channel, &rt, store.RouteChange{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // queued returns the inbound messages queued for client, in order.
@@ -151,7 +168,7 @@ func TestHandleRoutes(t *testing.T) {
 	if owner, err := h.Owner(ctx, "C2/1.1"); err != nil || owner != "datamachine" {
 		t.Fatalf("Owner(C2/1.1) = %q, %v; want datamachine", owner, err)
 	}
-	r.Route = route.Config{Defaults: map[string]string{"C2": "workstation"}, DM: "workstation"}
+	setRoute(t, h, store.Route{Channel: "C2", Machine: "workstation"})
 	handle(t, r, message("Ev2", "C2", "1.2", "1.1", "reply"))
 	me := message("Ev3", "C2", "1.3", "1.1", "shrugs")
 	me.SubType = "me_message"
@@ -414,7 +431,7 @@ func TestHandleRepliesInAgentThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Store.Claim(ctx, "C2/"+ts, "workstation", ""); err != nil {
+	if err := r.Store.Claim(ctx, "C2/"+ts, "workstation", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	reply := post(t, f, "C2", slack.Message{User: "U1", Text: "noted", ThreadTS: ts})
@@ -459,7 +476,7 @@ func TestHandleChannelName(t *testing.T) {
 	f.RenameChannel("C1", "example-renamed")
 	handle(t, r, message("Ev2", "C1", "1.2", "1.1", "reply"))
 	handle(t, r, message("Ev3", "C1", "1.3", "", hey+"second"))
-	if err := r.Store.Claim(t.Context(), "C1/1.4", "workstation", ""); err != nil {
+	if err := r.Store.Claim(t.Context(), "C1/1.4", "workstation", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	handle(t, r, message("Ev4", "C1", "1.5", "1.4", "in a thread with no name"))
@@ -525,12 +542,34 @@ func TestHandleDedupsEvents(t *testing.T) {
 // Two hubs on the same database, as during a handoff, both get the same
 // event: it is queued once. Each has its own connection and its own
 // memory; only the database is shared.
+// The messages of a thread carry the scope its channel's route had when
+// the thread was handed over; a DM thread the scope of the route of direct
+// messages.
+func TestHandleCarriesScope(t *testing.T) {
+	r, _ := newReceiver(t)
+	setRoute(t, r.Store, store.Route{Channel: "C1", Machine: "workstation", Scope: "control-plane"})
+	setRoute(t, r.Store, store.Route{Channel: store.DMRoute, Machine: "workstation", Scope: "personal"})
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
+	setRoute(t, r.Store, store.Route{Channel: "C1", Machine: "workstation"})
+	handle(t, r, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	dm := message("Ev3", "D1", "2.1", "", "psst")
+	dm.IM = true
+	handle(t, r, dm)
+	var got []string
+	for _, m := range queued(t, r.Store, "workstation") {
+		got = append(got, m.Scope)
+	}
+	if want := []string{"control-plane", "control-plane", "personal"}; !slices.Equal(got, want) {
+		t.Fatalf("scopes queued = %q, want %q", got, want)
+	}
+}
+
 func TestHandleDedupsAcrossInstances(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.db")
 	r1, _ := newReceiver(t)
-	r1.Store = openHub(t, path)
+	r1.Store = routed(t, openHub(t, path))
 	r2, _ := newReceiver(t)
-	r2.Store = openHub(t, path)
+	r2.Store = routed(t, openHub(t, path))
 	handle(t, r1, message("Ev1", "C1", "1.1", "", hey+"first"))
 	handle(t, r2, message("Ev1", "C1", "1.1", "", hey+"first"))
 	handle(t, r2, message("Ev2", "C1", "1.2", "1.1", "reply"))
@@ -549,7 +588,7 @@ func TestHandleFailsWhenStoreFails(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "hub.db")
 	r, _ := newReceiver(t)
-	r.Store = openHub(t, path)
+	r.Store = routed(t, openHub(t, path))
 	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
 	r.Store.Close()
 	if err := r.Handle(ctx, message("Ev2", "C1", "1.2", "1.1", "reply")); err == nil {
@@ -647,7 +686,9 @@ func TestHandleNoMachine(t *testing.T) {
 	// A new direct message with no DM machine is told so, by a post in
 	// the hub's inbox, once, that the outbound side delivers like any
 	// other post, under the hub's name.
-	r.Route.DM = ""
+	if err := r.Store.SetRoute(ctx, store.DMRoute, nil, store.RouteChange{}); err != nil {
+		t.Fatal(err)
+	}
 	dm := message("Ev3", "D1", "5.1", "", "psst")
 	dm.IM = true
 	handle(t, r, dm)
@@ -775,7 +816,7 @@ func TestBackfillWindow(t *testing.T) {
 func TestBackfillAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.db")
 	r, f := newReceiver(t)
-	r.Store = openHub(t, path)
+	r.Store = routed(t, openHub(t, path))
 	connected(t, r)
 	first := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
 	handle(t, r, first)
@@ -784,7 +825,7 @@ func TestBackfillAfterRestart(t *testing.T) {
 	r.Store.Close()
 	post(t, f, "C1", slack.Message{User: "U1", Text: "while down", ThreadTS: first.TS})
 	post(t, f, "C1", slack.Message{User: "U1", Text: hey + "also while down"})
-	r = &Receiver{Store: openHub(t, path), Slack: f, Route: r.Route, Users: r.Users, Bot: r.Bot, Now: r.Now}
+	r = &Receiver{Store: openHub(t, path), Slack: f, Users: r.Users, Bot: r.Bot, Now: r.Now}
 	connected(t, r)
 	handle(t, r, post(t, f, "C1", slack.Message{User: "U1", Text: "live after restart", ThreadTS: first.TS}))
 	runBackfill(t, r)
@@ -911,7 +952,7 @@ func TestBackfillOfOldProcessKeepsNewStart(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "hub.db")
 	old, f := newReceiver(t)
-	old.Store = openHub(t, path)
+	old.Store = routed(t, openHub(t, path))
 	handle(t, old, post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"}))
 	connected(t, old)
 	gate := &gatedHistory{API: f, entered: make(chan struct{}), release: make(chan struct{})}
@@ -925,7 +966,7 @@ func TestBackfillOfOldProcessKeepsNewStart(t *testing.T) {
 	}
 	// The new process comes up and fixes its start; a message is posted
 	// that the old backfill has already read past.
-	fresh := &Receiver{Store: openHub(t, path), Slack: f, Route: old.Route, Users: old.Users, Bot: old.Bot, Now: old.Now}
+	fresh := &Receiver{Store: openHub(t, path), Slack: f, Users: old.Users, Bot: old.Bot, Now: old.Now}
 	connected(t, fresh)
 	post(t, f, "C1", slack.Message{User: "U1", Text: hey + "gap"})
 	close(gate.release)
@@ -1082,7 +1123,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func TestRunAcks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.db")
 	r, f := newReceiver(t)
-	r.Store = openHub(t, path)
+	r.Store = routed(t, openHub(t, path))
 	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
 	tr := newFakeTransport()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -1133,7 +1174,7 @@ func TestRunAcks(t *testing.T) {
 
 	// The hub comes back on the same database; a reply posted while it
 	// was away is backfilled once the connection is up.
-	r.Store = openHub(t, path)
+	r.Store = routed(t, openHub(t, path))
 	if n := len(texts(t, r.Store, "workstation")); n != 1 {
 		t.Fatalf("%d queued after a failed record, want 1", n)
 	}

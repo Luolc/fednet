@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,7 +39,6 @@ import (
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/release"
-	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	"github.com/Luolc/fednet/internal/upgrade"
@@ -74,15 +74,18 @@ commands:
         file it sends alerts, and with the approval key (an Ed25519
         private key, PKCS#8 PEM) it runs approvals: posts the cards and
         signs what the approvers approve; each file holds one credential;
-        the JSON config file says, for each channel, which client takes
-        the threads people start in it and which clients may open threads
-        in it, which client takes direct messages, lists the Slack users
-        fednet serves, each with a name for the agents, which may be
-        empty, names the channel approval cards go to and the users, from
-        that list, who may approve, bounds the thread history a message
-        that mentions the bot carries (how many messages, how many
-        characters in all, how many in one message before it is cut; the
-        defaults are shown), says which uploaded files a client fetches
+        the routes (which client takes the threads people start in each
+        channel and in direct messages, the scope those threads' messages
+        carry, which clients may open threads in each channel) are in the
+        database, changed by client request-route; the JSON config file's
+        channels and dm are read only once, into a database with no
+        routes, and ignored after that, with a warning; the config file
+        lists the Slack users fednet serves, each with a name for the
+        agents, which may be empty, names the channel approval cards and
+        route requests go to and the users, from that list, who may
+        approve, bounds the thread history a message that mentions the bot
+        carries (how many messages, how many characters in all, how many
+        in one message before it is cut; the defaults are shown), says which uploaded files a client fetches
         before it hands a message to its hook (the types, "image/*" for
         all images, the largest file, the most one message's files add up
         to), the largest file a client may fetch at all, the largest file
@@ -211,6 +214,24 @@ commands:
         a message of type approval through the hook, signed when approved;
         an action the card cannot show whole is refused; -requester is a
         note on the card, not checked
+  client request-route -socket PATH -agent NAME (-channel CHANNEL | -dm) [-machine CLIENT-ID]
+         [-scope SCOPE] [-open-thread CLIENT-ID,...] [-requester USER-ID] [-json] [--] TEXT
+  client request-route -socket PATH -agent NAME (-channel CHANNEL | -dm) -delete [-requester USER-ID] [-json] [--] TEXT
+        ask for approval of a change of one route, the channel's or that of
+        direct messages: TEXT says why, NAME is the agent that asks; the
+        route becomes MACHINE taking the threads people start there, their
+        messages carrying SCOPE ([a-z0-9-], none if left out), and the
+        clients listed (comma separated, none if empty) able to open threads
+        in the channel; without -open-thread a route there is keeps its
+        list and a new one lists MACHINE; -delete removes the route; prints
+        the approval id once the hub has posted the card in the approvals
+        channel; once approved the hub makes the change itself, for the
+        threads started after it, and the outcome comes as a message of type
+        approval through the hook, unsigned; -requester is a note on the
+        card, not checked
+  client routes -socket PATH [-json]
+        print the routes: each channel (dm for direct messages), the client
+        that takes its new threads, the scope, and who may open threads
   client ops -socket PATH [-json] (upgrade | version)
         ask the hub for one of two fixed operations, as this machine; run
         it only when a person asks for it: an agent never decides on its
@@ -516,25 +537,20 @@ func (c hubConfig) history() inbound.Limits {
 	return inbound.Limits{MaxMessages: c.History.MaxMessages, MaxChars: c.History.MaxChars, MaxMessageChars: c.History.MaxMessageChars}
 }
 
-// route is the routing part of the config: which client takes new threads
-// in each channel and in direct messages.
-func (c hubConfig) route() route.Config {
-	defaults := make(map[string]string)
+// routes is the routing part of the config, its channels and dm, as the
+// routes a database with none imports, in order of channel.
+func (c hubConfig) routes() []store.Route {
+	var rs []store.Route
 	for ch, cc := range c.Channels {
-		if cc.Machine != "" {
-			defaults[ch] = cc.Machine
+		if cc.Machine != "" || len(cc.OpenThread) > 0 {
+			rs = append(rs, store.Route{Channel: ch, Machine: cc.Machine, OpenThread: cc.OpenThread})
 		}
 	}
-	return route.Config{Defaults: defaults, DM: c.DM.Machine}
-}
-
-// openThread maps each channel to the clients that may open threads in it.
-func (c hubConfig) openThread() map[string][]string {
-	m := make(map[string][]string, len(c.Channels))
-	for ch, cc := range c.Channels {
-		m[ch] = cc.OpenThread
+	if c.DM.Machine != "" {
+		rs = append(rs, store.Route{Channel: store.DMRoute, Machine: c.DM.Machine})
 	}
-	return m
+	slices.SortFunc(rs, func(a, b store.Route) int { return strings.Compare(a.Channel, b.Channel) })
+	return rs
 }
 
 // How the hub reaches Slack once it has the tokens; tests replace them
@@ -665,6 +681,20 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		return err
 	}
 	defer st.Close()
+	// The import commits, or fails this process, before it is ready: a
+	// predecessor serves on until then, from the same routes in its
+	// config.
+	if routes := cfg.routes(); len(routes) > 0 {
+		imported, err := st.ImportRoutes(ctx, routes, time.Now())
+		switch {
+		case err != nil:
+			return fmt.Errorf("importing the config's routes into the database: %w", err)
+		case imported:
+			slog.Info("hub: imported the config's routes into the database; its channels and dm are not read again", "routes", len(routes))
+		default:
+			slog.Warn("hub: ignoring the config's channels and dm: the routes are in the database", "config", *configPath)
+		}
+	}
 	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval, Users: cfg.Users}
 	hub := &link.Hub{
 		Store:         st,
@@ -672,17 +702,18 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		AcceptVersion: acceptVersion,
 		Uplinked:      poster.Nudge,
 	}
-	// Without the key, or without Slack, the hub runs no approvals: a
-	// request is refused rather than left waiting for a card that cannot
-	// be posted or a signature that cannot be made.
+	// Without Slack the hub runs no approvals, and without the key it
+	// signs none: a request is refused rather than left waiting for a card
+	// that cannot be posted or a signature that cannot be made. A route
+	// request needs no signature.
 	var approvals *approval.Flow
-	if key != nil && sl != nil {
+	if sl != nil {
 		approvals = &approval.Flow{
 			Store: st, Slack: sl, Key: key, Channel: cfg.Approvals.Channel, Approvers: cfg.Approvals.Approvers,
 			TTL: approvalTTL, Interval: approvalInterval, Stored: hub.WakeAll,
 		}
 	}
-	api := &hubapi.Server{Store: st, Slack: sl, OpenThread: cfg.openThread(), Users: cfg.Users, Approvals: approvals,
+	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
 		BeforeUpload: poster.BeforeUpload}
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
@@ -730,7 +761,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r = &inbound.Receiver{Store: st, Slack: sl, Route: cfg.route(), Users: cfg.Users, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Commands: upgrades, Stored: func() {
+		r = &inbound.Receiver{Store: st, Slack: sl, Users: cfg.Users, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -794,11 +825,10 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 			defer close(posted)
 			poster.Run(ctx)
 		})
-		if approvals == nil {
-			slog.Info("hub: no approval key, approvals are off")
-		} else {
-			wg.Go(func() { approvals.Run(ctx) })
+		if key == nil {
+			slog.Info("hub: no approval key, only route requests are approved")
 		}
+		wg.Go(func() { approvals.Run(ctx) })
 		if webhook == nil {
 			slog.Warn("hub: no alert webhook, alerts are only logged")
 			return
@@ -948,6 +978,10 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return handoffCommand(ctx, "fednet client handoff", args[1:], stdout)
 		case "request-approval":
 			return clientRequestApproval(ctx, args[1:], stdout)
+		case "request-route":
+			return clientRequestRoute(ctx, args[1:], stdout)
+		case "routes":
+			return clientRoutes(ctx, args[1:], stdout)
 		case "fetch-file":
 			return clientFetchFile(ctx, args[1:], stdout)
 		case "ops":
@@ -1626,6 +1660,82 @@ func clientRequestApproval(ctx context.Context, args []string, stdout io.Writer)
 	}
 	_, err = fmt.Fprintln(stdout, res.ApprovalID)
 	return err
+}
+
+// clientRequestRoute asks the hub for approval of a change of one route
+// and prints the approval id.
+func clientRequestRoute(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client request-route", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	agent := fs.String("agent", "", "the agent that asks (required)")
+	channel := fs.String("channel", "", "the Slack id of the channel whose route changes")
+	dm := fs.Bool("dm", false, "change the route of direct messages")
+	machine := fs.String("machine", "", "the client that takes the threads people start there")
+	scope := fs.String("scope", "", "the scope the messages of those threads carry")
+	openThread := fs.String("open-thread", "", "the clients that may open threads in the channel, comma separated")
+	del := fs.Bool("delete", false, "remove the route")
+	requester := fs.String("requester", "", "Slack id of the person the agent asks on behalf of, shown on the card as the agent's own word")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || *agent == "" || (*channel == "") == !*dm || fs.Arg(0) == "" {
+		return usageError("fednet client request-route: -socket, -agent, one of -channel and -dm, and a non-empty TEXT are required")
+	}
+	q := &hubapi.RouteRequest{Channel: *channel, Machine: *machine, Scope: *scope, Delete: *del}
+	if *dm {
+		q.Channel = store.DMRoute
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "open-thread" {
+			list := []string{}
+			if *openThread != "" {
+				list = strings.Split(*openThread, ",")
+			}
+			q.OpenThread = &list
+		}
+	})
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.RequestRoute, Agent: *agent, Requester: *requester, Route: q, Text: fs.Arg(0)})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.ApprovalID)
+	return err
+}
+
+// clientRoutes prints the hub's routes, one a line: the channel, the
+// client that takes its new threads, the scope and who may open threads,
+// with - for what is not set.
+func clientRoutes(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client routes", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" {
+		return usageError("fednet client routes: -socket is required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Routes})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	or := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
+	for _, r := range res.Routes {
+		if _, err := fmt.Fprintln(stdout, r.Channel, or(r.Machine), or(r.Scope), or(strings.Join(r.OpenThread, ","))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // clientFetchFile has the client daemon fetch a file through the hub and

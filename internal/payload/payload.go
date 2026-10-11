@@ -125,6 +125,11 @@ type Message struct {
 	// message, and when the hub could not read the name or owned the
 	// thread from before it recorded names.
 	ChannelName string `json:"channel_name,omitempty"`
+	// Scope is the scope of the route that handed the thread over, as it
+	// was when the thread got its owner: on every inbound message of the
+	// thread. Empty when the route had none, which the receiver takes as
+	// its default.
+	Scope string `json:"scope,omitempty"`
 	// Trigger says why an inbound message was sent: Mention, Reply or DM.
 	Trigger string `json:"trigger,omitempty"`
 	// UserName is User's name on the hub's user list.
