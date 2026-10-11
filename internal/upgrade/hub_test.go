@@ -387,6 +387,18 @@ func TestRolloutClientsThenHub(t *testing.T) {
 // and the summary names the client.
 func TestRolloutStopsWhenAClientFails(t *testing.T) {
 	b := newBench(t)
+	// The summary asks for another /fednet upgrade, so by the time it is
+	// said the upgrade is no longer in progress.
+	alert := b.h.Alert
+	b.h.Alert = func(ctx context.Context, text string) error {
+		b.h.mu.Lock()
+		target := b.h.target
+		b.h.mu.Unlock()
+		if strings.Contains(text, "没完成") && target != "" {
+			t.Errorf("the hub said %q while still upgrading to %s", text, target)
+		}
+		return alert(ctx, text)
+	}
 	b.run(t)
 	b.click(t, "U1", b.cmd(t, "U1", "upgrade").Card.ID, true)
 	b.next(t)

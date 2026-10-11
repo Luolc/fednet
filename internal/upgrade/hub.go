@@ -559,17 +559,26 @@ func (h *Hub) check(ctx context.Context) {
 // release yet, waits Wait for each to report it, and, when all have,
 // requests the hub's own upgrade and waits Wait for the handoff. Any
 // client that fails, or is still not there at the end of the wait,
-// keeps the hub where it is. Each step is said through Alert.
+// keeps the hub where it is. Each step is said through Alert. The
+// summary is said once the upgrade is no longer in progress, so a retry
+// it asks for is not refused as one.
 func (h *Hub) rollout(ctx context.Context, r rollout) {
-	defer func() {
-		h.mu.Lock()
-		h.target = ""
-		h.mu.Unlock()
-	}()
+	summary := h.carry(ctx, r)
+	h.mu.Lock()
+	h.target = ""
+	h.mu.Unlock()
+	if summary != "" {
+		h.say(ctx, summary)
+	}
+}
+
+// carry does the work of rollout, saying each step but the last, and
+// returns the summary; "" when ctx is done or the hub has handed off
+// before there is one.
+func (h *Hub) carry(ctx context.Context, r rollout) string {
 	clients, err := h.clients(ctx)
 	if err != nil {
-		h.say(ctx, "升级到 "+r.to+" 没开始：读不到 client 名单："+err.Error())
-		return
+		return "升级到 " + r.to + " 没开始：读不到 client 名单：" + err.Error()
 	}
 	var todo, offline, there []string
 	for _, c := range clients {
@@ -593,7 +602,7 @@ func (h *Hub) rollout(ctx context.Context, r rollout) {
 	left := h.await(ctx, todo, failed, r.to)
 	if left == nil {
 		// Stopped or handed off while waiting: nothing to report.
-		return
+		return ""
 	}
 	for _, c := range left {
 		failed[c] = "超时"
@@ -605,23 +614,20 @@ func (h *Hub) rollout(ctx context.Context, r rollout) {
 				fs = append(fs, c+"："+failed[c])
 			}
 		}
-		h.say(ctx, fmt.Sprintf("升级到 %s 没完成：%s；hub 不升，还是 %s。处理好了再发一次 /fednet upgrade", r.to, strings.Join(fs, "，"), h.Version))
-		return
+		return fmt.Sprintf("升级到 %s 没完成：%s；hub 不升，还是 %s。处理好了再发一次 /fednet upgrade", r.to, strings.Join(fs, "，"), h.Version)
 	}
 	if h.Request == "" {
-		h.say(ctx, "client 都已是 "+r.to+"，但 hub 没有配升级请求的路径，hub 不升，还是 "+h.Version)
-		return
+		return "client 都已是 " + r.to + "，但 hub 没有配升级请求的路径，hub 不升，还是 " + h.Version
 	}
 	if err := WriteRequest(h.Request, r.to); err != nil {
-		h.say(ctx, "client 都已是 "+r.to+"，但 hub 的升级请求写不了，hub 不升，还是 "+h.Version+"："+err.Error())
-		return
+		return "client 都已是 " + r.to + "，但 hub 的升级请求写不了，hub 不升，还是 " + h.Version + "：" + err.Error()
 	}
 	h.say(ctx, "client 都已是 "+r.to+"，hub 开始从 "+h.Version+" 升级")
 	t := time.NewTimer(or(h.Wait, DefaultWait))
 	defer t.Stop()
 	select {
 	case <-h.HandedOff:
-		h.say(ctx, "hub 已换成新进程，升级到 "+r.to+" 完成")
+		return "hub 已换成新进程，升级到 " + r.to + " 完成"
 	case <-t.C:
 		// The upgrader leaves what became of the request next to it: a
 		// failed handoff says it rolled back.
@@ -629,8 +635,9 @@ func (h *Hub) rollout(ctx context.Context, r rollout) {
 		if result == "" {
 			result = "升级器没有留下结果，原因在 hub 机器上它的日志里"
 		}
-		h.say(ctx, fmt.Sprintf("hub 在 %v 内没有换成新进程，还是 %s；升级器说：%s", or(h.Wait, DefaultWait), h.Version, result))
+		return fmt.Sprintf("hub 在 %v 内没有换成新进程，还是 %s；升级器说：%s", or(h.Wait, DefaultWait), h.Version, result)
 	case <-ctx.Done():
+		return ""
 	}
 }
 
