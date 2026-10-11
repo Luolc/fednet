@@ -46,16 +46,14 @@ jobs:
 
   ci-green:
     runs-on: ubuntu-24.04
-    # The script waits for at most 30 minutes.
+    # The action waits for at most 30 minutes.
     timeout-minutes: 40
     permissions:
-      contents: read
       actions: read # the CI runs of the tagged commit
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: .github/scripts/release-ci-green.sh "$GITHUB_SHA"
+      # Checks github.sha: the tagged commit, or on workflow_dispatch the
+      # commit the run is on.
+      - uses: Luolc/ci-actions/release-ci-green@afb3a5a9525f6153c9ce996c547b0a714115137e # main, 2026-10-11
 
   build:
     needs: [on-main, ci-green]
