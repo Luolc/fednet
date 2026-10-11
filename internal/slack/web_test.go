@@ -430,8 +430,8 @@ func TestCardBlocks(t *testing.T) {
 	params := "{\n  \"note\": \"```not a fence```\",\n  \"bucket\": \"*example-critical* <https://example.invalid|x>\"\n}"
 	c := Card{ID: "apr-1", Summary: "delete *b* <!channel>", Params: params, Machine: "workstation", Agent: "ops-*exec*", Requester: "<@U7>", Expires: time.Unix(1_760_000_000, 0)}
 	bs := blocks(c)
-	if len(bs) != fixedBlocks+1 {
-		t.Fatalf("%d blocks with one parameter block, want the %d fixed ones and it", len(bs), fixedBlocks)
+	if len(bs) != fixedBlocks {
+		t.Fatalf("%d blocks with one parameter block, want it and the %d fixed ones but the note", len(bs), fixedBlocks-1)
 	}
 	actions, ok := bs[len(bs)-1].(*slackgo.ActionBlock)
 	if !ok || len(actions.Elements.ElementSet) != 2 {
@@ -501,6 +501,12 @@ func TestCardBlocks(t *testing.T) {
 	if text = blocksJSON(t, blocks(c)); !strings.Contains(text, "已过期") {
 		t.Errorf("expired card %s does not say expired", text)
 	}
+	// A note goes under the outcome, in plain text.
+	c.Outcome, c.Approver, c.Note = "approved", "U1", "建 channel 失败：*name_taken*"
+	bs = blocks(c)
+	if sec, ok := bs[len(bs)-1].(*slackgo.SectionBlock); !ok || sec.Text.Type != slackgo.PlainTextType || sec.Text.Text != c.Note {
+		t.Errorf("card with a note ends with %+v, want the note in plain text", bs[len(bs)-1])
+	}
 
 	c.Params = strings.Repeat("é", ParamChunk) + "<&>"
 	got := paramTexts(t, blocks(c))
@@ -508,13 +514,16 @@ func TestCardBlocks(t *testing.T) {
 		t.Fatalf("parameter blocks = %d, joined %q; want two that join to the parameters, the first %d characters", len(got), strings.Join(got, ""), ParamChunk)
 	}
 	// The largest parameters that fit make exactly the largest message
-	// Slack takes, pending or decided, with or without a requester; the
-	// Fake refuses one block more, as Slack would.
+	// Slack takes, decided with a note, and one block less while pending;
+	// the Fake refuses one block more, as Slack would.
 	c.Params = strings.Repeat("x", MaxParamChunks*ParamChunk)
-	for _, outcome := range []string{"", "approved"} {
-		c.Outcome = outcome
-		if n := len(blocks(c)); n != maxBlocks {
-			t.Fatalf("largest card (outcome %q) has %d blocks, want %d", outcome, n, maxBlocks)
+	for _, tt := range []struct {
+		outcome, note string
+		want          int
+	}{{"", "", maxBlocks - 1}, {"approved", "建好了", maxBlocks}} {
+		c.Outcome, c.Note = tt.outcome, tt.note
+		if n := len(blocks(c)); n != tt.want {
+			t.Fatalf("largest card (outcome %q, note %q) has %d blocks, want %d", tt.outcome, tt.note, n, tt.want)
 		}
 	}
 	f := &Fake{}
@@ -841,5 +850,45 @@ func TestWebUpload(t *testing.T) {
 	err = w.Upload(ctx, "C1", "1.1", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
 	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 3 {
 		t.Fatalf("Upload to another host = %v, %d uploads; want it refused before any upload, without quoting the token", err, len(uploaded))
+	}
+}
+
+// CreateChannel and Invite send what Slack takes, and Slack's error codes
+// come back through Code.
+func TestWebCreateChannel(t *testing.T) {
+	ctx := context.Background()
+	fail := ""
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		if fail != "" {
+			return 200, `{"ok":false,"error":"` + fail + `"}`
+		}
+		switch r.method {
+		case "conversations.create":
+			return 200, `{"ok":true,"channel":{"id":"C7","name":"` + r.form.Get("name") + `"}}`
+		case "conversations.invite":
+			return 200, `{"ok":true,"channel":{"id":"C7"}}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	if id, err := w.CreateChannel(ctx, "repo-example", true); err != nil || id != "C7" {
+		t.Fatalf("CreateChannel = %q, %v; want C7", id, err)
+	}
+	if err := w.Invite(ctx, "C7", []string{"U1", "U2"}); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := ts.got()
+	if len(rs) != 2 || rs[0].form.Get("name") != "repo-example" || rs[0].form.Get("is_private") != "true" || rs[1].form.Get("channel") != "C7" || rs[1].form.Get("users") != "U1,U2" {
+		t.Fatalf("requests = %+v, want the create of a private repo-example, then the invite of U1 and U2 to C7", rs)
+	}
+	for _, code := range []string{"name_taken", "missing_scope"} {
+		ts.mu.Lock()
+		fail = code
+		ts.mu.Unlock()
+		if _, err := w.CreateChannel(ctx, "repo-example", false); Code(err) != code {
+			t.Errorf("CreateChannel when Slack says %s: Code(%v) = %q", code, err, Code(err))
+		}
+	}
+	if Code(errors.New("name_taken")) != "" {
+		t.Error("Code read a code out of an error Slack did not send")
 	}
 }

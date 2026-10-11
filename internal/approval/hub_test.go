@@ -7,12 +7,15 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	slackgo "github.com/slack-go/slack"
 	_ "modernc.org/sqlite" // the store's driver, for a test that holds its lock
 
 	"github.com/Luolc/fednet/internal/payload"
@@ -653,5 +656,202 @@ func TestFlowRoute(t *testing.T) {
 	tf.Channel = ""
 	if _, err := tf.RequestRoute(ctx, "workstation", "lead", "", "x", RouteChange{Route: c2}); !errors.Is(err, ErrOff) {
 		t.Fatalf("RequestRoute without the card channel = %v, want ErrOff", err)
+	}
+}
+
+// slackErrs is a Slack whose CreateChannel, SetPurpose and Invite fail
+// with the errors set, those that are.
+type slackErrs struct {
+	*slack.Fake
+	create, purpose, invite error
+}
+
+func (s *slackErrs) CreateChannel(ctx context.Context, name string, private bool) (string, error) {
+	if s.create != nil {
+		return "", s.create
+	}
+	return s.Fake.CreateChannel(ctx, name, private)
+}
+
+func (s *slackErrs) SetPurpose(ctx context.Context, channel, purpose string) error {
+	if s.purpose != nil {
+		return s.purpose
+	}
+	return s.Fake.SetPurpose(ctx, channel, purpose)
+}
+
+func (s *slackErrs) Invite(ctx context.Context, channel string, users []string) error {
+	if s.invite != nil {
+		return s.invite
+	}
+	return s.Fake.Invite(ctx, channel, users)
+}
+
+// slackSays is the error Slack's Web API answers with code, as a Web call
+// returns it.
+func slackSays(code string) error {
+	return fmt.Errorf("slack: some.method: %w", slackgo.SlackErrorResponse{Err: code})
+}
+
+// An approved request to create a channel creates it on the next Pass,
+// with its purpose and the people invited, writes its route, sends the
+// outcome with the channel's id and says on the card how it went. What
+// Slack refuses fails the request, or, once the channel is there, is told
+// in the note; a missing scope is told as the scope and what it is for.
+func TestFlowCreateChannel(t *testing.T) {
+	tf := newFlow(t)
+	tf.Key = nil
+	ctx := t.Context()
+	sl := &slackErrs{Fake: tf.f}
+	tf.Slack = sl
+	create := func(n NewChannel) (string, store.ChannelRequest, payload.Message, slack.Card) {
+		t.Helper()
+		id, err := tf.RequestRoute(ctx, "workstation", "lead", "", "new repo", RouteChange{Route: store.Route{Machine: "workstation", Scope: "data", OpenThread: []string{"workstation"}}, Create: &n})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tss, cards := tf.f.Cards("C9")
+		ts := tss[len(cards)-1]
+		if c := tf.card(t, ts); c.Summary != "建 channel 并写路由：new repo" {
+			t.Fatalf("card = %+v, want it to say it creates a channel", c)
+		}
+		tf.click(t, id, ts, "U1", true)
+		cr, err := tf.Store.ChannelRequest(ctx, id)
+		if err != nil || !cr.Done {
+			t.Fatalf("channel request after the Pass = %+v, %v; want done", cr, err)
+		}
+		out := tf.outcomes(t, "workstation")
+		return id, cr, out[len(out)-1], tf.card(t, ts)
+	}
+
+	id, cr, m, c := create(NewChannel{Name: "repo-example", Purpose: "the example repo", Invite: []string{"U2"}})
+	if name, private, members := tf.f.Created(cr.Created); name != "repo-example" || private || !slices.Equal(members, []string{"U2"}) {
+		t.Fatalf("created %q, private %v, members %q; want public repo-example with U2", name, private, members)
+	}
+	if info, err := tf.f.ChannelInfo(ctx, cr.Created); err != nil || info.Purpose != "the example repo" {
+		t.Fatalf("channel info = %+v, %v; want the purpose", info, err)
+	}
+	if got, err := tf.Store.Route(ctx, cr.Created); err != nil || got.Machine != "workstation" || got.Scope != "data" {
+		t.Fatalf("route of the new channel = %+v, %v; want workstation with scope data", got, err)
+	}
+	wantNote := "已建公开 channel #repo-example (" + cr.Created + ")，路由已写好"
+	if m.ApprovalID != id || m.Outcome != payload.Approved || m.Channel != cr.Created || m.Note != wantNote || c.Outcome != payload.Approved || c.Note != wantNote {
+		t.Fatalf("outcome %+v, card %+v; want approved, the channel and the note %q", m, c, wantNote)
+	}
+
+	// The name is taken now: the request fails, and no route is written.
+	_, cr, m, c = create(NewChannel{Name: "repo-example"})
+	if m.Outcome != payload.Failed || m.Channel != "" || !strings.Contains(m.Note, "name_taken") || c.Note != m.Note || cr.Created != "" {
+		t.Fatalf("outcome %+v, card note %q; want failed with name_taken", m, c.Note)
+	}
+
+	// No scope to create a private channel: told as the scope it takes.
+	sl.create = slackSays("missing_scope")
+	_, _, m, _ = create(NewChannel{Name: "repo-private", Private: true})
+	if m.Outcome != payload.Failed || !strings.Contains(m.Note, "groups:write") || !strings.Contains(m.Note, "建私有 channel") {
+		t.Fatalf("outcome %+v; want failed, naming groups:write and creating a private channel", m)
+	}
+	// No answer from Slack: the channel may be there.
+	sl.create = errors.New("context deadline exceeded")
+	_, _, m, _ = create(NewChannel{Name: "repo-slow"})
+	if m.Outcome != payload.Failed || !strings.Contains(m.Note, "可能已经建好") {
+		t.Fatalf("outcome %+v; want failed, saying the channel may exist", m)
+	}
+	sl.create = nil
+
+	// The purpose and the invite fail once the channel is there: it and
+	// its route stay, and the note says what failed.
+	sl.purpose, sl.invite = slackSays("missing_scope"), slackSays("user_not_found")
+	_, cr, m, _ = create(NewChannel{Name: "repo-partial", Purpose: "p", Invite: []string{"U2"}})
+	if _, err := tf.Store.Route(ctx, cr.Created); err != nil || m.Outcome != payload.Approved || m.Channel == "" ||
+		!strings.Contains(m.Note, "写 purpose 失败：bot token 没有 channels:write.topic") || !strings.Contains(m.Note, "拉人失败：slack: some.method: user_not_found") {
+		t.Fatalf("outcome %+v, route err %v; want approved with the channel, and the purpose and invite failures in the note", m, err)
+	}
+	sl.purpose, sl.invite = nil, nil
+
+	// A request the hub asked Slack about before, without carrying it
+	// out, is not asked again.
+	id, err := tf.RequestRoute(ctx, "workstation", "lead", "", "new repo", RouteChange{Route: store.Route{Machine: "workstation"}, Create: &NewChannel{Name: "repo-again"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tss, _ := tf.f.Cards("C9")
+	tf.clickOnly(t, slack.Click{ID: id, Approve: true, User: "U1", Channel: "C9", TS: tss[len(tss)-1]})
+	if err := tf.Store.MarkChannelAttempted(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := tf.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	out := tf.outcomes(t, "workstation")
+	if m := out[len(out)-1]; m.ApprovalID != id || m.Outcome != payload.Failed || !strings.Contains(m.Note, "没有做完") {
+		t.Fatalf("outcome %+v; want failed, saying the last attempt did not finish", m)
+	}
+	if _, err := tf.f.CreateChannel(ctx, "repo-again", false); err != nil {
+		t.Fatalf("a channel named repo-again is there already: %v", err)
+	}
+}
+
+// A request to create a channel creates nothing unless approved: not when
+// rejected, not when it expires. One the hub recorded Slack's id for goes
+// on from there without creating the channel again.
+func TestFlowCreateChannelOnlyOnApproval(t *testing.T) {
+	tf := newFlow(t)
+	tf.Key = nil
+	ctx := t.Context()
+	request := func(name string) (id, ts string) {
+		t.Helper()
+		id, err := tf.RequestRoute(ctx, "workstation", "lead", "", "new repo", RouteChange{Route: store.Route{Machine: "workstation"}, Create: &NewChannel{Name: name}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tss, _ := tf.f.Cards("C9")
+		return id, tss[len(tss)-1]
+	}
+	rejected, ts := request("repo-rejected")
+	tf.click(t, rejected, ts, "U1", false)
+	expired, _ := request("repo-expired")
+	tf.now = tf.now.Add(TTL)
+	if err := tf.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, m := range tf.outcomes(t, "workstation") {
+		got = append(got, m.ApprovalID+" "+m.Outcome)
+	}
+	if want := []string{rejected + " " + payload.Rejected, expired + " " + payload.Expired}; !slices.Equal(got, want) {
+		t.Fatalf("outcomes = %q, want %q", got, want)
+	}
+	for _, name := range []string{"repo-rejected", "repo-expired"} {
+		if _, err := tf.f.CreateChannel(ctx, name, false); err != nil {
+			t.Fatalf("a channel named %s was created: %v", name, err)
+		}
+	}
+
+	// Slack created the channel and its id is recorded, but the hub did
+	// not get further: the next Pass writes the route and sends the
+	// outcome, and does not create the channel again, which Slack would
+	// refuse as name_taken.
+	id, ts := request("repo-resumed")
+	tf.clickOnly(t, slack.Click{ID: id, Approve: true, User: "U1", Channel: "C9", TS: ts})
+	channel, err := tf.f.CreateChannel(ctx, "repo-resumed", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tf.Store.MarkChannelAttempted(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := tf.Store.MarkChannelCreated(ctx, id, channel); err != nil {
+		t.Fatal(err)
+	}
+	if err := tf.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	out := tf.outcomes(t, "workstation")
+	if m := out[len(out)-1]; m.ApprovalID != id || m.Outcome != payload.Approved || m.Channel != channel {
+		t.Fatalf("outcome = %+v, want %s approved with %s", m, id, channel)
+	}
+	if got, err := tf.Store.Route(ctx, channel); err != nil || got.Machine != "workstation" {
+		t.Fatalf("route of %s = %+v, %v; want workstation", channel, got, err)
 	}
 }

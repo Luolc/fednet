@@ -100,22 +100,39 @@ func (f *Flow) Request(ctx context.Context, client, agent, requester, summary st
 }
 
 // RouteChange is what a route request asks for: Route to become the
-// route of its channel, or, with Delete, the route of Route.Channel to go.
+// route of its channel, or, with Delete, the route of Route.Channel to go,
+// or, with Create, a new channel, with Route as its route.
 type RouteChange struct {
 	store.Route
-	Delete bool `json:"delete,omitempty"`
+	Delete bool        `json:"delete,omitempty"`
+	Create *NewChannel `json:"create,omitempty"`
+}
+
+// NewChannel is the channel a route request creates: its name, whether it
+// is private, its purpose and the people to invite into it, by Slack
+// user id.
+type NewChannel struct {
+	Name    string   `json:"name"`
+	Private bool     `json:"private,omitempty"`
+	Purpose string   `json:"purpose,omitempty"`
+	Invite  []string `json:"invite,omitempty"`
 }
 
 // RequestRoute records the request of client's agent to make change, with
 // summary saying why, and posts the card, as Request does; an approval of
-// it makes the change in the hub's routes, and nothing is signed, so the
-// hub needs no Key for it.
+// it makes the change in the hub's routes, creating the channel first
+// when change has Create, and nothing is signed, so the hub needs no Key
+// for it.
 func (f *Flow) RequestRoute(ctx context.Context, client, agent, requester, summary string, change RouteChange) (string, error) {
 	action, err := json.MarshalIndent(change, "", "  ")
 	if err != nil {
 		return "", err
 	}
-	return f.request(ctx, store.Approval{Kind: store.KindRoute, Client: client, Agent: agent, Requester: requester, Summary: summary, Action: action, Nonce: []byte{}})
+	kind := store.KindRoute
+	if change.Create != nil {
+		kind = store.KindChannel
+	}
+	return f.request(ctx, store.Approval{Kind: kind, Client: client, Agent: agent, Requester: requester, Summary: summary, Action: action, Nonce: []byte{}})
 }
 
 // request records a, an approval of either kind with its request filled
@@ -250,7 +267,11 @@ func (f *Flow) decide(ctx context.Context, id, outcome, by string) (d store.Deci
 		}
 		d = store.Decision{Status: outcome, By: by, At: now}
 		m := payload.Message{Type: payload.Approval, ApprovalID: a.ID, Agent: a.Agent, Outcome: outcome, Approver: by, Text: a.Summary}
-		if outcome == payload.Approved && a.Kind == store.KindRoute {
+		if outcome == payload.Approved && a.Kind == store.KindChannel {
+			// The channel is created by the next Pass, outside the
+			// transaction, which sends the outcome down then.
+			return d, nil
+		} else if outcome == payload.Approved && a.Kind == store.KindRoute {
 			var c RouteChange
 			if err := json.Unmarshal(a.Action, &c); err != nil {
 				return store.Decision{}, err
@@ -293,9 +314,23 @@ func (f *Flow) decide(ctx context.Context, id, outcome, by string) (d store.Deci
 // giving Slack SlackTimeout. A card Slack does not update now is left for
 // the next Pass; a card that is gone from Slack has nothing to show.
 func (f *Flow) finishCard(ctx context.Context, a store.Approval) {
+	c := card(a)
+	if a.Kind == store.KindChannel && a.Status == payload.Approved {
+		// A card that creates a channel waits until that is done, and
+		// then says how it went.
+		cr, err := f.Store.ChannelRequest(ctx, a.ID)
+		if err != nil {
+			slog.Warn("approval: reading what came of a channel request", "approval", a.ID, "err", err)
+			return
+		}
+		if !cr.Done {
+			return
+		}
+		c.Note = cr.Note
+	}
 	sctx, cancel := context.WithTimeout(ctx, f.slackTimeout())
 	defer cancel()
-	err := f.Slack.UpdateCard(sctx, a.Channel, a.TS, card(a))
+	err := f.Slack.UpdateCard(sctx, a.Channel, a.TS, c)
 	if errors.Is(err, slack.ErrNotFound) {
 		slog.Warn("approval: the card is gone from Slack", "approval", a.ID)
 	} else if err != nil {
@@ -310,8 +345,11 @@ func (f *Flow) finishCard(ctx context.Context, a store.Approval) {
 // card is a's card as it should look now.
 func card(a store.Approval) slack.Card {
 	summary := a.Summary
-	if a.Kind == store.KindRoute {
+	switch a.Kind {
+	case store.KindRoute:
 		summary = "改路由：" + summary
+	case store.KindChannel:
+		summary = "建 channel 并写路由：" + summary
 	}
 	c := slack.Card{ID: a.ID, Summary: summary, Params: string(a.Action), Machine: a.Client, Agent: a.Agent, Requester: a.Requester, Expires: a.ExpiresAt}
 	if a.Status != store.Pending {
@@ -369,6 +407,9 @@ func (f *Flow) Pass(ctx context.Context) error {
 			}
 		}
 	}
+	if err := f.createChannels(ctx); err != nil {
+		return err
+	}
 	unfinished, err := f.Store.UnfinishedCards(ctx)
 	if err != nil {
 		return err
@@ -389,6 +430,133 @@ func (f *Flow) Pass(ctx context.Context) error {
 		}
 	}
 	return f.postRouteChanges(ctx)
+}
+
+// createChannels carries out each approved request to create a channel:
+// it asks Slack to create the channel, records its id, sets its purpose
+// and invites the people the request names, then, in one transaction,
+// writes the channel's route, records the request carried out and sends
+// the outcome down. A request the hub asked Slack about before is not
+// asked again: with the id recorded it goes on from there, and without it
+// fails, as the channel may exist, and says so. The request under way
+// runs to its end when ctx is done, each Slack call within SlackTimeout,
+// so that a handoff does not cut it off; no other starts then.
+func (f *Flow) createChannels(ctx context.Context) error {
+	todo, err := f.Store.ChannelRequestsToDo(ctx)
+	if err != nil {
+		return err
+	}
+	for _, cr := range todo {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := f.createChannel(context.WithoutCancel(ctx), cr); err != nil {
+			return err
+		}
+		if f.Stored != nil {
+			f.Stored()
+		}
+	}
+	return nil
+}
+
+// createChannel carries out cr, as createChannels says.
+func (f *Flow) createChannel(ctx context.Context, cr store.ChannelRequest) error {
+	a, err := f.Store.Approval(ctx, cr.ID)
+	if err != nil {
+		return err
+	}
+	var c RouteChange
+	if err := json.Unmarshal(a.Action, &c); err != nil {
+		return err
+	}
+	channel, note, err := f.makeChannel(ctx, cr, *c.Create)
+	if err != nil {
+		return err
+	}
+	m := payload.Message{Type: payload.Approval, ApprovalID: a.ID, Agent: a.Agent, Outcome: payload.Approved, Approver: a.DecidedBy, Text: a.Summary, Channel: channel, Note: note}
+	if channel == "" {
+		m.Outcome = payload.Failed
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	route := c.Route
+	route.Channel = channel
+	return f.Store.FinishChannelRequest(ctx, cr.ID, note, func(tx *store.Hub) error {
+		if channel != "" {
+			if err := tx.SetRoute(ctx, channel, &route, store.RouteChange{RequestID: a.ID, Client: a.Client, Agent: a.Agent, Approver: a.DecidedBy, At: f.now()}); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Outbox.Enqueue(ctx, a.Client, b)
+		return err
+	})
+}
+
+// makeChannel makes n for the request cr: creates it unless cr has it
+// already, then sets its purpose and invites the people. It returns the
+// channel's id, empty when there is no channel, and what came of it; an
+// error only when the database fails. Once the channel is there, a purpose
+// or an invite that fails is told in the note and does not undo it.
+func (f *Flow) makeChannel(ctx context.Context, cr store.ChannelRequest, n NewChannel) (channel, note string, err error) {
+	kind, perms := "公开", channelScopes{create: "channels:manage", purpose: "channels:write.topic (或 channels:manage)", invite: "channels:write.invites (或 channels:manage)"}
+	if n.Private {
+		kind, perms = "私有", channelScopes{create: "groups:write", purpose: "groups:write.topic (或 groups:write)", invite: "groups:write.invites (或 groups:write)"}
+	}
+	call := func(op func(context.Context) error) error {
+		sctx, cancel := context.WithTimeout(ctx, f.slackTimeout())
+		defer cancel()
+		return op(sctx)
+	}
+	switch channel = cr.Created; {
+	case channel != "":
+	case cr.Attempted:
+		return "", "hub 上次建 #" + n.Name + " 时没有做完，这个 channel 可能已经建好了：先在 Slack 里找一找，没有再重新提议", nil
+	default:
+		if err := f.Store.MarkChannelAttempted(ctx, cr.ID); err != nil {
+			return "", "", err
+		}
+		err := call(func(ctx context.Context) (err error) {
+			channel, err = f.Slack.CreateChannel(ctx, n.Name, n.Private)
+			return err
+		})
+		switch {
+		case err != nil && slack.Code(err) == "":
+			return "", "建 #" + n.Name + " 时没等到 Slack 的回答 (" + err.Error() + ")，这个 channel 可能已经建好了：先在 Slack 里找一找，没有再重新提议", nil
+		case err != nil:
+			return "", "建 #" + n.Name + " 失败：" + explain(err, "建"+kind+" channel", perms.create), nil
+		}
+		if err := f.Store.MarkChannelCreated(ctx, cr.ID, channel); err != nil {
+			return "", "", err
+		}
+	}
+	notes := []string{"已建" + kind + " channel #" + n.Name + " (" + channel + ")，路由已写好"}
+	if n.Purpose != "" {
+		if err := call(func(ctx context.Context) error { return f.Slack.SetPurpose(ctx, channel, n.Purpose) }); err != nil {
+			notes = append(notes, "写 purpose 失败："+explain(err, "写"+kind+" channel 的 purpose", perms.purpose))
+		}
+	}
+	if len(n.Invite) > 0 {
+		if err := call(func(ctx context.Context) error { return f.Slack.Invite(ctx, channel, n.Invite) }); err != nil {
+			notes = append(notes, "拉人失败："+explain(err, "往"+kind+" channel 里拉人", perms.invite))
+		}
+	}
+	return channel, strings.Join(notes, "；"), nil
+}
+
+// channelScopes are the scopes the bot token needs to create a channel of
+// one kind, set its purpose and invite people into it.
+type channelScopes struct{ create, purpose, invite string }
+
+// explain says err from a Slack call that does what: missing_scope as
+// the scope it takes, anything else as it is.
+func explain(err error, what, scope string) string {
+	if slack.Code(err) == "missing_scope" {
+		return "bot token 没有 " + scope + " 这个 scope，hub 不能" + what + "；在 Slack app 里加上这个 scope 并重新安装后再提议"
+	}
+	return err.Error()
 }
 
 // postRouteChanges tells each change of the routes not told yet in

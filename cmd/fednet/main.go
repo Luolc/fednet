@@ -88,15 +88,15 @@ commands:
         in one message before it is cut; the defaults are shown), says
         which uploaded files a client fetches before it hands a message to
         its hook (the types, "image/*" for all images, the largest file,
-        the most one message's files add up to), the largest file a client may fetch at all, the largest file
-        and how many files a post may upload, in bytes (the defaults are
-        shown: 20 MiB, 50 MiB, 200 MiB, 50 MiB, 10), whether an upload
-        names the machine in its comment rather than in a block (for a
-        Slack that takes no blocks with an upload), and names the users,
-        from that list, who may upgrade with /fednet upgrade and whether
-        the hub upgrades on its own when it finds a new release (default
-        yes), and, for each operation of client ops, the clients that may
-        ask for it (none unless listed):
+        the most one message's files add up to), the largest file a client
+        may fetch at all, the largest file and how many files a post may
+        upload, in bytes (the defaults are shown: 20 MiB, 50 MiB, 200 MiB,
+        50 MiB, 10), whether an upload names the machine in its comment
+        rather than in a block (for a Slack that takes no blocks with an
+        upload), and names the users, from that list, who may upgrade with
+        /fednet upgrade and whether the hub upgrades on its own when it
+        finds a new release (default yes), and, for each operation of
+        client ops, the clients that may ask for it (none unless listed):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
@@ -230,6 +230,19 @@ commands:
         approval through the hook, unsigned; -requester is a note on the
         card, not checked; exits 5 while the route has a request waiting
         for approval: ask again once it is decided
+  client request-channel -socket PATH -agent NAME -name NAME -machine CLIENT-ID [-private]
+         [-purpose TEXT] [-invite USER-ID,...] [-scope SCOPE] [-open-thread CLIENT-ID,...]
+         [-requester USER-ID] [-json] [--] TEXT
+        ask for approval to create a Slack channel and give it a route, as
+        request-route does for a channel there is: NAME is 1 to 80 of a-z,
+        0-9, - and _; the channel is public unless -private; once approved
+        the hub creates it, with the bot in it, sets its purpose, invites
+        the users listed (each on the user list), writes the route and
+        tells the outcome through the hook, as a message of type approval
+        with the channel's id, or of outcome failed with why (a name Slack
+        has already, a scope the bot token lacks); a purpose or an invite
+        that fails leaves the channel and its route; exits 5 while a request
+        for the same name waits for approval
   client routes -socket PATH [-json]
         print the routes: each channel (dm for direct messages), the client
         that takes its new threads, the scope, and who may open threads
@@ -981,6 +994,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientRequestApproval(ctx, args[1:], stdout)
 		case "request-route":
 			return clientRequestRoute(ctx, args[1:], stdout)
+		case "request-channel":
+			return clientRequestChannel(ctx, args[1:], stdout)
 		case "routes":
 			return clientRoutes(ctx, args[1:], stdout)
 		case "fetch-file":
@@ -1696,6 +1711,51 @@ func clientRequestRoute(ctx context.Context, args []string, stdout io.Writer) er
 		}
 	})
 	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.RequestRoute, Agent: *agent, Requester: *requester, Route: q, Text: fs.Arg(0)})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.ApprovalID)
+	return err
+}
+
+// clientRequestChannel asks the hub for approval to create a channel with
+// a route and prints the approval id.
+func clientRequestChannel(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client request-channel", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	agent := fs.String("agent", "", "the agent that asks (required)")
+	name := fs.String("name", "", "the name of the channel to create (required)")
+	private := fs.Bool("private", false, "create a private channel")
+	purpose := fs.String("purpose", "", "the channel's purpose")
+	invite := fs.String("invite", "", "Slack ids of the users to invite, comma separated, each on the user list")
+	machine := fs.String("machine", "", "the client that takes the threads people start there (required)")
+	scope := fs.String("scope", "", "the scope the messages of those threads carry")
+	openThread := fs.String("open-thread", "", "the clients that may open threads in the channel, comma separated; the machine alone if left out")
+	requester := fs.String("requester", "", "Slack id of the person the agent asks on behalf of, shown on the card as the agent's own word")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || *agent == "" || *name == "" || *machine == "" || fs.Arg(0) == "" {
+		return usageError("fednet client request-channel: -socket, -agent, -name, -machine and a non-empty TEXT are required")
+	}
+	n := &approval.NewChannel{Name: *name, Private: *private, Purpose: *purpose}
+	if *invite != "" {
+		n.Invite = strings.Split(*invite, ",")
+	}
+	q := &hubapi.RouteRequest{Machine: *machine, Scope: *scope, Create: n}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "open-thread" {
+			list := []string{}
+			if *openThread != "" {
+				list = strings.Split(*openThread, ",")
+			}
+			q.OpenThread = &list
+		}
+	})
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.RequestChannel, Agent: *agent, Requester: *requester, Route: q, Text: fs.Arg(0)})
 	if err != nil {
 		return err
 	}

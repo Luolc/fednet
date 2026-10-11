@@ -85,3 +85,43 @@ func TestRouteFlow(t *testing.T) {
 	}
 	rig.stop(t)
 }
+
+// End to end: an agent asks for a channel through the client; once the
+// card is approved the hub creates it with the bot in it, invites the
+// person named, writes its route, and the outcome reaches the hook with
+// the channel's id.
+func TestCreateChannelFlow(t *testing.T) {
+	ctx := t.Context()
+	rig := startApprovalRig(t, false)
+	var out syncBuffer
+	code := run(ctx, []string{"client", "request-channel", "-socket", rig.socket, "-agent", "lead", "-name", "repo-example", "-machine", "workstation",
+		"-scope", "data", "-purpose", "the example repo", "-invite", "U2", "new repo"}, &out, rig.stderr)
+	id := strings.TrimSpace(out.String())
+	if code != 0 || id == "" {
+		t.Fatalf("request-channel: exit %d, printed %q; want 0 and an approval id", code, id)
+	}
+	tss, cards := rig.f.Cards("C9")
+	if len(cards) != 1 || cards[0].ID != id {
+		t.Fatalf("cards = %+v, want the request %s", cards, id)
+	}
+	if err := rig.sr.r.Click(ctx, slack.Click{ID: id, Approve: true, User: "U1", Channel: "C9", TS: tss[0]}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the outcome to reach the hook", func() bool { return len(rig.outcomes(t)) == 1 })
+	m := rig.outcomes(t)[0]
+	if m.ApprovalID != id || m.Outcome != payload.Approved || m.Channel == "" {
+		t.Fatalf("outcome = %+v, want %s approved with the channel's id", m, id)
+	}
+	if name, private, members := rig.f.Created(m.Channel); name != "repo-example" || private || len(members) != 1 || members[0] != "U2" {
+		t.Fatalf("created %q, private %v, members %q; want public repo-example with U2", name, private, members)
+	}
+	out = syncBuffer{}
+	if code := run(ctx, []string{"client", "routes", "-socket", rig.socket}, &out, rig.stderr); code != 0 || out.String() != m.Channel+" workstation data workstation\n" {
+		t.Fatalf("client routes: exit %d, printed %q; want the new channel's route", code, out.String())
+	}
+	waitFor(t, "the card to say the channel is there", func() bool {
+		c, _ := rig.f.Card("C9", tss[0])
+		return strings.Contains(c.Note, "已建公开 channel #repo-example")
+	})
+	rig.stop(t)
+}

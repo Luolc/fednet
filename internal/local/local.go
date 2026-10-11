@@ -359,7 +359,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		}
 		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
-		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.Routes, hubapi.Ops, hubapi.Delete:
+		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.RequestChannel, hubapi.Routes, hubapi.Ops, hubapi.Delete:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
