@@ -407,9 +407,14 @@ func TestClientStoresBeforeAck(t *testing.T) {
 func TestClientStoresReplayOnce(t *testing.T) {
 	srv, conns := fakeHub(t)
 	cs := openClientStore(t)
-	testClient(t, cs, "a", srv.URL, &cutter{})
+	// The client's pong is answered only while this end reads, and a slow
+	// machine can leave it unread past testTimeout: leave the timeout at
+	// the default, so the connection stays up.
+	testClientWith(t, cs, "a", srv.URL, &cutter{}, func(c *Client) { c.Timeout = 0 })
 	conn := <-conns
 	defer conn.CloseNow()
+	// Not reading here for longer than testTimeout is that slow machine.
+	time.Sleep(3 * testTimeout)
 	// The same message twice, as a hub does when the first ack was lost.
 	for _, seq := range []int64{1, 2} {
 		if err := wsjson.Write(t.Context(), conn, downlink{Seq: seq, MsgID: "m1", Payload: []byte("x")}); err != nil {
@@ -821,7 +826,10 @@ func TestUpgradeHeader(t *testing.T) {
 		cut := &cutter{}
 		c := &Client{
 			Store: openClientStore(t), ID: id, Hub: srv.URL, Header: http.Header{VersionHeader: {version}},
-			Heartbeat: testHeartbeat, Backoff: testBackoff, Timeout: testTimeout,
+			// A pong waits unread while the receiver is in Divert, so the
+			// timeout is the default: past testTimeout the client would
+			// drop the connection, and the hub send the upgrade again.
+			Heartbeat: testHeartbeat, Backoff: testBackoff,
 			HTTPClient: &http.Client{Transport: &http.Transport{DialContext: cut.dial}},
 			Divert: func(_ context.Context, p []byte) bool {
 				if string(p) != "upgrade" {
@@ -829,7 +837,13 @@ func TestUpgradeHeader(t *testing.T) {
 				}
 				mu.Lock()
 				taken[id] = append(taken[id], string(p))
+				first := len(taken[id]) == 1
 				mu.Unlock()
+				if first {
+					// Acting on the notice takes longer than testTimeout,
+					// as it may on a slow machine.
+					time.Sleep(3 * testTimeout)
+				}
 				return true
 			},
 			Upgrade: func(_ context.Context, to string) {
