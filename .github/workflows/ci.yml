@@ -2,7 +2,7 @@
 # the docs/design.md length check and its test, the tests of the release
 # guards, then the Go checks (gofmt, vet, race-enabled tests). The job name
 # `check` is the required status check. A release reads the result of this
-# workflow on main; see release-ci-green.sh.
+# workflow on main; see the ci-green job of release.yml.
 
 name: CI
 
@@ -82,12 +82,9 @@ jobs:
         run: .github/scripts/design-length.sh
 
       - name: Release guard tests
-        # The waiting arms of release-ci-green.test.sh poll without a pause.
-        timeout-minutes: 5
         run: |
           .github/scripts/release-version.test.sh
           .github/scripts/release-on-main.test.sh
-          .github/scripts/release-ci-green.test.sh
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
