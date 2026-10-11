@@ -1,8 +1,8 @@
 # PR and main gate: secret scan of the new commits, pre-commit on all files,
 # the docs/design.md length check and its test, the tests of the release
-# guards, then the Go checks (gofmt, vet, race-enabled tests). The job name
-# `check` is the required status check. A release reads the result of this
-# workflow on main; see the ci-green job of release.yml.
+# guards, then the Go checks (gofmt, vet, race-enabled tests). A release
+# reads the result of this workflow on main; see the ci-green job of
+# release.yml.
 
 name: CI
 
