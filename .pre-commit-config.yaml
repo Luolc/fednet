@@ -21,6 +21,6 @@ repos:
   # wheel from PyPI; the main limae repo builds from Rust source, which makes
   # every cold hook environment slow to build.
   - repo: https://github.com/Luolc/limae-pre-commit
-    rev: v0.13.3
+    rev: v0.13.4
     hooks:
       - id: limae
