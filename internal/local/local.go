@@ -89,7 +89,7 @@ type Request struct {
 	// Route is the argument of hubapi.RequestRoute.
 	Route *hubapi.RouteRequest `json:"route,omitempty"`
 	// Ref and Card are the arguments of hubapi.Ask, and ID that of
-	// hubapi.AskClose.
+	// hubapi.AskClose and hubapi.ReadAnswer.
 	Ref  string `json:"ref,omitempty"`
 	Card []byte `json:"card,omitempty"`
 	ID   string `json:"id,omitempty"`
@@ -109,6 +109,7 @@ type Response struct {
 	ApprovalID string          `json:"approval_id,omitempty"`
 	Routes     []store.Route   `json:"routes,omitempty"`
 	Question   *ask.Posted     `json:"question,omitempty"`
+	Card       *hubapi.Card    `json:"card,omitempty"`
 	Path       string          `json:"path,omitempty"`
 	Version    string          `json:"version,omitempty"`
 	PID        int             `json:"pid,omitempty"`
@@ -369,7 +370,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
 		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.RequestChannel, hubapi.Routes, hubapi.Ops, hubapi.Delete,
-		hubapi.Ask, hubapi.AskClose, hubapi.React, hubapi.Unreact:
+		hubapi.Ask, hubapi.AskClose, hubapi.ReadAnswer, hubapi.React, hubapi.Unreact:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
@@ -519,7 +520,7 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err := json.Unmarshal(answer, &reply); err != nil {
 		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
 	}
-	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID, Routes: reply.Routes, Question: reply.Question}
+	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID, Routes: reply.Routes, Question: reply.Question, Card: reply.Card}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An
