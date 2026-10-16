@@ -77,9 +77,9 @@ type Flow struct {
 	hints []hint
 }
 
-// hint is a text to show user alone, in the thread that starts at ts in
-// channel, or in channel when ts is empty.
-type hint struct{ channel, ts, user, text string }
+// hint is a text to show user alone about a click on card, in the
+// thread that starts at ts in channel, or in channel when ts is empty.
+type hint struct{ card, channel, ts, user, text string }
 
 // Posted is where a card is: its id, its message, and the link to it,
 // empty when Slack did not give one.
@@ -181,7 +181,7 @@ func (f *Flow) Click(ctx context.Context, c slack.QuestionClick) error {
 		return err
 	}
 	if h.text != "" {
-		h.user = c.User
+		h.card, h.user = c.ID, c.User
 		f.mu.Lock()
 		if len(f.hints) < maxHints {
 			f.hints = append(f.hints, h)
@@ -198,14 +198,6 @@ func (f *Flow) Click(ctx context.Context, c slack.QuestionClick) error {
 // for one that did.
 func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 	h := hint{channel: c.Channel}
-	switch {
-	case c.Bot:
-		h.text = "bot 不能回答问题"
-		return h, nil
-	case !f.listed(c.User):
-		h.text = "你不在用户名单上，不能回答这个问题"
-		return h, nil
-	}
 	q, err := f.Store.Question(ctx, c.ID)
 	if errors.Is(err, store.ErrNotFound) {
 		h.text = "没有这张问题卡 (编号 " + c.ID + ")"
@@ -215,8 +207,17 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 		return h, err
 	}
 	channel, root, _ := slack.ParseThreadKey(q.Thread)
-	h.ts = root
-	if c.Channel != channel || c.TS != q.TS {
+	if c.Channel == channel {
+		h.ts = root
+	}
+	switch {
+	case c.Bot:
+		h.text = "bot 不能回答问题"
+		return h, nil
+	case !f.listed(c.User):
+		h.text = "你不在用户名单上，不能回答这个问题"
+		return h, nil
+	case c.Channel != channel || c.TS != q.TS:
 		h.text = "这个按钮不在编号 " + c.ID + " 的问题卡上"
 		return h, nil
 	}
@@ -380,7 +381,7 @@ func (f *Flow) Pass(ctx context.Context) error {
 		}
 		cancel()
 		if err != nil {
-			slog.Warn("ask: telling the clicker why the click did not count", "user", h.user, "err", err)
+			slog.Warn("ask: telling the clicker why the click did not count", "card", h.card, "user", h.user, "err", err)
 		}
 	}
 	return nil

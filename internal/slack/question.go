@@ -396,7 +396,20 @@ func (f *Fake) Picked(triggerID string) (PickerState, bool) {
 	return s, ok
 }
 
-// WhisperInThread keeps text with the other ephemeral texts shown to user.
-func (f *Fake) WhisperInThread(ctx context.Context, channel, _, user, text string) error {
-	return f.Whisper(ctx, channel, user, text)
+// WhisperInThread keeps text with the other ephemeral texts shown to
+// user, and ts with it for WhisperedIn.
+func (f *Fake) WhisperInThread(_ context.Context, channel, ts, user, text string) error {
+	return f.whisper(channel, ts, user, text)
+}
+
+// WhisperedIn returns, for each ephemeral text shown to user, oldest
+// first, the thread it was shown in, or "" for the channel.
+func (f *Fake) WhisperedIn(user string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ts []string
+	for _, w := range f.whispers[user] {
+		ts = append(ts, w.ts)
+	}
+	return ts
 }

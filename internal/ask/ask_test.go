@@ -143,8 +143,8 @@ func TestAsk(t *testing.T) {
 
 // Submit sends the choice and the note down once and the card then shows
 // them; a second press, a press by someone off the user list, by a bot or
-// on a card that is not this one changes nothing and gets a hint, as does
-// "other" with no note.
+// on a card that is not this one changes nothing and gets a hint in the
+// card's thread, as does "other" with no note.
 func TestSubmit(t *testing.T) {
 	tf := newFlow(t)
 	p := tf.ask(t, "q-12")
@@ -167,6 +167,14 @@ func TestSubmit(t *testing.T) {
 	tf.pass(t)
 	if w1, w2, w9 := tf.f.Whispers("U1"), tf.f.Whispers("U2"), tf.f.Whispers("U9"); len(w1) != 3 || len(w2) != 1 || len(w9) != 1 || w2[0] != "请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。" {
 		t.Fatalf("hints: U1 %q, U2 %q, U9 %q; want 3, 1, 1", w1, w2, w9)
+	}
+	_, root, _ := slack.ParseThreadKey(tf.thread)
+	for _, u := range []string{"U1", "U2", "U9"} {
+		for _, in := range tf.f.WhisperedIn(u) {
+			if in != root {
+				t.Fatalf("hints to %s shown in %q, want all in thread %s", u, tf.f.WhisperedIn(u), root)
+			}
+		}
 	}
 
 	tf.click(t, p, "U2", slack.QuestionSubmitAction, "1", "补充一句")
