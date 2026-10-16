@@ -13,7 +13,7 @@
 ## Design impact
 
 <!--
-本 PR 改了 docs/design.md 的哪一节或哪条不变量，以及守护它的测试；没有就写「无」。除了维护者发起的 design 修订，其它 PR 不改 docs/design.md。
+本 PR 改了 docs/design.md 的哪一节或哪条不变量，以及守护它的测试；没有就写「无」。改了 fednet 的行为、接口或不变量的 PR，在同一个 PR 里更新 docs/design.md 的相应部分。
 -->
 
 ## 检查
