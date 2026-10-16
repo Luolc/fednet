@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/hook"
+	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/question"
 	"github.com/Luolc/fednet/internal/slack"
@@ -84,6 +86,24 @@ func TestQuestionFlow(t *testing.T) {
 		t.Fatalf("answer = %+v, want (b) answered by U2 with the note", a)
 	}
 	waitFor(t, "the card to show the answer", func() bool { c, _ := rig.f.Question("C9", p.TS); return c.State == question.Answered })
+	out = syncBuffer{}
+	if code := run(ctx, []string{"client", "read-answer", "-socket", rig.socket, "-json", p.ID}, &out, rig.stderr); code != 0 {
+		t.Fatalf("client read-answer: exit %d", code)
+	}
+	var c hubapi.Card
+	if err := json.Unmarshal([]byte(out.String()), &c); err != nil || c.ID != p.ID || c.Thread != thread || c.Status != question.Answered || c.Question.Question != "放宽第 5 条吗？" {
+		t.Fatalf("client read-answer printed %q (%v), want the card, answered", out.String(), err)
+	}
+	if a := rig.answers(t)[0]; !bytes.Equal(c.Answer, mustJSON(t, a)) {
+		t.Fatalf("read-answer's answer = %s, want %s, as the hook got it", c.Answer, mustJSON(t, a))
+	}
+	out = syncBuffer{}
+	if code := run(ctx, []string{"client", "read-answer", "-socket", rig.socket, p.ID}, &out, rig.stderr); code != 0 || out.String() != "answered\n"+string(c.Answer)+"\n" {
+		t.Fatalf("client read-answer: exit %d, printed %q; want the status and the answer", code, out.String())
+	}
+	if code := run(ctx, []string{"client", "read-answer", "-socket", rig.socket, "NOSUCHCARD"}, &out, rig.stderr); code != 1 {
+		t.Fatalf("client read-answer of no card: exit %d, want 1", code)
+	}
 	if code := run(ctx, []string{"client", "ask-close", "-socket", rig.socket, p.ID}, &out, rig.stderr); code != exitBadRequest {
 		t.Fatalf("ask-close of an answered card: exit %d, want %d", code, exitBadRequest)
 	}
@@ -115,4 +135,14 @@ func TestQuestionFlow(t *testing.T) {
 		t.Fatalf("%d cards and %d answers, want 2 and 1", len(cards), len(rig.answers(t)))
 	}
 	rig.stop(t)
+}
+
+// mustJSON returns a as the hub writes it.
+func mustJSON(t *testing.T, a question.Answer) []byte {
+	t.Helper()
+	b, err := a.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

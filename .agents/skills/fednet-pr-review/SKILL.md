@@ -12,6 +12,6 @@ hub 机器的 hostname `fednet-hub` 是设计的一部分，可以写。Linear �
 ## 设计文档
 
 - PR 描述的「Design impact」要填：写影响哪一节或哪条不变量以及守护它的测试，没有影响写「无」。
-- 只有维护者发起的 design 修订可以改 `docs/design.md`；其它 PR 改了它，是阻塞项。
+- PR 改了 fednet 的行为、接口或不变量，却没在同一个 PR 里更新 `docs/design.md` 的相应部分，是问题；改 `docs/design.md` 本身不是阻塞项。
 - `docs/design.md` 列出的每条不变量要链到一个存在的测试；链接指向的测试找不到，是阻塞项。没有测试的不变量必须标「untested」并列进 PR 描述。
 - 仓里不应该出现 ADR、调研报告和待办清单。
