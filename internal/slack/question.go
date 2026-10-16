@@ -175,11 +175,11 @@ func questionBlocks(c QuestionCard) []slackgo.Block {
 		return append(bs, idLine)
 	}
 	a := c.Answer
-	var line string
+	var line, choice string
 	switch c.State {
 	case question.Answered:
 		if a.Choice != nil && a.Choice.Index < len(q.Options) {
-			line = "✅ <@" + a.By + "> 选了 *" + q.OptionLabel(a.Choice.Index) + "*"
+			line, choice = "✅ <@"+a.By+"> 选了", q.OptionLabel(a.Choice.Index)
 		} else {
 			line = "✍️ <@" + a.By + "> 选了「其他」，写了补充"
 		}
@@ -189,6 +189,9 @@ func questionBlocks(c QuestionCard) []slackgo.Block {
 		line = "🚫 <@" + a.By + "> 关闭了这个问题"
 	}
 	bs = append(bs, slackgo.NewSectionBlock(mrkdwn(line), nil, nil))
+	if choice != "" {
+		bs = append(bs, slackgo.NewSectionBlock(plain(choice), nil, nil))
+	}
 	if a.Note != "" {
 		bs = append(bs, slackgo.NewSectionBlock(plain("补充："+a.Note), nil, nil))
 	}

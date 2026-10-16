@@ -236,7 +236,7 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 		if i, err := strconv.Atoi(c.Choice); err == nil && i >= 0 && i < len(card.Options) {
 			a.Choice = &question.Choice{Index: i, Short: card.Options[i].Short}
 		} else if c.Note == "" {
-			h.text = "选了「其他」的话，请先在补充框里写几句，再点「提交」。"
+			h.text = "请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。"
 			return h, nil
 		}
 	case slack.QuestionCloseAction:

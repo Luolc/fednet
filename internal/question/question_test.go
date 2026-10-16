@@ -55,6 +55,26 @@ func TestParse(t *testing.T) {
 		}
 	}
 
+	// The total of the markdown blocks holds at 12000 and fails at 12001:
+	// the context, and four options of "**(a) x**", a newline and Long.
+	total := func(extra int) string {
+		var opts []string
+		for i := range 4 {
+			n := 2240
+			if i == 0 {
+				n += extra
+			}
+			opts = append(opts, fmt.Sprintf(`{"short": "x", "long": %q}`, strings.Repeat("问", n)))
+		}
+		return fmt.Sprintf(`{"question": "q", "context": %q, "options": [%s]}`, strings.Repeat("问", MaxContext), strings.Join(opts, ","))
+	}
+	if _, err := Parse([]byte(total(0))); err != nil {
+		t.Errorf("markdown at %d characters: %v, want nil", MaxMarkdown, err)
+	}
+	if _, err := Parse([]byte(total(1))); err == nil || err.Error() != "context and the options' long take 12001 characters on the card, Slack shows at most 12000 in one message" {
+		t.Errorf("markdown at %d characters: %v, want it refused", MaxMarkdown+1, err)
+	}
+
 	var six []string
 	for range 6 {
 		six = append(six, `{"short": "x"}`)

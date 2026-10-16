@@ -87,6 +87,26 @@ func TestQuestionBlocks(t *testing.T) {
 		t.Fatalf("buttons = %s, want %s", strings.Join(buttons, ","), want)
 	}
 
+	// The option chosen goes in plain text: what the agent wrote is never
+	// mrkdwn.
+	chosen := c
+	chosen.Question.Options = []question.Option{{Short: "*粗* <!channel>"}}
+	chosen.Mentions, chosen.State = nil, question.Answered
+	chosen.Answer = question.Answer{Outcome: question.Answered, Choice: &question.Choice{Index: 0, Short: "*粗* <!channel>"}, By: "U1"}
+	var plainTexts []string
+	for _, b := range questionBlocks(chosen) {
+		if sec, ok := b.(*slackgo.SectionBlock); ok && sec.Text != nil {
+			if sec.Text.Type == slackgo.PlainTextType {
+				plainTexts = append(plainTexts, sec.Text.Text)
+			} else if strings.Contains(sec.Text.Text, "粗") {
+				t.Fatalf("the option chosen is in mrkdwn: %q", sec.Text.Text)
+			}
+		}
+	}
+	if !strings.Contains(strings.Join(plainTexts, "|"), "(a) *粗* <!channel>") {
+		t.Fatalf("plain text sections = %q, want the option chosen as it is", plainTexts)
+	}
+
 	c.Mentions, c.State = nil, question.Answered
 	c.Answer = question.Answer{QuestionID: "r1", CardID: "Q1", Outcome: question.Answered, Note: "`*x*` <y>", By: "U1", At: "t"}
 	got := mustJSON(t, questionBlocks(c))
@@ -140,7 +160,7 @@ func TestWebQuestions(t *testing.T) {
 		case "chat.postMessage", "chat.update":
 			return 200, `{"ok":true,"channel":"C1","ts":"1.5"}`
 		case "chat.getPermalink":
-			return 200, `{"ok":true,"channel":"C1","permalink":"https://example.slack.com/archives/C1/p15"}`
+			return 200, `{"ok":true,"channel":"C1","permalink":"https://slack.example.invalid/archives/C1/p15"}`
 		case "views.open":
 			return 200, `{"ok":true,"view":{"id":"V1"}}`
 		case "chat.postEphemeral":
@@ -156,7 +176,7 @@ func TestWebQuestions(t *testing.T) {
 	if err := w.UpdateQuestion(ctx, "C1", "1.5", c); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := w.Permalink(ctx, "C1", "1.5"); err != nil || got != "https://example.slack.com/archives/C1/p15" {
+	if got, err := w.Permalink(ctx, "C1", "1.5"); err != nil || got != "https://slack.example.invalid/archives/C1/p15" {
 		t.Fatalf("Permalink = %q, %v", got, err)
 	}
 	if err := w.PickTime(ctx, "T1", PickerState{ID: "Q1", Channel: "C1", TS: "1.5"}); err != nil {

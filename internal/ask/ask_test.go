@@ -165,7 +165,7 @@ func TestSubmit(t *testing.T) {
 		t.Fatalf("answers after clicks that do not count = %+v, want none", as)
 	}
 	tf.pass(t)
-	if w1, w2, w9 := tf.f.Whispers("U1"), tf.f.Whispers("U2"), tf.f.Whispers("U9"); len(w1) != 3 || len(w2) != 1 || len(w9) != 1 || w2[0] != "选了「其他」的话，请先在补充框里写几句，再点「提交」。" {
+	if w1, w2, w9 := tf.f.Whispers("U1"), tf.f.Whispers("U2"), tf.f.Whispers("U9"); len(w1) != 3 || len(w2) != 1 || len(w9) != 1 || w2[0] != "请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。" {
 		t.Fatalf("hints: U1 %q, U2 %q, U9 %q; want 3, 1, 1", w1, w2, w9)
 	}
 
