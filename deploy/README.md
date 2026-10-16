@@ -6,6 +6,7 @@
 - [`echo-hook.sh`](echo-hook.sh)：client 的示例钩子，把收到的每条消息的概要回到同一个线程，见下面「回声钩子」一节。
 - `fednet-hub-upgrade.path`、`fednet-hub-upgrade.service`、`fednet-client-upgrade.path`、`fednet-client-upgrade.service`：让 hub 和 client 自己升级的 root 单元，见下面「升级」一节。
 - [`hub.example.json`](hub.example.json)：hub 配置的示例，channel id、机器名、用户 id 都是示例值。字段的含义以 `fednet` 不带参数时打印的用法为准。
+- [`slack-app-manifest.yaml`](slack-app-manifest.yaml)：Slack app 当前的 manifest，以这份为准。改 scope 或事件订阅就改这份文件，再把整份粘进 Slack 后台 app 设置里的 App Manifest。
 
 机器本身怎么建、文件怎么装上去，不在这个仓里。
 
@@ -58,9 +59,9 @@ agent 也可以用 `fednet client request-channel` 提议新建一个 Slack chan
 
 channel 里的消息只有 @ 了 bot 才交给 agent，@ 的那条带上线程里之前的消息作为上下文；配置里的 `history` 定上下文的上限：`max_messages` 最多几条，`max_chars` 这几条的正文合计最多几个字符，`max_message_chars` 单条正文超过几个字符就截断 (@ 的那条本身也按它截)。不写就用示例里的默认值 (10、4000、2000)。hub 启动时用 bot token 调一次 `auth.test` 认自己的用户 id，调不到就不启动。
 
-人在 Slack 里上传的文件由 hub 用 bot token 代 client 下载 (app 的 manifest 要有 `files:read`)；配置里的 `files` 定上限：`prefetch_types` 是交给 agent 之前就先取到它机器上的类型 (`image/*` 是所有图片)，`prefetch_max_bytes` 先取的单个文件最大几个字节，`prefetch_max_total_bytes` 一条消息先取的合计最多几个字节，`fetch_max_bytes` agent 用 `fednet client fetch-file` 按需取时单个文件最大几个字节，`upload_max_bytes` 与 `upload_max_files` 是 agent 用 `fednet client post -file` 发文件时单个文件最大几个字节、一次最多几个 (manifest 要有 `files:write`)。不写就用示例里的默认值 (图片与 PDF、20 MiB、50 MiB、200 MiB、50 MiB、10 个)。旧配置里的 `upload_comment` 已经不用，hub 读到时只记一行日志。hub 不存文件；client 存在它数据库旁边的 `files/` 下 (`-files-dir` 可改)，默认保留 7 天、合计 2 GiB (`-files-retention`、`-files-max-total-bytes`)。
+人在 Slack 里上传的文件由 hub 用 bot token 代 client 下载 (app 的 [manifest](slack-app-manifest.yaml) 要有 `files:read`)；配置里的 `files` 定上限：`prefetch_types` 是交给 agent 之前就先取到它机器上的类型 (`image/*` 是所有图片)，`prefetch_max_bytes` 先取的单个文件最大几个字节，`prefetch_max_total_bytes` 一条消息先取的合计最多几个字节，`fetch_max_bytes` agent 用 `fednet client fetch-file` 按需取时单个文件最大几个字节，`upload_max_bytes` 与 `upload_max_files` 是 agent 用 `fednet client post -file` 发文件时单个文件最大几个字节、一次最多几个 (manifest 要有 `files:write`)。不写就用示例里的默认值 (图片与 PDF、20 MiB、50 MiB、200 MiB、50 MiB、10 个)。旧配置里的 `upload_comment` 已经不用，hub 读到时只记一行日志。hub 不存文件；client 存在它数据库旁边的 `files/` 下 (`-files-dir` 可改)，默认保留 7 天、合计 2 GiB (`-files-retention`、`-files-max-total-bytes`)。
 
-agent 用 `fednet client react` 在线程的第一条消息上加或去掉 bot 自己的 emoji reaction (app 的 manifest 要有 `reactions:write`)，比如用来标出线程现在的状态。缺这个 scope 时命令退 3，错误里写明缺的是 `reactions:write`；改了 manifest 要重新安装 app，hub 的 bot token 才有它。
+agent 用 `fednet client react` 在线程的第一条消息上加或去掉 bot 自己的 emoji reaction (app 的 [manifest](slack-app-manifest.yaml) 要有 `reactions:write`)，比如用来标出线程现在的状态。缺这个 scope 时命令退 3，错误里写明缺的是 `reactions:write`；改了 manifest 要重新安装 app，hub 的 bot token 才有它。
 
 用户名单上的人在一个已有归属的线程的第一条消息上加 emoji reaction 时，hub 把它交给线程归属的 client，钩子收到一条 `reaction` 类型的消息，带线程、人和 emoji 名。这要 app 订阅 bot event `reaction_added`，manifest 要有 `reactions:read`；改完要重新安装 app。去掉 reaction、加在线程里其它消息上的、名单外的人加的，都不转发。hub 不记这类事件，Slack 重发一次，client 就会再收到一次；断线期间加的 reaction 也不补拉。
 
@@ -90,7 +91,7 @@ hub 和 client 都不改自己的二进制。要升级时它们只写一个升�
 
 升级怎么触发，三条路都走上面这套单元：
 
-- Slack 里的 slash command `/fednet`。正式 app 的 manifest 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、bot token 已有的 scope (hub 启动时从 `auth.test` 响应的 `X-OAuth-Scopes` 头读到，读不到就是 `unknown`，启动日志里也记一行)、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
+- Slack 里的 slash command `/fednet`。正式 app 的 [manifest](slack-app-manifest.yaml) 要加 `commands` 权限和这条命令，在任何 channel 或私信里都能发，bot 不必在那个 channel 里，命令文字不会作为消息进 channel、也不会路由给 agent。`/fednet version` 回 hub 的版本、最新的 release、bot token 已有的 scope (hub 启动时从 `auth.test` 响应的 `X-OAuth-Scopes` 头读到，读不到就是 `unknown`，启动日志里也记一行)、每台 client 的版本和是否在线，用户名单上的人都能用，只有发命令的人看得到。`/fednet upgrade` 只有配置里 `upgrade.admins` 列出的人能用，只能升到最新的 release、不能降级；它先回一张只有发命令的人看得到的确认卡「从 vX 升到 vY？」，点「升级」才开始，点「取消」或者十分钟没点就作废。
 - hub 每小时查一次最新的 release，有新的就自己开始升级；配置里 `upgrade.auto` 设成 `false` 就只留手动。hub 跑的不是发布版 (`fednet version` 打出 `dev`) 时不查，也不能从 Slack 升级。
 - agent 机器上的 `fednet client ops -socket <client 的 socket> upgrade`，例如用户在 Slack 里让 workstation 上的 agent 把 fednet 升级一下。hub 配置里 `ops.upgrade` 列出的 client 才能用 (`ops.version` 管同一条命令的 `version`，读数和 `/fednet version` 一样)，没列的一律拒绝，认的是 client 连 hub 用的凭证，不是请求里写的名字。它和点「升级」走同一条路、只能升到最新的 release，hub 开始升级就返回，不等做完，进度看报警 channel；已是最新就只回一句。每次请求，不论成功、失败还是被拒，hub 都在执行之前先写一行日志、执行完再写一行结果，再在报警 channel 发一条，写明哪台 client、什么操作、结果；报警 channel 积压太多条没发出去时，hub 不执行新的请求，回「hub 忙」(退 5)，过一会儿再试。这条命令只在人要求时用，agent 不自己决定升级。
 
