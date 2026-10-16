@@ -16,7 +16,7 @@ fednet 是用户与各台机器上的 coding agent 之间的 Slack 消息桥：�
   - 不超过 200 行，由 CI 检查。
   - 只有维护者发起的 design 修订可以改它。其它 PR 不碰它，在描述的「Design impact」里写：影响哪一节或哪条不变量以及守护它的测试，没有影响就写「无」。
 - PR 描述按 `.github/pull_request_template.md` 写，包括 Design impact。
-- Slack app 的权限和事件订阅以 `deploy/slack-app-manifest.yaml` 为准。要改 scope 或事件订阅，在同一个 PR 里改这份文件，合入后把整份文件交给维护者，粘进 Slack 后台的 App Manifest，不让维护者到各个设置页上逐项点。维护者在后台另外改过的，先请他把当前 manifest 贴回来，对齐这份文件再改。
+- Slack app 的权限和事件订阅以 `deploy/slack-app-manifest.yaml` 为准。要改 scope 或事件订阅，在同一个 PR 里改这份文件，合入后把整份文件交给维护者，粘进 Slack 后台的 App Manifest，不让维护者到各个设置页上逐项点。维护者在后台另外改过的，先请维护者把当前 manifest 贴回来，对齐这份文件再改。
 
 ## 检查与测试
 
