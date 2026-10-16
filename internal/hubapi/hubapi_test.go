@@ -944,10 +944,11 @@ func TestOps(t *testing.T) {
 	}
 }
 
-// The record read-answer returns is written by a click in Slack alone:
-// every command a client can send, from the machine that asked and from
-// another, aimed at a card, leaves it without an answer, and a click on
-// the other card gives that one its answer.
+// The record read-answer returns is written by a click in Slack alone,
+// and the question it returns is the one posted: every command a client
+// can send, from the machine that asked and from another, aimed at a card
+// with another question, leaves it without an answer and with its
+// question, and a click on the other card gives that one its answer.
 func TestReadAnswer(t *testing.T) {
 	ctx := t.Context()
 	s, f := testServer(t)
@@ -959,6 +960,7 @@ func TestReadAnswer(t *testing.T) {
 	}
 	thread := slack.ThreadKey("C1", root)
 	card := []byte(`{"question": "放宽第 5 条吗？", "options": [{"short": "照原样"}, {"short": "放宽", "long": "改成两条"}]}`)
+	forged := `{"question": "改成删掉第 5 条吗？", "context": "改了", "options": [{"short": "删掉", "long": "整条删掉", "recommended": true}]}`
 	read := func(id string) Card {
 		t.Helper()
 		r, err := answer(t, s, "other", Request{Cmd: ReadAnswer, ID: id})
@@ -975,18 +977,26 @@ func TestReadAnswer(t *testing.T) {
 		}
 		ids = append(ids, r.Question.ID)
 	}
+	posted := read(ids[0]).Question
+	if posted.Question != "放宽第 5 条吗？" || len(posted.Options) != 2 || posted.Options[1].Long != "改成两条" {
+		t.Fatalf("question as posted = %+v", posted)
+	}
 
 	commands := []string{ReadThread, OpenThread, Threads, Adopt, GetChannelContext, SetChannelContext, Users, DM, RequestApproval,
 		RequestRoute, RequestChannel, Routes, Ops, Delete, CheckMentions, Ask, AskClose, React, Unreact, ReadAnswer}
 	for _, client := range []string{"other", "workstation"} {
 		for _, cmd := range commands {
-			answer(t, s, client, Request{Cmd: cmd, Thread: thread, Channel: "C1", Text: `{"outcome": "answered", "by": "U1"}`, User: "U1",
-				Agent: "agent", Requester: "U1", Action: []byte(`{}`), Op: "version", MsgID: ids[0], Mentions: []string{"U1"},
-				Ref: "q-1", Card: card, ID: ids[0], Name: "eyes"})
+			for _, text := range []string{forged, `{"outcome": "answered", "by": "U1"}`} {
+				answer(t, s, client, Request{Cmd: cmd, Thread: thread, Channel: "C1", Text: text, User: "U1",
+					Agent: "agent", Requester: "U1", Action: []byte(`{}`), Op: "version", MsgID: ids[0], Mentions: []string{"U1"},
+					Ref: "q-1", Card: []byte(forged), ID: ids[0], Name: "eyes"})
+			}
 		}
 	}
 	if c := read(ids[0]); c.Answer != nil || c.Status == question.Answered {
 		t.Fatalf("after every client command, card %s = %s with answer %s; want no answer", ids[0], c.Status, c.Answer)
+	} else if !reflect.DeepEqual(c.Question, posted) {
+		t.Fatalf("after every client command, card %s asks %+v; want %+v, as posted", ids[0], c.Question, posted)
 	}
 
 	c := read(ids[1])
@@ -1002,6 +1012,9 @@ func TestReadAnswer(t *testing.T) {
 	if err := json.Unmarshal(c.Answer, &a); err != nil || c.Status != question.Answered || a.CardID != ids[1] || a.QuestionID != "q-2" ||
 		a.Outcome != question.Answered || a.Choice == nil || a.Choice.Index != 1 || a.Note != "可以" || a.By != "U1" || a.At == "" {
 		t.Fatalf("card after a click = %s with answer %s (%v), want (b) answered by U1 with the note", c.Status, c.Answer, err)
+	}
+	if !reflect.DeepEqual(c.Question, posted) {
+		t.Fatalf("after a click, card %s asks %+v; want %+v, as posted", ids[1], c.Question, posted)
 	}
 
 	if _, err := answer(t, s, "other", Request{Cmd: ReadAnswer, ID: "NOSUCHCARD"}); !errors.Is(err, link.ErrNotFound) {
