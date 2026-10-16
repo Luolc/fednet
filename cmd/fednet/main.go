@@ -28,6 +28,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/approval"
+	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/files"
 	"github.com/Luolc/fednet/internal/handoff"
@@ -38,6 +39,7 @@ import (
 	"github.com/Luolc/fednet/internal/local"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/question"
 	"github.com/Luolc/fednet/internal/release"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
@@ -247,6 +249,34 @@ commands:
         print the routes: each channel (dm for direct messages), the client
         that takes its new threads, the scope, who may open threads, and
         the channel's name as Slack gives it
+  client ask -socket PATH -thread THREAD-KEY -ref REF -card FILE [-mention USER-ID]... [-json]
+        post a question card in a thread and print its id (with -json: id,
+        channel, ts and permalink); FILE, - for standard input, is the
+        question as JSON:
+        {"question": "one sentence, at most 140 characters",
+         "context": "standard Markdown, at most 3000 characters, optional",
+         "options": [{"short": "at most 60 characters", "long": "standard Markdown,
+                      at most 2900 characters", "recommended": true}]}
+        at most 5 options, at most one recommended, the context and the
+        options' long at most 12000 characters together; a card over a limit
+        is refused with the field, the limit and its length, never cut; the
+        card adds "other", a note box, submit, snooze (30 minutes, 2 hours,
+        tomorrow, a time picked) and close; REF is the caller's id of the
+        question: asking with a REF this machine asked with before posts no
+        second card and prints that one; -mention names users on the user
+        list to mention on the card; each press of submit, snooze or close by
+        a person on the user list, and each snoozed card posted again at the
+        bottom of the thread when its time comes, comes through the hook as
+        a message of type answer whose answer field is
+        {"question_id": REF, "card_id": ID, "outcome": "answered" | "snoozed"
+         | "closed" | "resurfaced", "choice": {"index": N, "short": "..."} or
+         null for "other", "note": "...", "snooze_until": RFC 3339,
+         "by": USER-ID, "at": RFC 3339}, with no choice, note or by on
+        resurfaced; the card then shows that JSON at its bottom
+  client ask-close -socket PATH [-note TEXT] [-json] ID
+        take back a question card this machine asked that still waits, or
+        is snoozed: it shows the note and no buttons, and nothing comes
+        through the hook
   client ops -socket PATH [-json] (upgrade | version)
         ask the hub for one of two fixed operations, as this machine; run
         it only when a person asks for it: an agent never decides on its
@@ -722,13 +752,15 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	// that cannot be posted or a signature that cannot be made. A route
 	// request needs no signature.
 	var approvals *approval.Flow
+	var questions *ask.Flow
 	if sl != nil {
+		questions = &ask.Flow{Store: st, Slack: sl, Users: cfg.Users, Stored: hub.WakeAll}
 		approvals = &approval.Flow{
 			Store: st, Slack: sl, Key: key, Channel: cfg.Approvals.Channel, Approvers: cfg.Approvals.Approvers,
 			TTL: approvalTTL, Interval: approvalInterval, Stored: hub.WakeAll,
 		}
 	}
-	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals,
+	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals, Questions: questions,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
 		BeforeUpload: poster.BeforeUpload}
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
@@ -776,7 +808,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r = &inbound.Receiver{Store: st, Slack: sl, Users: cfg.Users, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Commands: upgrades, Stored: func() {
+		r = &inbound.Receiver{Store: st, Slack: sl, Users: cfg.Users, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Questions: questions, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -844,6 +876,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 			slog.Info("hub: no approval key, only route requests are approved")
 		}
 		wg.Go(func() { approvals.Run(ctx) })
+		wg.Go(func() { questions.Run(ctx) })
 		if webhook == nil {
 			slog.Warn("hub: no alert webhook, alerts are only logged")
 			return
@@ -1003,6 +1036,10 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientFetchFile(ctx, args[1:], stdout)
 		case "ops":
 			return clientOps(ctx, args[1:], stdout)
+		case "ask":
+			return clientAsk(ctx, args[1:], stdout)
+		case "ask-close":
+			return clientAskClose(ctx, args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -1647,6 +1684,77 @@ func checkLength(cmd, text string) error {
 		return exitError{exitBadRequest, fmt.Errorf("%s: TEXT is over %d characters", cmd, hubapi.MaxTextChars)}
 	}
 	return nil
+}
+
+// stdin is what `client ask -card -` reads; tests replace it.
+var stdin io.Reader = os.Stdin
+
+// clientAsk posts a question card in a thread and prints its id. The card
+// is checked here, as the hub checks it, so a card over the limits is a
+// usage error before the socket.
+func clientAsk(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client ask", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	thread := fs.String("thread", "", "the key of the thread to ask in, CHANNEL/TS (required)")
+	ref := fs.String("ref", "", "the caller's id of the question; asking with it again posts no second card (required)")
+	cardPath := fs.String("card", "", "file holding the question as JSON, - for standard input (required)")
+	var mentions []string
+	fs.Func("mention", "Slack id of a user on the user list to mention on the card (repeatable)", func(user string) error {
+		mentions = append(mentions, user)
+		return nil
+	})
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" || *thread == "" || *ref == "" || *cardPath == "" {
+		return usageError("fednet client ask: -socket, -thread, -ref and -card are required")
+	}
+	if _, _, ok := slack.ParseThreadKey(*thread); !ok {
+		return usageError(fmt.Sprintf("fednet client ask: %q is not a thread key (CHANNEL/TS)", *thread))
+	}
+	var card []byte
+	var err error
+	if *cardPath == "-" {
+		card, err = io.ReadAll(stdin)
+	} else {
+		card, err = os.ReadFile(*cardPath)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := question.Parse(card); err != nil {
+		return exitError{exitBadRequest, fmt.Errorf("fednet client ask: %w", err)}
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Ask, Thread: *thread, Ref: *ref, Card: card, Mentions: mentions})
+	if err != nil {
+		return err
+	}
+	if res.Question == nil {
+		return errors.New("fednet client ask: the hub answered without the card")
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res.Question)
+	}
+	_, err = fmt.Fprintln(stdout, res.Question.ID)
+	return err
+}
+
+// clientAskClose takes back a question card this machine asked.
+func clientAskClose(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client ask-close", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	note := fs.String("note", "", "a note the card shows")
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || fs.Arg(0) == "" {
+		return usageError("fednet client ask-close: -socket and a card ID are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.AskClose, ID: fs.Arg(0), Text: *note})
+	if err != nil || !*asJSON {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(res)
 }
 
 // clientRequestApproval asks the hub for approval of an action and prints

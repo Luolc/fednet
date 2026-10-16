@@ -141,7 +141,7 @@ func OpenHub(ctx context.Context, path string) (*Hub, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, routeSchema); err != nil {
+	if _, err := db.ExecContext(ctx, routeSchema+questionSchema); err != nil {
 		db.Close()
 		return nil, err
 	}
