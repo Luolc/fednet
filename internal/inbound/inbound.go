@@ -251,6 +251,36 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	return nil
 }
 
+// Reaction is a reaction a person added: User put the emoji Name on the
+// message at TS in Channel.
+type Reaction struct {
+	Channel, TS, User, Name string
+}
+
+// React queues a, a reaction a person on the user list put on the first
+// message of a thread that has an owner, for that owner, as a message of
+// type reaction; any other reaction is not the agents' business. Nothing
+// records the event, so one Slack delivers again is queued again. An
+// error means nothing was queued, and the event must not be acked.
+func (r *Receiver) React(ctx context.Context, a Reaction) error {
+	if _, ok := r.Users[a.User]; !ok {
+		return nil
+	}
+	thread := slack.ThreadKey(a.Channel, a.TS)
+	m := payload.Message{Type: payload.Reaction, Thread: thread, User: a.User, UserName: r.Users[a.User], Reaction: a.Name}
+	_, err := route.New(r.Store).RouteReply(ctx, thread, m)
+	if errors.Is(err, route.ErrNoOwner) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inbound: reaction on %s: %w", thread, err)
+	}
+	if r.Stored != nil {
+		r.Stored()
+	}
+	return nil
+}
+
 // Click hands a press on an approval card's button to the approvals; an
 // error means it was not applied and must not be acked.
 func (r *Receiver) Click(ctx context.Context, c slack.Click) error {

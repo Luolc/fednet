@@ -29,6 +29,10 @@ const (
 	// or a snoozed card coming back, sent down to the client that asked.
 	// It reaches the hook like any message.
 	Answer = "answer"
+	// Reaction is an emoji a person on the user list put on the first
+	// message of a thread, sent down to the thread's owner. It reaches
+	// the hook like any message.
+	Reaction = "reaction"
 	// Upgrade tells a client to upgrade itself to Version, a release. The
 	// client acts on it itself; it never reaches the hook.
 	Upgrade = "upgrade"
@@ -117,8 +121,11 @@ type Message struct {
 	// with its name and link.
 	Text string `json:"text,omitempty"`
 	// User is the Slack user id of the person who posted an inbound
-	// message.
+	// message, or put a reaction on a thread.
 	User string `json:"user,omitempty"`
+	// Reaction is the name of the emoji, without colons, of a message of
+	// type Reaction.
+	Reaction string `json:"reaction,omitempty"`
 	// TS is the Slack ts of an inbound message.
 	TS string `json:"ts,omitempty"`
 	// Context is the description of the channel, its Slack purpose, sent

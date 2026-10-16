@@ -130,12 +130,19 @@ func run(ctx context.Context, t transport, r *Receiver, retry time.Duration) err
 	}
 }
 
-// handleEventsAPI hands a message event to r.Handle; any other Events API
-// event is not the hub's business.
+// handleEventsAPI hands a message event to r.Handle and a reaction on a
+// message to r.React; any other Events API event is not the hub's
+// business.
 func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 	e, ok := data.(slackevents.EventsAPIEvent)
 	if !ok {
 		return nil
+	}
+	if a, ok := e.InnerEvent.Data.(*slackevents.ReactionAddedEvent); ok {
+		if a.Item.Type != "message" {
+			return nil
+		}
+		return r.React(ctx, Reaction{Channel: a.Item.Channel, TS: a.Item.Timestamp, User: a.User, Name: a.Reaction})
 	}
 	m, ok := e.InnerEvent.Data.(*slackevents.MessageEvent)
 	if !ok {

@@ -132,6 +132,12 @@ commands:
         which only this user and the members of GROUP can connect to; COMMAND
         runs for each message received, with the event file as its last
         argument, in an environment of just PATH, HOME and each -hook-env NAME;
+        an emoji a person on the user list adds to the first message of a
+        thread this machine owns comes the same way, as a message of type
+        reaction: {"type": "reaction", "thread": KEY, "user": USER-ID,
+        "reaction": EMOJI-NAME}, with "user_name" and "scope" as a message
+        of the thread has them, sent again when Slack delivers the event
+        again; one taken off, or on any other message, does not come;
         the upgrade request is the file the client writes when the hub tells
         it to upgrade, for the machine's upgrader (fednet upgrade, run by
         root); without it the hub's notices are dropped; the files people
