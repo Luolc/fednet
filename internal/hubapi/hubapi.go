@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Luolc/fednet/internal/approval"
+	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
@@ -85,6 +86,15 @@ const (
 	// list, before a client queues a post that mentions them. A hub that
 	// answers it also mentions them when it posts.
 	CheckMentions = "check-mentions"
+	// Ask posts Card, a question card, in Thread, mentioning Mentions,
+	// each on the user list, and returns where it is. Ref is the
+	// requesting client's id of the question: a ref it asked with before
+	// posts nothing and returns that card. What people do with the card
+	// comes down the link later, as messages of type answer.
+	Ask = "ask"
+	// AskClose takes back the card with ID, which the requesting client
+	// asked, with Text, if set, a note on the card.
+	AskClose = "ask-close"
 )
 
 // Request is one request. Cmd selects the command; the other fields are its
@@ -109,6 +119,12 @@ type Request struct {
 	Mentions []string `json:"mentions,omitempty"`
 	// Route is the argument of RequestRoute.
 	Route *RouteRequest `json:"route,omitempty"`
+	// Ref and Card are the arguments of Ask; Card is carried as bytes so
+	// that the hub checks it as the agent wrote it.
+	Ref  string `json:"ref,omitempty"`
+	Card []byte `json:"card,omitempty"`
+	// ID is the argument of AskClose.
+	ID string `json:"id,omitempty"`
 }
 
 // RouteRequest is a change of one route that RequestRoute asks for: the
@@ -145,6 +161,7 @@ type Reply struct {
 	Users      []User          `json:"users,omitempty"`
 	ApprovalID string          `json:"approval_id,omitempty"`
 	Routes     []store.Route   `json:"routes,omitempty"`
+	Question   *ask.Posted     `json:"question,omitempty"`
 }
 
 // Server answers requests on the hub. Its Answer is meant for
@@ -158,6 +175,9 @@ type Server struct {
 	// serves, mapped to a name for the agents, which may be empty. Only
 	// people on it get direct messages.
 	Users map[string]string
+	// Questions runs the question cards; nil means the hub runs none,
+	// and Ask and AskClose are refused.
+	Questions *ask.Flow
 	// Approvals runs the approvals; nil means the hub cannot give any, and
 	// RequestApproval and RequestRoute are refused.
 	Approvals *approval.Flow
@@ -370,6 +390,10 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		err = s.delete(ctx, client, r)
 	case CheckMentions:
 		err = s.checkMentions(r)
+	case Ask:
+		reply.Question, err = s.ask(ctx, client, r)
+	case AskClose:
+		err = s.askClose(ctx, client, r)
 	default:
 		err = link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
 	}
@@ -803,4 +827,49 @@ func (s *Server) postRouteRequest(ctx context.Context, client string, r Request,
 		return "", link.Refuse(link.ErrBadRequest, "%v", err)
 	}
 	return id, err
+}
+
+// ask posts a question card for client, as Ask says.
+func (s *Server) ask(ctx context.Context, client string, r Request) (*ask.Posted, error) {
+	if _, _, err := thread(r); err != nil {
+		return nil, err
+	}
+	if r.Ref == "" || len(r.Card) == 0 {
+		return nil, link.Refuse(link.ErrBadRequest, "needs a ref and a card")
+	}
+	if s.Questions == nil {
+		return nil, link.Refuse(link.ErrDenied, "the hub runs no question cards: it has no Slack")
+	}
+	p, err := s.Questions.Ask(ctx, client, r.Thread, r.Ref, r.Card, r.Mentions)
+	switch {
+	case errors.Is(err, ask.ErrInvalid):
+		return nil, link.Refuse(link.ErrBadRequest, "%v", err)
+	case errors.Is(err, ask.ErrNotListed):
+		return nil, link.Refuse(link.ErrDenied, "%v", err)
+	case errors.Is(err, slack.ErrNotFound):
+		return nil, link.Refuse(link.ErrNotFound, "no thread %s", r.Thread)
+	case err != nil:
+		return nil, err
+	}
+	return &p, nil
+}
+
+// askClose takes back a question card client asked, as AskClose says.
+func (s *Server) askClose(ctx context.Context, client string, r Request) error {
+	if r.ID == "" {
+		return link.Refuse(link.ErrBadRequest, "needs a card id")
+	}
+	if s.Questions == nil {
+		return link.Refuse(link.ErrDenied, "the hub runs no question cards: it has no Slack")
+	}
+	err := s.Questions.Withdraw(ctx, client, r.ID, r.Text)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return link.Refuse(link.ErrNotFound, "no card %s", r.ID)
+	case errors.Is(err, ask.ErrNotYours):
+		return link.Refuse(link.ErrDenied, "card %s was asked by another client", r.ID)
+	case errors.Is(err, ask.ErrDone):
+		return link.Refuse(link.ErrBadRequest, "card %s is not waiting: %v", r.ID, err)
+	}
+	return err
 }

@@ -3,8 +3,10 @@ package inbound
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	slackgo "github.com/slack-go/slack"
@@ -20,13 +22,14 @@ const DefaultRetry = time.Minute
 
 // Run keeps a Socket Mode connection to Slack up until ctx is done, hands
 // every message event it brings to r.Handle, every click on an approval
-// card to r.Click, every click on an upgrade card and every slash command
-// to r.Commands, and acks each once that has returned without error, a
-// slash command with its reply; other events and interactions are acked
-// at once. Each time the
-// connection comes up, r.Connected fixes where the backfill starts before
-// any event of the connection is handled, and the backfill runs in the
-// background, again after retry (DefaultRetry when zero) while it fails.
+// card to r.Click, every click on a question card and every time picked in
+// one's time picker to r.Questions, every click on an upgrade card and
+// every slash command to r.Commands, and acks each once that has returned
+// without error, a slash command with its reply; other events and
+// interactions are acked at once. Each time the connection comes up,
+// r.Connected fixes where the backfill starts before any event of the
+// connection is handled, and the backfill runs in the background, again
+// after retry (DefaultRetry when zero) while it fails.
 // appToken is the app-level token Socket Mode connects with. Run returns
 // ctx.Err() when ctx is done, and earlier only when Slack rejects the
 // token, which no retry fixes.
@@ -155,11 +158,19 @@ func (r *Receiver) handleEventsAPI(ctx context.Context, data any) error {
 
 // handleInteractive hands each press on an approval card's button, told
 // by its action id and the block id the card gives its buttons, to
-// r.Click, and each press on an upgrade card's button to r.Commands; any
-// other interaction is not the hub's business.
+// r.Click, each press on a question card's button, and each time picked
+// in the time picker one of them opened, to r.Questions, and each press
+// on an upgrade card's button to r.Commands; any other interaction is not
+// the hub's business.
 func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
 	cb, ok := data.(slackgo.InteractionCallback)
-	if !ok || cb.Type != slackgo.InteractionTypeBlockActions {
+	if !ok {
+		return nil
+	}
+	if cb.Type == slackgo.InteractionTypeViewSubmission && cb.View.CallbackID == slack.QuestionTimePicker {
+		return r.pickedTime(ctx, cb)
+	}
+	if cb.Type != slackgo.InteractionTypeBlockActions {
 		return nil
 	}
 	// The container names the message the buttons are on; older payloads
@@ -175,12 +186,67 @@ func (r *Receiver) handleInteractive(ctx context.Context, data any) error {
 		case (a.ActionID == slack.UpgradeConfirmAction || a.ActionID == slack.UpgradeCancelAction) && a.BlockID == slack.UpgradeBlockID(a.Value):
 			c.Approve = a.ActionID == slack.UpgradeConfirmAction
 			err = r.commander().Click(ctx, c)
+		case questionPart(a.ActionID) != "" && a.BlockID == slack.QuestionBlockID(a.Value, questionPart(a.ActionID)):
+			q := slack.QuestionClick{ID: a.Value, Action: a.ActionID, User: cb.User.ID, Bot: cb.User.IsBot, Channel: channel, TS: ts, TriggerID: cb.TriggerID}
+			if cb.BlockActionState != nil {
+				values := cb.BlockActionState.Values
+				if o := values[slack.QuestionBlockID(a.Value, slack.QuestionPickPart)][slack.QuestionPickAction].SelectedOption; o.Value != "" {
+					q.Choice = o.Value
+				}
+				q.Note = strings.TrimSpace(values[slack.QuestionBlockID(a.Value, slack.QuestionNotePart)][slack.QuestionNoteAction].Value)
+			}
+			err = r.questionClick(ctx, q)
 		}
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// questionPart returns the part of a question card the button with
+// action is in, or "" for an action that is no question card's button.
+func questionPart(action string) string {
+	switch action {
+	case slack.QuestionSubmitAction:
+		return slack.QuestionSubmitPart
+	case slack.QuestionCloseAction, slack.QuestionPickTimeAction:
+		return slack.QuestionLaterPart
+	}
+	for _, s := range slack.QuestionSnoozes {
+		if action == s.Action {
+			return slack.QuestionLaterPart
+		}
+	}
+	return ""
+}
+
+// pickedTime hands the time picked in a question card's time picker to
+// r.Questions, as a click on the card that opened it.
+func (r *Receiver) pickedTime(ctx context.Context, cb slackgo.InteractionCallback) error {
+	var st slack.PickerState
+	if err := json.Unmarshal([]byte(cb.View.PrivateMetadata), &st); err != nil {
+		slog.Warn("inbound: a time picker without the card it is for", "err", err)
+		return nil
+	}
+	if cb.View.State == nil {
+		return nil
+	}
+	until, ok := slack.PickedTime(cb.View.State.Values)
+	if !ok {
+		return nil
+	}
+	return r.questionClick(ctx, slack.QuestionClick{ID: st.ID, Action: slack.QuestionTimePicker, Until: until, Note: st.Note,
+		User: cb.User.ID, Bot: cb.User.IsBot, Channel: st.Channel, TS: st.TS})
+}
+
+// questionClick hands c to r.Questions, or, when there is none, drops it.
+func (r *Receiver) questionClick(ctx context.Context, c slack.QuestionClick) error {
+	if r.Questions == nil {
+		slog.Warn("inbound: click on a question card, but the hub runs no question cards", "card", c.ID, "user", c.User)
+		return nil
+	}
+	return r.Questions.Click(ctx, c)
 }
 
 // handleCommand answers a slash command through r.Commands; anything

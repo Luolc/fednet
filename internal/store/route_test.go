@@ -107,7 +107,8 @@ func TestImportRoutes(t *testing.T) {
 const releasedHubMigrations = 9
 
 // A hub of the release before the routes opens a database this one has
-// written routes, route requests, channel requests and scopes to, and
+// written routes, route requests, channel requests, question cards and
+// scopes to, and
 // sees no route request among its approvals; a hub of the release after
 // it, which reads route requests, sees no channel request among them.
 func TestOlderHubOpensTheDatabase(t *testing.T) {
@@ -127,6 +128,9 @@ func TestOlderHubOpensTheDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, err := h.ClaimAndEnqueue(ctx, "C1/1.1", "workstation", "", "data", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.PutQuestion(ctx, Question{ID: "q1", Client: "workstation", Ref: "r1", Thread: "C1/1.1", Card: []byte(`{"question": "q?"}`), AskedAt: at, TS: "1.3"}); err != nil {
 		t.Fatal(err)
 	}
 	h.Close()

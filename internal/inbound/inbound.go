@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Luolc/fednet/internal/approval"
+	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
@@ -103,6 +104,9 @@ type Receiver struct {
 	// Approvals takes the clicks on approval cards; nil means they are
 	// acked and dropped.
 	Approvals *approval.Flow
+	// Questions takes the clicks on question cards; nil means they are
+	// acked and dropped.
+	Questions *ask.Flow
 	// Commands answers slash commands and takes the clicks on the cards
 	// they show; nil means a command is answered that the hub serves
 	// none, and the clicks are dropped.

@@ -31,6 +31,10 @@ type request struct {
 	method string
 	form   url.Values
 	auth   string
+	// query is the URL's query, and body what is left of the body after
+	// the form, a JSON body.
+	query url.Values
+	body  string
 }
 
 // testSlack stands in for Slack's Web API. answer gets each request and
@@ -54,7 +58,8 @@ func newTestWeb(t *testing.T, answer func(r request) (int, string)) (*Web, *test
 		if err := hr.ParseForm(); err != nil {
 			t.Error(err)
 		}
-		r := request{method: path.Base(hr.URL.Path), form: hr.PostForm, auth: hr.Header.Get("Authorization")}
+		rest, _ := io.ReadAll(hr.Body)
+		r := request{method: path.Base(hr.URL.Path), form: hr.PostForm, auth: hr.Header.Get("Authorization"), query: hr.URL.Query(), body: string(rest)}
 		ts.mu.Lock()
 		ts.requests = append(ts.requests, r)
 		status, body := answer(r)

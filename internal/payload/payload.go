@@ -25,6 +25,10 @@ const (
 	// Approval is the outcome of an approval an agent requested, sent down
 	// to the client that requested it.
 	Approval = "approval"
+	// Answer is what a person did with a question card an agent asked,
+	// or a snoozed card coming back, sent down to the client that asked.
+	// It reaches the hook like any message.
+	Answer = "answer"
 	// Upgrade tells a client to upgrade itself to Version, a release. The
 	// client acts on it itself; it never reaches the hook.
 	Upgrade = "upgrade"
@@ -160,6 +164,9 @@ type Message struct {
 	// Approval is, on an approved outcome, the signed approval document
 	// as `fednet approval verify` reads it, to be written to a file as is.
 	Approval json.RawMessage `json:"approval,omitempty"`
+	// Answer is, on an Answer, the question.Answer as JSON: what the
+	// card shows the agent got.
+	Answer json.RawMessage `json:"answer,omitempty"`
 	// Version is, on an Upgrade, the release to upgrade to.
 	Version string `json:"version,omitempty"`
 	// Footer is set on a post whose Text goes out as one line of small

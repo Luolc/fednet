@@ -155,6 +155,18 @@ type API interface {
 	// nothing else, as one line of small grey text in the thread that
 	// starts at ts in channel, and returns the new message's ts.
 	PostFooter(ctx context.Context, channel, ts, text string) (string, error)
+	// PostQuestion posts c in the thread that starts at ts in channel
+	// and returns the new message's ts.
+	PostQuestion(ctx context.Context, channel, ts string, c QuestionCard) (string, error)
+	// UpdateQuestion replaces the question card at ts in channel with c.
+	UpdateQuestion(ctx context.Context, channel, ts string, c QuestionCard) error
+	// Permalink returns the link that opens the message at ts in channel.
+	Permalink(ctx context.Context, channel, ts string) (string, error)
+	// PickTime opens the time picker of a question card for the person
+	// whose click gave triggerID, carrying state to the submission.
+	PickTime(ctx context.Context, triggerID string, state PickerState) error
+	// WhisperInThread is Whisper in the thread that starts at ts.
+	WhisperInThread(ctx context.Context, channel, ts, user, text string) error
 }
 
 // Upload is one file to upload: its name, its size in bytes and its
@@ -382,7 +394,12 @@ type Fake struct {
 	responses map[string][]string
 	// files maps a file id to the file and its content.
 	files map[string]fakeFile
-	clock int
+	// questions maps channel and ts, as a thread key, to the question
+	// card there; pickers maps a trigger id to the state of the time
+	// picker opened with it.
+	questions map[string]QuestionCard
+	pickers   map[string]PickerState
+	clock     int
 }
 
 type fakeFile struct {
@@ -541,6 +558,7 @@ func (f *Fake) Delete(_ context.Context, channel, ts string) error {
 		return ErrNotFound
 	}
 	delete(f.cards, ThreadKey(channel, ts))
+	delete(f.questions, ThreadKey(channel, ts))
 	if c.threads[ts] != nil {
 		delete(c.threads, ts)
 		return nil

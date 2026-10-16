@@ -20,6 +20,7 @@ import (
 	"github.com/slack-go/slack/socketmode"
 
 	"github.com/Luolc/fednet/internal/approval"
+	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
@@ -1547,5 +1548,87 @@ func TestHandleConcurrentFirstMentions(t *testing.T) {
 	}
 	if got[1].Trigger != payload.Reply || got[1].History != nil || got[1].Context != "" {
 		t.Fatalf("the second = %+v, want a reply without history or context", got[1])
+	}
+}
+
+// interactive returns the interaction body, a JSON payload as Slack sends
+// it, as Socket Mode hands it over.
+func interactive(t *testing.T, envelope, body string) socketmode.Event {
+	t.Helper()
+	var cb slackgo.InteractionCallback
+	if err := json.Unmarshal([]byte(body), &cb); err != nil {
+		t.Fatal(err)
+	}
+	return socketmode.Event{Type: socketmode.EventTypeInteractive, Data: cb, Request: &socketmode.Request{Type: socketmode.RequestTypeInteractive, EnvelopeID: envelope}}
+}
+
+// Through the transport: a press on a question card's button reaches the
+// questions with what the radio buttons and the note box held, and the
+// time picked in the time picker as a snooze; each is acked once the
+// answer is queued. Selecting a radio button alone is acked and does
+// nothing.
+func TestRunAcksQuestionClicks(t *testing.T) {
+	r, f := newReceiver(t)
+	root, err := f.Start("C1", "U1", "a thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Questions = &ask.Flow{Store: r.Store, Slack: f, Users: users, Now: func() time.Time { return r.Now().UTC() }}
+	card := []byte(`{"question": "q?", "options": [{"short": "a"}]}`)
+	p1, err := r.Questions.Ask(t.Context(), "workstation", slack.ThreadKey("C1", root), "r1", card, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := r.Questions.Ask(t.Context(), "workstation", slack.ThreadKey("C1", root), "r2", card, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := newFakeTransport()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
+
+	press := func(envelope string, p ask.Posted, action, part, choice, note string) {
+		t.Helper()
+		body := `{"type":"block_actions","user":{"id":"U2"},"trigger_id":"T1","container":{"type":"message","message_ts":"` + p.TS + `","channel_id":"C1"},` +
+			`"actions":[{"action_id":"` + action + `","block_id":"ask:` + p.ID + `:` + part + `","type":"button","value":"` + p.ID + `","action_ts":"1.6"}],` +
+			`"state":{"values":{"ask:` + p.ID + `:pick":{"ask-pick":{"type":"radio_buttons","selected_option":{"value":"` + choice + `"}}},` +
+			`"ask:` + p.ID + `:note":{"ask-note":{"type":"plain_text_input","value":"` + note + `"}}}}}`
+		tr.send(t, interactive(t, envelope, body))
+		if ack := tr.ack(2 * time.Second); ack != envelope {
+			t.Fatalf("ack = %q, want %s", ack, envelope)
+		}
+	}
+	press("env1", p1, slack.QuestionPickAction, slack.QuestionPickPart, "0", "")
+	if got := queued(t, r.Store, "workstation"); len(got) != 0 {
+		t.Fatalf("queued after selecting a radio button = %+v, want nothing", got)
+	}
+	press("env2", p2, slack.QuestionSubmitAction, slack.QuestionSubmitPart, slack.QuestionOther, "  都不对，换个思路  ")
+	press("env3", p1, slack.QuestionPickTimeAction, slack.QuestionLaterPart, "0", "下周")
+	st, ok := f.Picked("T1")
+	if !ok || st.ID != p1.ID || st.Note != "下周" {
+		t.Fatalf("time picker = %+v, %v; want one for %s with the note", st, ok, p1.ID)
+	}
+	md, _ := json.Marshal(st)
+	view := `{"type":"view_submission","user":{"id":"U2"},"view":{"callback_id":"` + slack.QuestionTimePicker + `","private_metadata":` + strconv.Quote(string(md)) + `,` +
+		`"state":{"values":{"ask-at":{"ask-at":{"type":"datetimepicker","selected_date_time":1792200000}}}}}}`
+	tr.send(t, interactive(t, "env4", view))
+	if ack := tr.ack(2 * time.Second); ack != "env4" {
+		t.Fatalf("ack = %q, want env4", ack)
+	}
+	var got []string
+	for _, m := range queued(t, r.Store, "workstation") {
+		got = append(got, string(m.Answer))
+	}
+	want := []string{
+		`{"question_id":"r2","card_id":"` + p2.ID + `","outcome":"answered","choice":null,"note":"都不对，换个思路","by":"U2","at":"2023-11-14T23:13:20Z"}`,
+		`{"question_id":"r1","card_id":"` + p1.ID + `","outcome":"snoozed","choice":null,"note":"下周","snooze_until":"2026-10-17T01:20:00Z","by":"U2","at":"2023-11-14T23:13:20Z"}`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("answers queued:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run returned %v, want context.Canceled", err)
 	}
 }
