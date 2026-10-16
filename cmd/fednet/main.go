@@ -291,6 +291,17 @@ commands:
         take back a question card this machine asked that still waits, or
         is snoozed: it shows the note and no buttons, and nothing comes
         through the hook
+  client read-answer -socket PATH [-json] ID
+        print a question card as the hub keeps it: its status (open,
+        snoozed, answered, closed or withdrawn), then, once a press has
+        counted, the last such press as the JSON that came through the hook;
+        with -json the card as one object: {"id", "thread", "ts",
+        "permalink", "asked_at", "question": the question as asked,
+        "status", "answer"}; only a click on the card in Slack, by a person
+        on the user list and not a bot, writes the answer, never a request
+        from a client; a snooze is replaced by the press after it, and once
+        answered or closed the card takes no more presses; any machine may
+        read any card; exits 1 when the hub has no such card
   client ops -socket PATH [-json] (upgrade | version)
         ask the hub for one of two fixed operations, as this machine; run
         it only when a person asks for it: an agent never decides on its
@@ -1056,6 +1067,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientAsk(ctx, args[1:], stdout)
 		case "ask-close":
 			return clientAskClose(ctx, args[1:], stdout)
+		case "read-answer":
+			return clientReadAnswer(ctx, args[1:], stdout)
 		}
 	}
 	return clientServe(ctx, args)
@@ -1794,6 +1807,33 @@ func clientAskClose(ctx context.Context, args []string, stdout io.Writer) error 
 		return err
 	}
 	return json.NewEncoder(stdout).Encode(res)
+}
+
+// clientReadAnswer prints a question card as the hub keeps it.
+func clientReadAnswer(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client read-answer", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 1); err != nil {
+		return err
+	}
+	if *socket == "" || fs.Arg(0) == "" {
+		return usageError("fednet client read-answer: -socket and a card ID are required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.ReadAnswer, ID: fs.Arg(0)})
+	if err != nil {
+		return err
+	}
+	if res.Card == nil {
+		return errors.New("fednet client read-answer: the hub answered without the card")
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res.Card)
+	}
+	if _, err := fmt.Fprintln(stdout, res.Card.Status); err != nil || res.Card.Answer == nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "%s\n", res.Card.Answer)
+	return err
 }
 
 // clientRequestApproval asks the hub for approval of an action and prints

@@ -25,6 +25,7 @@ import (
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/question"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -95,6 +96,9 @@ const (
 	// AskClose takes back the card with ID, which the requesting client
 	// asked, with Text, if set, a note on the card.
 	AskClose = "ask-close"
+	// ReadAnswer returns the question card with ID as the hub keeps it.
+	// Any client may read any card, as it may read any thread.
+	ReadAnswer = "read-answer"
 	// React adds the bot's reaction Name, an emoji's name without colons,
 	// to the first message of Thread, and Unreact removes it. Either is
 	// done when the bot's reaction already is, or is not, there. Any
@@ -129,7 +133,7 @@ type Request struct {
 	// that the hub checks it as the agent wrote it.
 	Ref  string `json:"ref,omitempty"`
 	Card []byte `json:"card,omitempty"`
-	// ID is the argument of AskClose.
+	// ID is the argument of AskClose and ReadAnswer.
 	ID string `json:"id,omitempty"`
 	// Name is the argument of React and Unreact.
 	Name string `json:"name,omitempty"`
@@ -170,6 +174,25 @@ type Reply struct {
 	ApprovalID string          `json:"approval_id,omitempty"`
 	Routes     []store.Route   `json:"routes,omitempty"`
 	Question   *ask.Posted     `json:"question,omitempty"`
+	Card       *Card           `json:"card,omitempty"`
+}
+
+// Card is a question card as ReadAnswer returns it: where it is now, the
+// question as the agent asked it, and its status. Answer is the last
+// press on the card that counted, the JSON that went down to the client
+// that asked; it is absent until a press counts, and a snooze is replaced
+// by the press after it. Only ask.Flow.Click writes it, for a click that
+// came from Slack by a person on the user list who is not a bot; no
+// request a client sends does.
+type Card struct {
+	ID        string            `json:"id"`
+	Thread    string            `json:"thread"`
+	TS        string            `json:"ts"`
+	Permalink string            `json:"permalink,omitempty"`
+	AskedAt   time.Time         `json:"asked_at"`
+	Question  question.Question `json:"question"`
+	Status    string            `json:"status"`
+	Answer    json.RawMessage   `json:"answer,omitempty"`
 }
 
 // Server answers requests on the hub. Its Answer is meant for
@@ -402,6 +425,8 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		reply.Question, err = s.ask(ctx, client, r)
 	case AskClose:
 		err = s.askClose(ctx, client, r)
+	case ReadAnswer:
+		reply.Card, err = s.readAnswer(ctx, r)
 	case React, Unreact:
 		err = s.react(ctx, r)
 	default:
@@ -882,6 +907,28 @@ func (s *Server) askClose(ctx context.Context, client string, r Request) error {
 		return link.Refuse(link.ErrBadRequest, "card %s is not waiting: %v", r.ID, err)
 	}
 	return err
+}
+
+// readAnswer returns the question card r names, as ReadAnswer says.
+func (s *Server) readAnswer(ctx context.Context, r Request) (*Card, error) {
+	if r.ID == "" {
+		return nil, link.Refuse(link.ErrBadRequest, "needs a card id")
+	}
+	q, err := s.Store.Question(ctx, r.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, link.Refuse(link.ErrNotFound, "no card %s", r.ID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	c := &Card{ID: q.ID, Thread: q.Thread, TS: q.TS, Permalink: q.Permalink, AskedAt: q.AskedAt, Status: q.Status}
+	if err := json.Unmarshal(q.Card, &c.Question); err != nil {
+		return nil, err
+	}
+	if len(q.Answer) > 0 {
+		c.Answer = q.Answer
+	}
+	return c, nil
 }
 
 // react adds or removes the bot's reaction on the first message of a

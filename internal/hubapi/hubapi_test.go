@@ -18,9 +18,11 @@ import (
 	"time"
 
 	"github.com/Luolc/fednet/internal/approval"
+	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/question"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	slackgo "github.com/slack-go/slack"
@@ -939,5 +941,73 @@ func TestOps(t *testing.T) {
 	}
 	if want := []string{"workstation version", "datamachine upgrade"}; !slices.Equal(asked, want) {
 		t.Fatalf("Ops was asked %q, want %q", asked, want)
+	}
+}
+
+// The record read-answer returns is written by a click in Slack alone:
+// every command a client can send, from the machine that asked and from
+// another, aimed at a card, leaves it without an answer, and a click on
+// the other card gives that one its answer.
+func TestReadAnswer(t *testing.T) {
+	ctx := t.Context()
+	s, f := testServer(t)
+	s.Users = map[string]string{"U1": "maintainer"}
+	s.Questions = &ask.Flow{Store: s.Store, Slack: f, Users: s.Users}
+	root, err := f.Start("C1", "U1", "帮我看看第 5 条")
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread := slack.ThreadKey("C1", root)
+	card := []byte(`{"question": "放宽第 5 条吗？", "options": [{"short": "照原样"}, {"short": "放宽", "long": "改成两条"}]}`)
+	read := func(id string) Card {
+		t.Helper()
+		r, err := answer(t, s, "other", Request{Cmd: ReadAnswer, ID: id})
+		if err != nil || r.Card == nil {
+			t.Fatalf("read-answer %s = %+v, %v", id, r.Card, err)
+		}
+		return *r.Card
+	}
+	var ids []string
+	for _, ref := range []string{"q-1", "q-2"} {
+		r, err := answer(t, s, "workstation", Request{Cmd: Ask, Thread: thread, Ref: ref, Card: card})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, r.Question.ID)
+	}
+
+	commands := []string{ReadThread, OpenThread, Threads, Adopt, GetChannelContext, SetChannelContext, Users, DM, RequestApproval,
+		RequestRoute, RequestChannel, Routes, Ops, Delete, CheckMentions, Ask, AskClose, React, Unreact, ReadAnswer}
+	for _, client := range []string{"other", "workstation"} {
+		for _, cmd := range commands {
+			answer(t, s, client, Request{Cmd: cmd, Thread: thread, Channel: "C1", Text: `{"outcome": "answered", "by": "U1"}`, User: "U1",
+				Agent: "agent", Requester: "U1", Action: []byte(`{}`), Op: "version", MsgID: ids[0], Mentions: []string{"U1"},
+				Ref: "q-1", Card: card, ID: ids[0], Name: "eyes"})
+		}
+	}
+	if c := read(ids[0]); c.Answer != nil || c.Status == question.Answered {
+		t.Fatalf("after every client command, card %s = %s with answer %s; want no answer", ids[0], c.Status, c.Answer)
+	}
+
+	c := read(ids[1])
+	if c.ID != ids[1] || c.Thread != thread || c.TS == "" || c.Permalink == "" || c.AskedAt.IsZero() || c.Status != store.QuestionOpen || c.Answer != nil ||
+		c.Question.Question != "放宽第 5 条吗？" || len(c.Question.Options) != 2 || c.Question.Options[1].Long != "改成两条" {
+		t.Fatalf("card before a click = %+v, want it open with no answer", c)
+	}
+	if err := s.Questions.Click(ctx, slack.QuestionClick{ID: ids[1], Action: slack.QuestionSubmitAction, Choice: "1", Note: "可以", User: "U1", Channel: "C1", TS: c.TS}); err != nil {
+		t.Fatal(err)
+	}
+	c = read(ids[1])
+	var a question.Answer
+	if err := json.Unmarshal(c.Answer, &a); err != nil || c.Status != question.Answered || a.CardID != ids[1] || a.QuestionID != "q-2" ||
+		a.Outcome != question.Answered || a.Choice == nil || a.Choice.Index != 1 || a.Note != "可以" || a.By != "U1" || a.At == "" {
+		t.Fatalf("card after a click = %s with answer %s (%v), want (b) answered by U1 with the note", c.Status, c.Answer, err)
+	}
+
+	if _, err := answer(t, s, "other", Request{Cmd: ReadAnswer, ID: "NOSUCHCARD"}); !errors.Is(err, link.ErrNotFound) {
+		t.Errorf("read-answer of no card = %v, want ErrNotFound", err)
+	}
+	if _, err := answer(t, s, "other", Request{Cmd: ReadAnswer}); !errors.Is(err, link.ErrBadRequest) {
+		t.Errorf("read-answer without an id = %v, want ErrBadRequest", err)
 	}
 }
