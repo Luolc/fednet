@@ -395,7 +395,7 @@ type Fake struct {
 	progress map[string]Progress
 	footers  map[string]string
 	// whispers maps a user to the ephemeral texts shown to them.
-	whispers map[string][]string
+	whispers map[string][]fakeWhisper
 	// responses maps a response URL to the texts posted through it.
 	responses map[string][]string
 	// files maps a file id to the file and its content.
@@ -410,6 +410,10 @@ type Fake struct {
 	reactions map[string][]string
 	clock     int
 }
+
+// fakeWhisper is an ephemeral text and the thread it was shown in, ""
+// for the channel.
+type fakeWhisper struct{ ts, text string }
 
 type fakeFile struct {
 	File
@@ -740,15 +744,19 @@ func (f *Fake) Cards(channel string) (ts []string, cards []Card) {
 }
 
 func (f *Fake) Whisper(_ context.Context, channel, user, text string) error {
+	return f.whisper(channel, "", user, text)
+}
+
+func (f *Fake) whisper(channel, ts, user, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.channels[channel]; !ok {
 		return ErrNotFound
 	}
 	if f.whispers == nil {
-		f.whispers = make(map[string][]string)
+		f.whispers = make(map[string][]fakeWhisper)
 	}
-	f.whispers[user] = append(f.whispers[user], text)
+	f.whispers[user] = append(f.whispers[user], fakeWhisper{ts, text})
 	return nil
 }
 
@@ -756,7 +764,11 @@ func (f *Fake) Whisper(_ context.Context, channel, user, text string) error {
 func (f *Fake) Whispers(user string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]string(nil), f.whispers[user]...)
+	var texts []string
+	for _, w := range f.whispers[user] {
+		texts = append(texts, w.text)
+	}
+	return texts
 }
 
 func (f *Fake) Respond(_ context.Context, responseURL, text string) error {

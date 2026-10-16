@@ -3,6 +3,7 @@ package slack
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,30 @@ func TestQuestionBlocks(t *testing.T) {
 	c.State = QuestionMoved
 	if got := mustJSON(t, questionBlocks(c)); strings.Contains(got, `"action_id"`) || !strings.Contains(got, "卡片重发在下方") {
 		t.Fatalf("moved card = %s, want no buttons and where it went", got)
+	}
+}
+
+// A warning goes above submit; the other blocks keep their ids, so that
+// what a person picked and typed stays on their screen.
+func TestQuestionWarning(t *testing.T) {
+	ids := func(bs []slackgo.Block) (ids []string) {
+		for _, b := range bs {
+			if sec, ok := b.(*slackgo.SectionBlock); ok {
+				ids = append(ids, "section:"+sec.Text.Text)
+				continue
+			}
+			ids = append(ids, string(b.BlockType())+":"+b.ID())
+		}
+		return ids
+	}
+	c := QuestionCard{ID: "Q1", Question: testQuestion}
+	plain := ids(questionBlocks(c))
+	c.Warning = "⚠️ 请先选一项"
+	warned := ids(questionBlocks(c))
+	submit := slices.Index(plain, "actions:"+QuestionBlockID("Q1", QuestionSubmitPart))
+	want := slices.Insert(slices.Clone(plain), submit, "section:*⚠️ 请先选一项*")
+	if strings.Join(warned, ",") != strings.Join(want, ",") {
+		t.Fatalf("blocks with a warning = %q, want %q", warned, want)
 	}
 }
 

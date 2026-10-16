@@ -33,6 +33,8 @@ type QuestionCard struct {
 	State  string
 	Answer question.Answer
 	Note   string
+	// Warning, on a card that waits, is a line shown above submit.
+	Warning string
 }
 
 // States of a QuestionCard besides the outcomes of an answer.
@@ -226,15 +228,20 @@ func waitingBlocks(c QuestionCard, plain, mrkdwn func(string) *slackgo.TextBlock
 		slackgo.NewButtonBlockElement(QuestionCloseAction, c.ID, plain("关闭问题")).WithStyle(slackgo.StyleDanger).WithConfirm(
 			slackgo.NewConfirmationBlockObject(plain("关闭这个问题？"), plain("agent 会收到「关闭」，自己决定不再问，还是换个问法。补充框里写的会一起带上。"), plain("关闭"), plain("取消")).WithStyle(slackgo.StyleDanger)),
 	)
-	return []slackgo.Block{
+	bs := []slackgo.Block{
 		slackgo.NewActionBlock(QuestionBlockID(c.ID, QuestionPickPart), radio),
 		slackgo.NewInputBlock(QuestionBlockID(c.ID, QuestionNotePart), plain("补充 (可选)"), nil, note).WithOptional(true),
+	}
+	if c.Warning != "" {
+		bs = append(bs, slackgo.NewSectionBlock(mrkdwn("*"+c.Warning+"*"), nil, nil))
+	}
+	return append(bs,
 		slackgo.NewActionBlock(QuestionBlockID(c.ID, QuestionSubmitPart),
 			slackgo.NewButtonBlockElement(QuestionSubmitAction, c.ID, plain("提交")).WithStyle(slackgo.StylePrimary)),
 		slackgo.NewContextBlock("", mrkdwn("稍后再问，或者关掉这个问题：")),
 		slackgo.NewActionBlock(QuestionBlockID(c.ID, QuestionLaterPart), later...),
 		slackgo.NewContextBlock("", mrkdwn("编号 "+c.ID)),
-	}
+	)
 }
 
 // snoozeDate writes when a snooze ends as a Slack date token.
@@ -396,7 +403,20 @@ func (f *Fake) Picked(triggerID string) (PickerState, bool) {
 	return s, ok
 }
 
-// WhisperInThread keeps text with the other ephemeral texts shown to user.
-func (f *Fake) WhisperInThread(ctx context.Context, channel, _, user, text string) error {
-	return f.Whisper(ctx, channel, user, text)
+// WhisperInThread keeps text with the other ephemeral texts shown to
+// user, and ts with it for WhisperedIn.
+func (f *Fake) WhisperInThread(_ context.Context, channel, ts, user, text string) error {
+	return f.whisper(channel, ts, user, text)
+}
+
+// WhisperedIn returns, for each ephemeral text shown to user, oldest
+// first, the thread it was shown in, or "" for the channel.
+func (f *Fake) WhisperedIn(user string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ts []string
+	for _, w := range f.whispers[user] {
+		ts = append(ts, w.ts)
+	}
+	return ts
 }

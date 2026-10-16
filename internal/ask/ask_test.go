@@ -143,18 +143,12 @@ func TestAsk(t *testing.T) {
 
 // Submit sends the choice and the note down once and the card then shows
 // them; a second press, a press by someone off the user list, by a bot or
-// on a card that is not this one changes nothing and gets a hint, as does
-// "other" with no note.
+// on a card that is not this one changes nothing and gets a hint in the
+// card's thread.
 func TestSubmit(t *testing.T) {
 	tf := newFlow(t)
 	p := tf.ask(t, "q-12")
-	for _, c := range []struct{ user, choice, note string }{
-		{"U9", "1", ""},
-		{"U1", slack.QuestionOther, ""},
-		{"U2", "", ""},
-	} {
-		tf.click(t, p, c.user, slack.QuestionSubmitAction, c.choice, c.note)
-	}
+	tf.click(t, p, "U9", slack.QuestionSubmitAction, "1", "")
 	if err := tf.Click(t.Context(), slack.QuestionClick{ID: p.ID, Action: slack.QuestionSubmitAction, Choice: "1", User: "U1", Bot: true, Channel: p.Channel, TS: p.TS}); err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +159,16 @@ func TestSubmit(t *testing.T) {
 		t.Fatalf("answers after clicks that do not count = %+v, want none", as)
 	}
 	tf.pass(t)
-	if w1, w2, w9 := tf.f.Whispers("U1"), tf.f.Whispers("U2"), tf.f.Whispers("U9"); len(w1) != 3 || len(w2) != 1 || len(w9) != 1 || w2[0] != "请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。" {
-		t.Fatalf("hints: U1 %q, U2 %q, U9 %q; want 3, 1, 1", w1, w2, w9)
+	if w1, w9 := tf.f.Whispers("U1"), tf.f.Whispers("U9"); len(w1) != 2 || len(w9) != 1 {
+		t.Fatalf("hints: U1 %q, U9 %q; want 2, 1", w1, w9)
+	}
+	_, root, _ := slack.ParseThreadKey(tf.thread)
+	for _, u := range []string{"U1", "U9"} {
+		for _, in := range tf.f.WhisperedIn(u) {
+			if in != root {
+				t.Fatalf("hints to %s shown in %q, want all in thread %s", u, tf.f.WhisperedIn(u), root)
+			}
+		}
 	}
 
 	tf.click(t, p, "U2", slack.QuestionSubmitAction, "1", "补充一句")
@@ -179,7 +181,7 @@ func TestSubmit(t *testing.T) {
 	if c, _ := tf.f.Question("C1", p.TS); c.State != question.Answered || !same(c.Answer, want) {
 		t.Fatalf("card = %+v, want it to show %+v", c, want)
 	}
-	if w := tf.f.Whispers("U1"); len(w) != 4 || w[3] != "这个问题已经处理过了" {
+	if w := tf.f.Whispers("U1"); len(w) != 3 || w[2] != "这个问题已经处理过了" {
 		t.Fatalf("hints to U1 = %q, want one that the question is done", w)
 	}
 
@@ -188,6 +190,41 @@ func TestSubmit(t *testing.T) {
 	tf.click(t, p, "U1", slack.QuestionSubmitAction, slack.QuestionOther, "都不对")
 	if as := tf.answers(t); len(as) != 1 || as[0].Choice != nil || as[0].Note != "都不对" {
 		t.Fatalf("answers = %+v, want one with no choice and the note", as)
+	}
+}
+
+// Submit with nothing picked, or "other", and no note does not count: the
+// card says so above submit until a click that counts; a card that cannot be updated gets the
+// warning to the clicker alone instead.
+func TestSubmitWarning(t *testing.T) {
+	const warning = "⚠️ 请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。"
+	tf := newFlow(t)
+	p := tf.ask(t, "q-12")
+	for _, choice := range []string{"", slack.QuestionOther} {
+		tf.click(t, p, "U1", slack.QuestionSubmitAction, choice, "")
+		tf.pass(t)
+		if c, _ := tf.f.Question("C1", p.TS); c.State != "" || c.Warning != warning {
+			t.Fatalf("card after submitting %q with no note = %+v, want it waiting with the warning", choice, c)
+		}
+	}
+	if as, w := tf.answers(t), tf.f.Whispers("U1"); len(as) != 0 || len(w) != 0 {
+		t.Fatalf("answers %+v, hints %q; want neither", as, w)
+	}
+	tf.click(t, p, "U1", "ask-snooze-2h", slack.QuestionOther, "")
+	tf.pass(t)
+	if c, _ := tf.f.Question("C1", p.TS); c.State != question.Snoozed || c.Warning != "" {
+		t.Fatalf("card after a snooze = %+v, want it snoozed without the warning", c)
+	}
+
+	p = tf.ask(t, "q-13")
+	tf.click(t, p, "U1", slack.QuestionSubmitAction, slack.QuestionOther, "")
+	if err := tf.f.Delete(t.Context(), "C1", p.TS); err != nil {
+		t.Fatal(err)
+	}
+	tf.pass(t)
+	_, root, _ := slack.ParseThreadKey(tf.thread)
+	if w, in := tf.f.Whispers("U1"), tf.f.WhisperedIn("U1"); len(w) != 1 || "⚠️ "+w[0] != warning || in[0] != root {
+		t.Fatalf("hints to U1 = %q in %q, want the warning in thread %s", w, in, root)
 	}
 }
 
