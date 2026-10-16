@@ -1673,7 +1673,8 @@ func TestReact(t *testing.T) {
 }
 
 // Through the transport, a reaction_added event on a message is acked
-// once the reaction is queued; one on a file is acked and dropped.
+// once the reaction is queued, one on a file is acked and dropped, and
+// one that cannot be queued is not acked, so that Slack sends it again.
 func TestRunReaction(t *testing.T) {
 	r, f := newReceiver(t)
 	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
@@ -1685,22 +1686,29 @@ func TestRunReaction(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
 	defer func() { cancel(); <-done }()
-	for i, item := range []string{
-		`{"type":"file","file":{"id":"F1"}}`,
-		`{"type":"message","channel":"C1","ts":"` + root.TS + `"}`,
-	} {
+	send := func(env, item string) {
+		t.Helper()
 		inner := `{"type":"reaction_added","user":"U1","reaction":"package","item":` + item + `,"event_ts":"1700000100.000001"}`
-		e, err := slackevents.ParseEvent(json.RawMessage(`{"type":"event_callback","event_id":"Ev`+strconv.Itoa(i)+`","event":`+inner+`}`), slackevents.OptionNoVerifyToken())
+		e, err := slackevents.ParseEvent(json.RawMessage(`{"type":"event_callback","event_id":"Ev`+env+`","event":`+inner+`}`), slackevents.OptionNoVerifyToken())
 		if err != nil {
 			t.Fatal(err)
 		}
-		env := "env" + strconv.Itoa(i)
 		tr.send(t, socketmode.Event{Type: socketmode.EventTypeEventsAPI, Data: e, Request: &socketmode.Request{Type: socketmode.RequestTypeEventsAPI, EnvelopeID: env}})
+	}
+	onRoot := `{"type":"message","channel":"C1","ts":"` + root.TS + `"}`
+	for i, item := range []string{`{"type":"file","file":{"id":"F1"}}`, onRoot} {
+		env := "env" + strconv.Itoa(i)
+		send(env, item)
 		if id := tr.ack(2 * time.Second); id != env {
 			t.Fatalf("ack = %q, want %s", id, env)
 		}
 		if ms := queued(t, r.Store, "workstation"); len(ms) != 1+i || ms[i].Type != []string{payload.Inbound, payload.Reaction}[i] {
 			t.Fatalf("after event %d queued %+v", i, ms)
 		}
+	}
+	r.Store.Close()
+	send("env2", onRoot)
+	if id := tr.ack(200 * time.Millisecond); id != "" {
+		t.Fatalf("acked %q although the reaction was not queued", id)
 	}
 }
