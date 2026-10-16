@@ -79,13 +79,12 @@ type Flow struct {
 
 // hint is a text to show user alone about a click on card, in the
 // thread that starts at ts in channel, or in channel when ts is empty.
-// A hint onCard is shown on the card at cardTS instead, with the radio
-// button picked selected, and to user alone only if the card cannot be
-// updated.
+// A hint onCard is shown on the card at cardTS instead, and to user
+// alone only if the card cannot be updated.
 type hint struct {
 	card, channel, ts, user, text string
 	onCard                        bool
-	cardTS, picked                string
+	cardTS                        string
 }
 
 // Posted is where a card is: its id, its message, and the link to it,
@@ -246,7 +245,7 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 			a.Choice = &question.Choice{Index: i, Short: card.Options[i].Short}
 		} else if c.Note == "" {
 			h.text = "请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。"
-			h.onCard, h.cardTS, h.picked = true, q.TS, c.Choice
+			h.onCard, h.cardTS = true, q.TS
 			return h, nil
 		}
 	case slack.QuestionCloseAction:
@@ -418,7 +417,7 @@ func (f *Flow) warn(ctx context.Context, h hint) bool {
 		return false
 	}
 	channel, _, _ := slack.ParseThreadKey(q.Thread)
-	c := slack.QuestionCard{ID: q.ID, Question: card, Picked: h.picked, Warning: "⚠️ " + h.text}
+	c := slack.QuestionCard{ID: q.ID, Question: card, Warning: "⚠️ " + h.text}
 	if err := f.call(ctx, func(ctx context.Context) error { return f.Slack.UpdateQuestion(ctx, channel, q.TS, c) }); err != nil {
 		slog.Warn("ask: putting the warning on the card, telling the clicker alone instead", "card", q.ID, "err", err)
 		return false

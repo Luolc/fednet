@@ -33,10 +33,7 @@ type QuestionCard struct {
 	State  string
 	Answer question.Answer
 	Note   string
-	// Picked, on a card that waits, is the value of the radio button to
-	// show selected in place of the recommended option; Warning is a
-	// line shown above submit.
-	Picked  string
+	// Warning, on a card that waits, is a line shown above submit.
 	Warning string
 }
 
@@ -219,11 +216,6 @@ func waitingBlocks(c QuestionCard, plain, mrkdwn func(string) *slackgo.TextBlock
 	radio := slackgo.NewRadioButtonsBlockElement(QuestionPickAction, opts...)
 	if i := q.Recommended(); i >= 0 {
 		radio.InitialOption = opts[i]
-	}
-	for _, o := range opts {
-		if o.Value == c.Picked {
-			radio.InitialOption = o
-		}
 	}
 	note := slackgo.NewPlainTextInputBlockElement(plain("选不选都可以写。选「其他」的话，请把想法写在这里"), QuestionNoteAction)
 	note.Multiline, note.MaxLength = true, MaxQuestionNote

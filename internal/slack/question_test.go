@@ -124,9 +124,8 @@ func TestQuestionBlocks(t *testing.T) {
 	}
 }
 
-// A warning goes above submit and the radio button picked stays
-// selected; the other blocks keep their ids, so that what a person typed
-// is not lost.
+// A warning goes above submit; the other blocks keep their ids, so that
+// what a person picked and typed stays on their screen.
 func TestQuestionWarning(t *testing.T) {
 	ids := func(bs []slackgo.Block) (ids []string) {
 		for _, b := range bs {
@@ -140,20 +139,12 @@ func TestQuestionWarning(t *testing.T) {
 	}
 	c := QuestionCard{ID: "Q1", Question: testQuestion}
 	plain := ids(questionBlocks(c))
-	c.Picked, c.Warning = QuestionOther, "⚠️ 请先选一项"
-	bs := questionBlocks(c)
-	warned := ids(bs)
+	c.Warning = "⚠️ 请先选一项"
+	warned := ids(questionBlocks(c))
 	submit := slices.Index(plain, "actions:"+QuestionBlockID("Q1", QuestionSubmitPart))
 	want := slices.Insert(slices.Clone(plain), submit, "section:*⚠️ 请先选一项*")
 	if strings.Join(warned, ",") != strings.Join(want, ",") {
 		t.Fatalf("blocks with a warning = %q, want %q", warned, want)
-	}
-	for _, b := range bs {
-		if a, ok := b.(*slackgo.ActionBlock); ok && a.BlockID == QuestionBlockID("Q1", QuestionPickPart) {
-			if r := a.Elements.ElementSet[0].(*slackgo.RadioButtonsBlockElement); r.InitialOption == nil || r.InitialOption.Value != QuestionOther {
-				t.Fatalf("radio buttons start at %+v, want other", r.InitialOption)
-			}
-		}
 	}
 }
 

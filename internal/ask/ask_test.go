@@ -194,8 +194,7 @@ func TestSubmit(t *testing.T) {
 }
 
 // Submit with nothing picked, or "other", and no note does not count: the
-// card says so above submit, with the radio button picked still selected,
-// until a click that counts; a card that cannot be updated gets the
+// card says so above submit until a click that counts; a card that cannot be updated gets the
 // warning to the clicker alone instead.
 func TestSubmitWarning(t *testing.T) {
 	const warning = "⚠️ 请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。"
@@ -204,8 +203,8 @@ func TestSubmitWarning(t *testing.T) {
 	for _, choice := range []string{"", slack.QuestionOther} {
 		tf.click(t, p, "U1", slack.QuestionSubmitAction, choice, "")
 		tf.pass(t)
-		if c, _ := tf.f.Question("C1", p.TS); c.State != "" || c.Warning != warning || c.Picked != choice {
-			t.Fatalf("card after submitting %q with no note = %+v, want it waiting with the warning and %q picked", choice, c, choice)
+		if c, _ := tf.f.Question("C1", p.TS); c.State != "" || c.Warning != warning {
+			t.Fatalf("card after submitting %q with no note = %+v, want it waiting with the warning", choice, c)
 		}
 	}
 	if as, w := tf.answers(t), tf.f.Whispers("U1"); len(as) != 0 || len(w) != 0 {
