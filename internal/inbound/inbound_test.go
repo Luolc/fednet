@@ -1632,3 +1632,83 @@ func TestRunAcksQuestionClicks(t *testing.T) {
 		t.Fatalf("run returned %v, want context.Canceled", err)
 	}
 }
+
+// A reaction from a person on the user list on the first message of a
+// thread with an owner goes to that owner; one from anyone else, on a
+// reply, or in a thread nobody owns does not.
+func TestReact(t *testing.T) {
+	ctx := t.Context()
+	r, f := newReceiver(t)
+	stored := 0
+	r.Stored = func() { stored++ }
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
+	if err := r.Handle(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	reply := post(t, f, "C1", slack.Message{User: "U1", Text: "more", ThreadTS: root.TS})
+	if err := r.Handle(ctx, reply); err != nil {
+		t.Fatal(err)
+	}
+	unowned := post(t, f, "C1", slack.Message{User: "U1", Text: "chatter"})
+	stored = 0
+	for _, a := range []Reaction{
+		{Channel: "C1", TS: root.TS, User: "U2", Name: "package"},
+		{Channel: "C1", TS: root.TS, User: "U9", Name: "package"},
+		{Channel: "C1", TS: root.TS, User: slack.FakeBot, Name: "eyes"},
+		{Channel: "C1", TS: reply.TS, User: "U1", Name: "package"},
+		{Channel: "C1", TS: unowned.TS, User: "U1", Name: "package"},
+	} {
+		if err := r.React(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ms := queued(t, r.Store, "workstation")
+	want := payload.Message{Type: payload.Reaction, Thread: slack.ThreadKey("C1", root.TS), User: "U2", Reaction: "package"}
+	if len(ms) != 3 || !reflect.DeepEqual(ms[2], want) {
+		t.Fatalf("queued %+v, want the two messages and then %+v", ms, want)
+	}
+	if stored != 1 {
+		t.Fatalf("Stored called %d times, want 1", stored)
+	}
+}
+
+// Through the transport, a reaction_added event on a message is acked
+// once the reaction is queued, one on a file is acked and dropped, and
+// one that cannot be queued is not acked, so that Slack sends it again.
+func TestRunReaction(t *testing.T) {
+	r, f := newReceiver(t)
+	root := post(t, f, "C1", slack.Message{User: "U1", Text: hey + "first"})
+	if err := r.Handle(t.Context(), root); err != nil {
+		t.Fatal(err)
+	}
+	tr := newFakeTransport()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, tr, r, time.Millisecond) }()
+	defer func() { cancel(); <-done }()
+	send := func(env, item string) {
+		t.Helper()
+		inner := `{"type":"reaction_added","user":"U1","reaction":"package","item":` + item + `,"event_ts":"1700000100.000001"}`
+		e, err := slackevents.ParseEvent(json.RawMessage(`{"type":"event_callback","event_id":"Ev`+env+`","event":`+inner+`}`), slackevents.OptionNoVerifyToken())
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.send(t, socketmode.Event{Type: socketmode.EventTypeEventsAPI, Data: e, Request: &socketmode.Request{Type: socketmode.RequestTypeEventsAPI, EnvelopeID: env}})
+	}
+	onRoot := `{"type":"message","channel":"C1","ts":"` + root.TS + `"}`
+	for i, item := range []string{`{"type":"file","file":{"id":"F1"}}`, onRoot} {
+		env := "env" + strconv.Itoa(i)
+		send(env, item)
+		if id := tr.ack(2 * time.Second); id != env {
+			t.Fatalf("ack = %q, want %s", id, env)
+		}
+		if ms := queued(t, r.Store, "workstation"); len(ms) != 1+i || ms[i].Type != []string{payload.Inbound, payload.Reaction}[i] {
+			t.Fatalf("after event %d queued %+v", i, ms)
+		}
+	}
+	r.Store.Close()
+	send("env2", onRoot)
+	if id := tr.ack(200 * time.Millisecond); id != "" {
+		t.Fatalf("acked %q although the reaction was not queued", id)
+	}
+}

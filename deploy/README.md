@@ -62,6 +62,8 @@ channel 里的消息只有 @ 了 bot 才交给 agent，@ 的那条带上线程�
 
 agent 用 `fednet client react` 在线程的第一条消息上加或去掉 bot 自己的 emoji reaction (app 的 manifest 要有 `reactions:write`)，比如用来标出线程现在的状态。缺这个 scope 时命令退 3，错误里写明缺的是 `reactions:write`；改了 manifest 要重新安装 app，hub 的 bot token 才有它。
 
+用户名单上的人在一个已有归属的线程的第一条消息上加 emoji reaction 时，hub 把它交给线程归属的 client，钩子收到一条 `reaction` 类型的消息，带线程、人和 emoji 名。这要 app 订阅 bot event `reaction_added`，manifest 要有 `reactions:read`；改完要重新安装 app。去掉 reaction、加在线程里其它消息上的、名单外的人加的，都不转发。hub 不记这类事件，Slack 重发一次，client 就会再收到一次；断线期间加的 reaction 也不补拉。
+
 ## 启动之后
 
 在 hub 机器上登记一台 client (ID 和 HASH 是那台机器上 `fednet client init` 打印的)：
