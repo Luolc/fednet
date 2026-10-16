@@ -33,6 +33,11 @@ type QuestionCard struct {
 	State  string
 	Answer question.Answer
 	Note   string
+	// Picked, on a card that waits, is the value of the radio button to
+	// show selected in place of the recommended option; Warning is a
+	// line shown above submit.
+	Picked  string
+	Warning string
 }
 
 // States of a QuestionCard besides the outcomes of an answer.
@@ -215,6 +220,11 @@ func waitingBlocks(c QuestionCard, plain, mrkdwn func(string) *slackgo.TextBlock
 	if i := q.Recommended(); i >= 0 {
 		radio.InitialOption = opts[i]
 	}
+	for _, o := range opts {
+		if o.Value == c.Picked {
+			radio.InitialOption = o
+		}
+	}
 	note := slackgo.NewPlainTextInputBlockElement(plain("选不选都可以写。选「其他」的话，请把想法写在这里"), QuestionNoteAction)
 	note.Multiline, note.MaxLength = true, MaxQuestionNote
 	later := []slackgo.BlockElement{}
@@ -226,15 +236,20 @@ func waitingBlocks(c QuestionCard, plain, mrkdwn func(string) *slackgo.TextBlock
 		slackgo.NewButtonBlockElement(QuestionCloseAction, c.ID, plain("关闭问题")).WithStyle(slackgo.StyleDanger).WithConfirm(
 			slackgo.NewConfirmationBlockObject(plain("关闭这个问题？"), plain("agent 会收到「关闭」，自己决定不再问，还是换个问法。补充框里写的会一起带上。"), plain("关闭"), plain("取消")).WithStyle(slackgo.StyleDanger)),
 	)
-	return []slackgo.Block{
+	bs := []slackgo.Block{
 		slackgo.NewActionBlock(QuestionBlockID(c.ID, QuestionPickPart), radio),
 		slackgo.NewInputBlock(QuestionBlockID(c.ID, QuestionNotePart), plain("补充 (可选)"), nil, note).WithOptional(true),
+	}
+	if c.Warning != "" {
+		bs = append(bs, slackgo.NewSectionBlock(mrkdwn("*"+c.Warning+"*"), nil, nil))
+	}
+	return append(bs,
 		slackgo.NewActionBlock(QuestionBlockID(c.ID, QuestionSubmitPart),
 			slackgo.NewButtonBlockElement(QuestionSubmitAction, c.ID, plain("提交")).WithStyle(slackgo.StylePrimary)),
 		slackgo.NewContextBlock("", mrkdwn("稍后再问，或者关掉这个问题：")),
 		slackgo.NewActionBlock(QuestionBlockID(c.ID, QuestionLaterPart), later...),
 		slackgo.NewContextBlock("", mrkdwn("编号 "+c.ID)),
-	}
+	)
 }
 
 // snoozeDate writes when a snooze ends as a Slack date token.

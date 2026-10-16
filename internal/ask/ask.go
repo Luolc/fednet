@@ -79,7 +79,14 @@ type Flow struct {
 
 // hint is a text to show user alone about a click on card, in the
 // thread that starts at ts in channel, or in channel when ts is empty.
-type hint struct{ card, channel, ts, user, text string }
+// A hint onCard is shown on the card at cardTS instead, with the radio
+// button picked selected, and to user alone only if the card cannot be
+// updated.
+type hint struct {
+	card, channel, ts, user, text string
+	onCard                        bool
+	cardTS, picked                string
+}
 
 // Posted is where a card is: its id, its message, and the link to it,
 // empty when Slack did not give one.
@@ -169,7 +176,8 @@ func (f *Flow) Withdraw(ctx context.Context, client, id, note string) error {
 // and not a bot, c names the card where it is now, and the card waits,
 // all judged again under the database's write lock; a submit of "other"
 // needs a note. A click that does not count changes nothing, and the
-// clicker is told why in a hint the next Pass delivers. A click that
+// clicker is told why in a hint the next Pass delivers; a submit with no
+// option and no note gets it on the card, above submit. A click that
 // counts records the answer and queues it for the client in the same
 // transaction; the card is brought up to date by the next Pass. Click
 // calls Slack itself only to open the time picker, which must be within
@@ -238,6 +246,7 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 			a.Choice = &question.Choice{Index: i, Short: card.Options[i].Short}
 		} else if c.Note == "" {
 			h.text = "请先选一项；选「其他」的话，请先在补充框里写几句，再点「提交」。"
+			h.onCard, h.cardTS, h.picked = true, q.TS, c.Choice
 			return h, nil
 		}
 	case slack.QuestionCloseAction:
@@ -372,6 +381,9 @@ func (f *Flow) Pass(ctx context.Context) error {
 	f.hints = nil
 	f.mu.Unlock()
 	for _, h := range hints {
+		if h.onCard && f.warn(ctx, h) {
+			continue
+		}
 		sctx, cancel := context.WithTimeout(ctx, f.slackTimeout())
 		var err error
 		if h.ts == "" {
@@ -385,6 +397,33 @@ func (f *Flow) Pass(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// warn shows h on its card, if the card still waits there, and reports
+// whether h is done with; when it is not, h is for the clicker alone. A
+// click that counts in between is shown by the next Pass, which leaves
+// the warning off.
+func (f *Flow) warn(ctx context.Context, h hint) bool {
+	q, err := f.Store.Question(ctx, h.card)
+	if err != nil {
+		slog.Warn("ask: no card to put the warning on, telling the clicker alone instead", "card", h.card, "err", err)
+		return false
+	}
+	if q.Status != store.QuestionOpen || q.TS != h.cardTS {
+		return true
+	}
+	var card question.Question
+	if err := json.Unmarshal(q.Card, &card); err != nil {
+		slog.Warn("ask: no card to put the warning on, telling the clicker alone instead", "card", h.card, "err", err)
+		return false
+	}
+	channel, _, _ := slack.ParseThreadKey(q.Thread)
+	c := slack.QuestionCard{ID: q.ID, Question: card, Picked: h.picked, Warning: "⚠️ " + h.text}
+	if err := f.call(ctx, func(ctx context.Context) error { return f.Slack.UpdateQuestion(ctx, channel, q.TS, c) }); err != nil {
+		slog.Warn("ask: putting the warning on the card, telling the clicker alone instead", "card", q.ID, "err", err)
+		return false
+	}
+	return true
 }
 
 // resurface posts q, snoozed, again at the bottom of its thread, then

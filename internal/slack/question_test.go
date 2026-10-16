@@ -3,6 +3,7 @@ package slack
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,39 @@ func TestQuestionBlocks(t *testing.T) {
 	c.State = QuestionMoved
 	if got := mustJSON(t, questionBlocks(c)); strings.Contains(got, `"action_id"`) || !strings.Contains(got, "卡片重发在下方") {
 		t.Fatalf("moved card = %s, want no buttons and where it went", got)
+	}
+}
+
+// A warning goes above submit and the radio button picked stays
+// selected; the other blocks keep their ids, so that what a person typed
+// is not lost.
+func TestQuestionWarning(t *testing.T) {
+	ids := func(bs []slackgo.Block) (ids []string) {
+		for _, b := range bs {
+			if sec, ok := b.(*slackgo.SectionBlock); ok {
+				ids = append(ids, "section:"+sec.Text.Text)
+				continue
+			}
+			ids = append(ids, string(b.BlockType())+":"+b.ID())
+		}
+		return ids
+	}
+	c := QuestionCard{ID: "Q1", Question: testQuestion}
+	plain := ids(questionBlocks(c))
+	c.Picked, c.Warning = QuestionOther, "⚠️ 请先选一项"
+	bs := questionBlocks(c)
+	warned := ids(bs)
+	submit := slices.Index(plain, "actions:"+QuestionBlockID("Q1", QuestionSubmitPart))
+	want := slices.Insert(slices.Clone(plain), submit, "section:*⚠️ 请先选一项*")
+	if strings.Join(warned, ",") != strings.Join(want, ",") {
+		t.Fatalf("blocks with a warning = %q, want %q", warned, want)
+	}
+	for _, b := range bs {
+		if a, ok := b.(*slackgo.ActionBlock); ok && a.BlockID == QuestionBlockID("Q1", QuestionPickPart) {
+			if r := a.Elements.ElementSet[0].(*slackgo.RadioButtonsBlockElement); r.InitialOption == nil || r.InitialOption.Value != QuestionOther {
+				t.Fatalf("radio buttons start at %+v, want other", r.InitialOption)
+			}
+		}
 	}
 }
 
