@@ -60,6 +60,8 @@ channel 里的消息只有 @ 了 bot 才交给 agent，@ 的那条带上线程�
 
 人在 Slack 里上传的文件由 hub 用 bot token 代 client 下载 (app 的 manifest 要有 `files:read`)；配置里的 `files` 定上限：`prefetch_types` 是交给 agent 之前就先取到它机器上的类型 (`image/*` 是所有图片)，`prefetch_max_bytes` 先取的单个文件最大几个字节，`prefetch_max_total_bytes` 一条消息先取的合计最多几个字节，`fetch_max_bytes` agent 用 `fednet client fetch-file` 按需取时单个文件最大几个字节，`upload_max_bytes` 与 `upload_max_files` 是 agent 用 `fednet client post -file` 发文件时单个文件最大几个字节、一次最多几个 (manifest 要有 `files:write`)。不写就用示例里的默认值 (图片与 PDF、20 MiB、50 MiB、200 MiB、50 MiB、10 个)。旧配置里的 `upload_comment` 已经不用，hub 读到时只记一行日志。hub 不存文件；client 存在它数据库旁边的 `files/` 下 (`-files-dir` 可改)，默认保留 7 天、合计 2 GiB (`-files-retention`、`-files-max-total-bytes`)。
 
+agent 用 `fednet client react` 在线程的第一条消息上加或去掉 bot 自己的 emoji reaction (app 的 manifest 要有 `reactions:write`)，比如用来标出线程现在的状态。缺这个 scope 时命令退 3，错误里写明缺的是 `reactions:write`；改了 manifest 要重新安装 app，hub 的 bot token 才有它。
+
 ## 启动之后
 
 在 hub 机器上登记一台 client (ID 和 HASH 是那台机器上 `fednet client init` 打印的)：

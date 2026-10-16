@@ -93,6 +93,8 @@ type Request struct {
 	Ref  string `json:"ref,omitempty"`
 	Card []byte `json:"card,omitempty"`
 	ID   string `json:"id,omitempty"`
+	// Name is the argument of hubapi.React and hubapi.Unreact.
+	Name string `json:"name,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -367,7 +369,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		return s.progress(ctx, req)
 	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
 		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.RequestChannel, hubapi.Routes, hubapi.Ops, hubapi.Delete,
-		hubapi.Ask, hubapi.AskClose:
+		hubapi.Ask, hubapi.AskClose, hubapi.React, hubapi.Unreact:
 		if s.Request == nil {
 			return badRequest(req.Cmd + " is not served on this socket")
 		}
@@ -499,7 +501,7 @@ var kinds = []struct {
 func (s *Server) ask(ctx context.Context, req Request) Response {
 	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User,
 		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op, MsgID: req.MsgID, Mentions: req.Mentions, Route: req.Route,
-		Ref: req.Ref, Card: req.Card, ID: req.ID})
+		Ref: req.Ref, Card: req.Card, ID: req.ID, Name: req.Name})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}

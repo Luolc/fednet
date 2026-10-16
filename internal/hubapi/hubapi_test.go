@@ -23,6 +23,7 @@ import (
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	slackgo "github.com/slack-go/slack"
 )
 
 func testServer(t *testing.T) (*Server, *slack.Fake) {
@@ -104,6 +105,63 @@ func TestReadThread(t *testing.T) {
 			t.Errorf("read-thread %q = %v, want %v", tt.thread, err, tt.want)
 		}
 	}
+}
+
+// React and Unreact put the bot's reaction on a thread's first message
+// and take it off, and doing either twice is no error.
+func TestReact(t *testing.T) {
+	s, f := testServer(t)
+	ts, err := f.Start("C1", "U1", "please fix the build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := slack.ThreadKey("C1", ts)
+	steps := []struct {
+		cmd, name string
+		want      []string
+	}{
+		{React, "hourglass_flowing_sand", []string{"hourglass_flowing_sand"}},
+		{React, "hourglass_flowing_sand", []string{"hourglass_flowing_sand"}},
+		{React, "question", []string{"hourglass_flowing_sand", "question"}},
+		{Unreact, "hourglass_flowing_sand", []string{"question"}},
+		{Unreact, "hourglass_flowing_sand", []string{"question"}},
+	}
+	for _, st := range steps {
+		if _, err := answer(t, s, "workstation", Request{Cmd: st.cmd, Thread: key, Name: st.name}); err != nil {
+			t.Fatalf("%s %s = %v", st.cmd, st.name, err)
+		}
+		if got := f.Reactions("C1", ts); !slices.Equal(got, st.want) {
+			t.Fatalf("after %s %s the reactions are %v, want %v", st.cmd, st.name, got, st.want)
+		}
+	}
+
+	tests := []struct {
+		thread, name string
+		want         error
+	}{
+		{slack.ThreadKey("C1", "1600000000.000001"), "question", link.ErrNotFound},
+		{"C1", "question", link.ErrBadRequest},
+		{key, "", link.ErrBadRequest},
+		{key, ":question:", link.ErrBadRequest},
+	}
+	for _, tt := range tests {
+		if _, err := answer(t, s, "workstation", Request{Cmd: React, Thread: tt.thread, Name: tt.name}); !errors.Is(err, tt.want) {
+			t.Errorf("react %q %q = %v, want %v", tt.thread, tt.name, err, tt.want)
+		}
+	}
+
+	s.Slack = noReactionScope{f}
+	_, err = answer(t, s, "workstation", Request{Cmd: React, Thread: key, Name: "question"})
+	if !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "reactions:write") {
+		t.Fatalf("react without the scope = %v, want denied naming reactions:write", err)
+	}
+}
+
+// noReactionScope is a Slack API whose token lacks reactions:write.
+type noReactionScope struct{ slack.API }
+
+func (noReactionScope) React(context.Context, string, string, string) error {
+	return fmt.Errorf("slack: reactions.add: %w", slackgo.SlackErrorResponse{Err: "missing_scope"})
 }
 
 func TestAdopt(t *testing.T) {

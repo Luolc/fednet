@@ -186,6 +186,14 @@ commands:
         -error do nothing
   client read-thread -socket PATH [-json] THREAD-KEY
         print the messages of a thread, read by the hub
+  client react -socket PATH [-remove] [-json] THREAD-KEY NAME
+        add the bot's reaction NAME, an emoji's name without colons such as
+        hourglass_flowing_sand, to the first message of a thread, or with
+        -remove take it off; adding one the bot has there already, or
+        removing one it has not, succeeds too; only the bot's own reaction,
+        never one a person added; the hub's bot token needs the
+        reactions:write scope, else exits 3; exits 1 when Slack has no such
+        message
   client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
         start a thread in CHANNEL with TEXT and print its key; this machine
         owns it; TEXT is standard Markdown, as with post, and goes out as one
@@ -1008,6 +1016,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientProgress(ctx, args[1:], stdout)
 		case "read-thread":
 			return clientReadThread(ctx, args[1:], stdout)
+		case "react":
+			return clientReact(ctx, args[1:], stdout)
 		case "open-thread":
 			return clientOpenThread(ctx, args[1:], stdout)
 		case "threads":
@@ -1505,6 +1515,29 @@ func clientReadThread(ctx context.Context, args []string, stdout io.Writer) erro
 		}
 	}
 	return nil
+}
+
+// clientReact adds or removes the bot's reaction on the first message of
+// a thread.
+func clientReact(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client react", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	remove := fs.Bool("remove", false, "remove the reaction instead")
+	if err := parseFlags(fs, args, 2); err != nil {
+		return err
+	}
+	if *socket == "" || fs.Arg(0) == "" || fs.Arg(1) == "" {
+		return usageError("fednet client react: -socket, THREAD-KEY and NAME are required")
+	}
+	cmd := hubapi.React
+	if *remove {
+		cmd = hubapi.Unreact
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: cmd, Thread: fs.Arg(0), Name: fs.Arg(1)})
+	if err != nil || !*asJSON {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(res)
 }
 
 // clientOpenThread starts a thread through the hub and prints its key.

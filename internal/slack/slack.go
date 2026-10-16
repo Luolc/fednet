@@ -167,6 +167,12 @@ type API interface {
 	PickTime(ctx context.Context, triggerID string, state PickerState) error
 	// WhisperInThread is Whisper in the thread that starts at ts.
 	WhisperInThread(ctx context.Context, channel, ts, user, text string) error
+	// React adds the bot's reaction name, an emoji's name without
+	// colons, to the message at ts in channel, and Unreact removes it;
+	// either is done already when the bot's reaction is, or is not,
+	// there.
+	React(ctx context.Context, channel, ts, name string) error
+	Unreact(ctx context.Context, channel, ts, name string) error
 }
 
 // Upload is one file to upload: its name, its size in bytes and its
@@ -399,6 +405,9 @@ type Fake struct {
 	// picker opened with it.
 	questions map[string]QuestionCard
 	pickers   map[string]PickerState
+	// reactions maps channel and ts, as a thread key, to the names of
+	// the bot's reactions on the message there.
+	reactions map[string][]string
 	clock     int
 }
 
