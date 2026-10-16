@@ -95,6 +95,12 @@ const (
 	// AskClose takes back the card with ID, which the requesting client
 	// asked, with Text, if set, a note on the card.
 	AskClose = "ask-close"
+	// React adds the bot's reaction Name, an emoji's name without colons,
+	// to the first message of Thread, and Unreact removes it. Either is
+	// done when the bot's reaction already is, or is not, there. Any
+	// client may react in any thread, as it may read and post in any.
+	React   = "react"
+	Unreact = "unreact"
 )
 
 // Request is one request. Cmd selects the command; the other fields are its
@@ -125,6 +131,8 @@ type Request struct {
 	Card []byte `json:"card,omitempty"`
 	// ID is the argument of AskClose.
 	ID string `json:"id,omitempty"`
+	// Name is the argument of React and Unreact.
+	Name string `json:"name,omitempty"`
 }
 
 // RouteRequest is a change of one route that RequestRoute asks for: the
@@ -394,6 +402,8 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		reply.Question, err = s.ask(ctx, client, r)
 	case AskClose:
 		err = s.askClose(ctx, client, r)
+	case React, Unreact:
+		err = s.react(ctx, r)
 	default:
 		err = link.Refuse(link.ErrBadRequest, "unknown command %q", r.Cmd)
 	}
@@ -870,6 +880,35 @@ func (s *Server) askClose(ctx context.Context, client string, r Request) error {
 		return link.Refuse(link.ErrDenied, "card %s was asked by another client", r.ID)
 	case errors.Is(err, ask.ErrDone):
 		return link.Refuse(link.ErrBadRequest, "card %s is not waiting: %v", r.ID, err)
+	}
+	return err
+}
+
+// react adds or removes the bot's reaction on the first message of a
+// thread, as React and Unreact say.
+func (s *Server) react(ctx context.Context, r Request) error {
+	channel, ts, err := thread(r)
+	if err != nil {
+		return err
+	}
+	if r.Name == "" || strings.ContainsAny(r.Name, ": ") {
+		return link.Refuse(link.ErrBadRequest, "%q is not an emoji name without colons", r.Name)
+	}
+	if s.Slack == nil {
+		return errNoSlack
+	}
+	if r.Cmd == React {
+		err = s.Slack.React(ctx, channel, ts, r.Name)
+	} else {
+		err = s.Slack.Unreact(ctx, channel, ts, r.Name)
+	}
+	switch {
+	case errors.Is(err, slack.ErrNotFound):
+		return link.Refuse(link.ErrNotFound, "no thread %s", r.Thread)
+	case slack.Code(err) == "missing_scope":
+		return link.Refuse(link.ErrDenied, "the hub's bot token lacks the reactions:write scope; add it to the Slack app and reinstall the app")
+	case slack.Code(err) == "invalid_name":
+		return link.Refuse(link.ErrBadRequest, "Slack has no emoji %q", r.Name)
 	}
 	return err
 }

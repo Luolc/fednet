@@ -109,6 +109,31 @@ func TestHubRequests(t *testing.T) {
 		t.Fatalf("read-thread of a malformed key: exit %d, want 2", code)
 	}
 
+	// react puts the bot's reaction on the thread's first message, and
+	// -remove takes it off, each twice without error.
+	for range 2 {
+		if code, _ := fednet("client", "react", "-socket", socket, thread, "question"); code != 0 {
+			t.Fatalf("react: exit %d", code)
+		}
+	}
+	if got := f.Reactions("C1", ts); !slices.Equal(got, []string{"question"}) {
+		t.Fatalf("after react the reactions are %v, want [question]", got)
+	}
+	for range 2 {
+		if code, _ := fednet("client", "react", "-socket", socket, "-remove", thread, "question"); code != 0 {
+			t.Fatalf("react -remove: exit %d", code)
+		}
+	}
+	if got := f.Reactions("C1", ts); len(got) != 0 {
+		t.Fatalf("after react -remove the reactions are %v, want none", got)
+	}
+	if code, _ := fednet("client", "react", "-socket", socket, "C1/1600000000.000001", "question"); code != 1 {
+		t.Fatalf("react on a missing thread: exit %d, want 1", code)
+	}
+	if code, _ := fednet("client", "react", "-socket", socket, thread); code != 2 {
+		t.Fatalf("react without a name: exit %d, want 2", code)
+	}
+
 	// channel-context set, then get.
 	body := filepath.Join(dir, "context.md")
 	if err := os.WriteFile(body, []byte("repos: fednet, fleet"), 0o600); err != nil {
