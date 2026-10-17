@@ -75,7 +75,7 @@ const (
 	DefaultUploadWait  = 30 * time.Second
 )
 
-// outboxPoll is how often Upload looks at the outbox; tests shorten it.
+// outboxPoll is how often Drain looks at the outbox; tests shorten it.
 var outboxPoll = 100 * time.Millisecond
 
 // DefaultBackoff is the Backoff used when Client.Backoff is zero.
@@ -392,7 +392,11 @@ func (f *fetched) Close() error {
 // reached the hub, so that it stays in order with the posts. When the
 // outbox does not empty within UploadWait it fails as unreachable.
 func (c *Client) Upload(ctx context.Context, u Upload, body io.Reader) error {
-	if err := c.drain(ctx); err != nil {
+	wait := c.UploadWait
+	if wait == 0 {
+		wait = DefaultUploadWait
+	}
+	if err := c.Drain(ctx, wait); err != nil {
 		return err
 	}
 	header, err := json.Marshal(u)
@@ -423,12 +427,10 @@ func (c *Client) Upload(ctx context.Context, u Upload, body io.Reader) error {
 	return refused(res, strings.TrimSpace(string(msg)))
 }
 
-// drain waits until the outbox is empty, at most UploadWait.
-func (c *Client) drain(ctx context.Context) error {
-	wait := c.UploadWait
-	if wait == 0 {
-		wait = DefaultUploadWait
-	}
+// Drain waits until the outbox is empty, at most wait, so that a request
+// sent next reaches the hub after the posts queued before it. When the
+// outbox does not empty in time it fails as unreachable.
+func (c *Client) Drain(ctx context.Context, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	for {
 		ms, err := c.Store.Outbox.Pending(ctx)
@@ -439,7 +441,7 @@ func (c *Client) drain(ctx context.Context) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%w: %d posts queued before the upload have not reached the hub after %v", ErrUnreachable, len(ms), wait)
+			return fmt.Errorf("%w: %d posts queued before have not reached the hub after %v", ErrUnreachable, len(ms), wait)
 		}
 		t := time.NewTimer(outboxPoll)
 		select {

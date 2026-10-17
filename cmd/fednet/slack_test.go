@@ -377,6 +377,32 @@ func TestHubWithSlack(t *testing.T) {
 		t.Fatalf("client delete of a post deleted already: exit %d, want 1", code)
 	}
 
+	// The agent shows its progress, posts what it found and asks right
+	// after: the card waits for the post, closes the progress card and
+	// lands below the post.
+	if code := run(ctx, []string{"client", "progress", "-socket", socket, "-thread", thread, "-title", "reading the log",
+		"-item", "log:doing"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client progress: exit %d", code)
+	}
+	if code := run(ctx, []string{"client", "post", "-socket", socket, "-thread", thread, "the test is flaky"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client post: exit %d", code)
+	}
+	cardFile := filepath.Join(dir, "card.json")
+	if err := os.WriteFile(cardFile, []byte(`{"question": "skip it?"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := run(ctx, []string{"client", "ask", "-socket", socket, "-thread", thread, "-ref", "q-1", "-card", cardFile}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client ask: exit %d", code)
+	}
+	ms, _ = f.Replies(ctx, "C1", ts)
+	tss, _ := f.Questions("C1")
+	if len(ms) != 8 || ms[5].Text != "进度：reading the log" || ms[6].Text != "the test is flaky" || len(tss) != 1 || ms[7].TS != tss[0] {
+		t.Fatalf("Slack thread = %+v, cards at %q; want the progress card, the post, then the question card", ms, tss)
+	}
+	if card, ok := f.Progress("C1", ms[5].TS); !ok || card.Items[0].State != slack.Done {
+		t.Fatalf("progress card = %+v, want it closed", card)
+	}
+
 	if code := stopClient(); code != 0 {
 		t.Errorf("client exited %d", code)
 	}

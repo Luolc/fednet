@@ -1024,3 +1024,91 @@ func TestReadAnswer(t *testing.T) {
 		t.Errorf("read-answer without an id = %v, want ErrBadRequest", err)
 	}
 }
+
+// An Ask goes out after what its client posted before: it waits until
+// that is in Slack, closes the thread's progress card, and only then
+// posts the card, which lands below the post. Another client's posts do
+// not hold it up; its own that never go out make it busy, with no card.
+func TestAskAfterQueuedPosts(t *testing.T) {
+	ctx := t.Context()
+	s, f := testServer(t)
+	s.Questions = &ask.Flow{Store: s.Store, Slack: f}
+	poster := &outbound.Poster{Store: s.Store, Slack: f}
+	s.CatchUp = poster.CatchUp
+	root, err := f.Start("C1", "U1", "please fix the build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := slack.ThreadKey("C1", root)
+	n := 0
+	put := func(client string, m payload.Message) {
+		t.Helper()
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if _, err := s.Store.Inbox.PutFrom(ctx, client, store.Message{MsgID: fmt.Sprintf("m%d", n), Payload: b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	askFrom := func(client, ref string) <-chan error {
+		req, err := json.Marshal(Request{Cmd: Ask, Thread: key, Ref: ref, Card: []byte(`{"question": "合并吗？"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := s.Answer(ctx, client, req)
+			done <- err
+		}()
+		return done
+	}
+
+	put("workstation", payload.Message{Type: payload.Progress, Thread: key, Title: "building", Items: []slack.ProgressItem{{Text: "build", State: slack.Doing}}})
+	if err := poster.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	put("workstation", payload.Message{Type: payload.Post, Thread: key, Text: "build is green"})
+	done := askFrom("workstation", "q-1")
+	select {
+	case err := <-done:
+		t.Fatalf("Ask = %v before the post went out", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if tss, _ := f.Questions("C1"); len(tss) != 0 {
+		t.Fatalf("cards %q in Slack before the post went out, want none", tss)
+	}
+	if err := poster.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ms, err := f.Replies(ctx, "C1", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tss, _ := f.Questions("C1")
+	if len(ms) != 4 || ms[1].Text != "进度：building" || ms[2].Text != "build is green" || len(tss) != 1 || ms[3].TS != tss[0] {
+		t.Fatalf("thread = %+v, cards at %q; want the progress card, the post, then the question card", ms, tss)
+	}
+	if card, ok := f.Progress("C1", ms[1].TS); !ok || card.Items[0].State != slack.Done {
+		t.Fatalf("progress card = %+v, want it closed", card)
+	}
+
+	put("datamachine", payload.Message{Type: payload.Post, Thread: key, Text: "not out yet"})
+	if err := <-askFrom("workstation", "q-2"); err != nil {
+		t.Fatalf("Ask behind another client's post = %v, want the card", err)
+	}
+
+	askWait = 5 * time.Millisecond
+	t.Cleanup(func() { askWait = 15 * time.Second })
+	put("workstation", payload.Message{Type: payload.Post, Thread: key, Text: "stuck"})
+	if err := <-askFrom("workstation", "q-3"); !errors.Is(err, link.ErrBusy) {
+		t.Fatalf("Ask behind a post that does not go out = %v, want busy", err)
+	}
+	if tss, _ := f.Questions("C1"); len(tss) != 2 {
+		t.Fatalf("%d cards, want 2: none for the ask that gave up", len(tss))
+	}
+}

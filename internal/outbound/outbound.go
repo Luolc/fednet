@@ -16,8 +16,8 @@
 // the name of the machine it came from, or a progress card: one card open
 // at a time in each thread, which each progress replaces whole, kept in
 // the store so that it outlives the process. Whatever goes into a
-// thread, uploads included, first closes its open card, as a progress
-// with Close slack.Done does.
+// thread, uploads and question cards included, first closes its open
+// card, as a progress with Close slack.Done does.
 //
 // The inbox also holds the alerts clients raise, which only the hub can
 // send, since only the hub has the webhook: each goes to the webhook as
@@ -49,13 +49,10 @@ const (
 	// DefaultMaxChars is about the longest message Slack recommends.
 	DefaultMaxChars = 4000
 	DefaultInterval = 5 * time.Second
-	// DefaultUploadWait is well within the time a client gives an upload.
-	DefaultUploadWait = 30 * time.Second
 )
 
-// uploadPoll is how often BeforeUpload looks at the inbox; tests shorten
-// it.
-var uploadPoll = 100 * time.Millisecond
+// catchUpPoll is how often CatchUp looks at the inbox; tests shorten it.
+var catchUpPoll = 100 * time.Millisecond
 
 // Poster posts the hub's inbox to Slack. Run serves until its context is
 // done; Nudge tells it a post has arrived.
@@ -71,14 +68,11 @@ type Poster struct {
 	// Interval is how often Run looks at the inbox when not nudged, and
 	// how long it waits after a failure. Zero means DefaultInterval.
 	Interval time.Duration
-	// UploadWait bounds how long BeforeUpload waits for a client's
-	// earlier posts. Zero means DefaultUploadWait.
-	UploadWait time.Duration
 	// Users is the user list: a post mentions only the people on it.
 	Users map[string]string
 
 	// cards is held over each change to a progress card, which Run and
-	// BeforeUpload make.
+	// CatchUp make.
 	cards sync.Mutex
 
 	nudge     chan struct{}
@@ -423,14 +417,11 @@ func (p *Poster) close(ctx context.Context, thread, state, title string, items [
 	return p.record(ctx, func() error { return p.Store.CloseProgress(ctx, thread) })
 }
 
-// BeforeUpload readies thread for an upload from client: it waits, at
-// most UploadWait, until what client posted before is in Slack, then
-// closes the thread's progress card.
-func (p *Poster) BeforeUpload(ctx context.Context, client, thread string) error {
-	wait := p.UploadWait
-	if wait == 0 {
-		wait = DefaultUploadWait
-	}
+// CatchUp readies thread for what the hub is about to post there for
+// client itself, an upload or a question card, rather than through the
+// inbox: it waits, at most wait, until what client posted before is in
+// Slack, then closes the thread's progress card.
+func (p *Poster) CatchUp(ctx context.Context, client, thread string, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	upTo := int64(math.MaxInt64)
 	for {
@@ -443,9 +434,9 @@ func (p *Poster) BeforeUpload(ctx context.Context, client, thread string) error 
 		}
 		upTo = last
 		if time.Now().After(deadline) {
-			return fmt.Errorf("what this machine posted before the upload is not in Slack after %v", wait)
+			return fmt.Errorf("what this machine posted before is not in Slack after %v", wait)
 		}
-		t := time.NewTimer(uploadPoll)
+		t := time.NewTimer(catchUpPoll)
 		select {
 		case <-t.C:
 		case <-ctx.Done():
