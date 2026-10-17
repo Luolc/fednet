@@ -307,17 +307,18 @@ commands:
         answered or closed the card takes no more presses; any machine may
         read any card; exits 1 when the hub has no such card
   client ops -socket PATH [-json] (upgrade | version)
-        ask the hub for one of two fixed operations, as this machine; run
-        it only when a person asks for it: an agent never decides on its
-        own to upgrade; the hub allows each operation only to the clients
-        its config lists under ops, and posts every request, refused or
-        not, with what came of it, to the alerts channel; version prints
-        what /fednet version shows; upgrade starts the upgrade /fednet
-        upgrade would, to the latest release, never another, and returns
-        as soon as it has started: how it goes is posted to the alerts
-        channel, not printed here, as the hub restarts on the way; when the
-        hub is on the latest release already, upgrade says so and starts
-        nothing; exits 3 when the hub refuses, and 5 when the hub is busy:
+        ask the hub for one of two fixed operations, as this machine; once
+        a release is out under the rules for releasing, an agent may run
+        upgrade itself to move the machines to it, without waiting for a
+        person to ask or for the hub's own check; the hub allows each
+        operation only to the clients its config lists under ops, and
+        posts every request, refused or not, with what came of it, to the
+        alerts channel; version prints what /fednet version shows; upgrade
+        starts the upgrade /fednet upgrade would, to the latest release,
+        never another, and returns as soon as it has started: how it goes
+        is posted to the alerts channel, not printed here, as the hub
+        restarts on the way; when the hub is on the latest release
+        already, upgrade says so and starts nothing; exits 3 when the hub refuses, and 5 when the hub is busy:
         too many records of earlier requests are still waiting for the
         alerts channel, so it did nothing; try again later
   client init -id CLIENT-ID -credential PATH
@@ -520,7 +521,7 @@ type hubConfig struct {
 		// each must be on Users.
 		Admins []string `json:"admins"`
 		// Auto, unless set to false, makes the hub look for a new release
-		// every hour and upgrade to it.
+		// every five minutes and upgrade to it.
 		Auto *bool `json:"auto"`
 	} `json:"upgrade"`
 	// Ops lists, for each operation of client ops, the clients that may

@@ -5,10 +5,10 @@
 // downloads the release's binary for this architecture and its SHA256SUMS,
 // checks the sum, puts the binary in place atomically, and hands the
 // running process off to it. Hub, in hub.go, decides when: on `/fednet
-// upgrade` in Slack and on the hourly check for a new release, it tells
-// every client that is online, waits for them, then requests its own
-// upgrade. Client, in client.go, is the client's end: it turns the hub's
-// notice into the request file.
+// upgrade` in Slack and on its check for a new release every few
+// minutes, it tells every client that is online, waits for them, then
+// requests its own upgrade. Client, in client.go, is the client's end:
+// it turns the hub's notice into the request file.
 package upgrade
 
 import (
