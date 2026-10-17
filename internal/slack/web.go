@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -207,9 +208,10 @@ func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
 // posts the content there as the request's body, Size bytes with the
 // token, then completes the upload (files.completeUploadExternal) into
 // the thread as one message with the files, text in a markdown block as
-// PostReply puts it. The content is posted once: the upload to the URL is
-// not retried. The upload URL gets the token only if it passes the same
-// check as a download URL.
+// PostReply puts it, and returns once that message is in the thread. The
+// content is posted once: the upload to the URL is not retried. The
+// upload URL gets the token only if it passes the same check as a
+// download URL.
 func (w *Web) Upload(ctx context.Context, channel, ts, text string, files []Upload) error {
 	var ids []slackgo.FileSummary
 	for _, u := range files {
@@ -230,10 +232,55 @@ func (w *Web) Upload(ctx context.Context, channel, ts, text string, files []Uplo
 	if text != "" {
 		p.Blocks = slackgo.Blocks{BlockSet: []slackgo.Block{slackgo.NewMarkdownBlock("", text)}}
 	}
-	return w.call(ctx, "files.completeUploadExternal", func() error {
+	err := w.call(ctx, "files.completeUploadExternal", func() error {
 		_, err := w.c.CompleteUploadExternalContext(ctx, p)
 		return err
 	})
+	if err != nil {
+		return err
+	}
+	w.awaitShare(ctx, ids[0].ID, channel, ts)
+	return nil
+}
+
+// How often, and how many times, awaitShare asks files.info: about 10s
+// in all.
+const (
+	sharePoll  = 250 * time.Millisecond
+	shareTries = 40
+)
+
+// awaitShare waits until Slack has shared the file with id in the thread
+// channel/ts. Slack shares an upload in the thread only after
+// files.completeUploadExternal has returned, and the message gets its ts
+// then: what goes into the thread meanwhile lands above it. A share not
+// seen in time is only logged: the files are Slack's already, and failing
+// the upload would invite posting them again.
+func (w *Web) awaitShare(ctx context.Context, id, channel, ts string) {
+	for range shareTries {
+		var f *slackgo.File
+		err := w.call(ctx, "files.info", func() (err error) {
+			f, _, _, err = w.c.GetFileInfoContext(ctx, id, 0, 0)
+			return err
+		})
+		if err == nil && shared(f.Shares, channel, ts) {
+			return
+		}
+		if err := w.sleep(ctx, sharePoll); err != nil {
+			break
+		}
+	}
+	slog.Warn("slack: uploaded file not seen in its thread yet; what follows may land above it", "file", id, "thread", ThreadKey(channel, ts))
+}
+
+// shared reports whether s has a share in the thread channel/ts.
+func shared(s slackgo.Share, channel, ts string) bool {
+	for _, i := range append(s.Public[channel], s.Private[channel]...) {
+		if i.ThreadTs == ts && i.Ts != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // upload posts u's content to uploadURL, the body Size bytes long.

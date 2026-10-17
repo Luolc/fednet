@@ -144,7 +144,8 @@ type API interface {
 	Download(ctx context.Context, f File) (io.ReadCloser, error)
 	// Upload posts files, with text, in the thread that starts at ts in
 	// channel, as one message; each file's content is read from its Body,
-	// Size bytes.
+	// Size bytes. It returns once the message is in the thread, so that
+	// what is posted after it lands below it.
 	Upload(ctx context.Context, channel, ts, text string, files []Upload) error
 	// PostProgress posts p in the thread that starts at ts in channel and
 	// returns the new message's ts.
