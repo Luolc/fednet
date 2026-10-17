@@ -99,6 +99,40 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// A short that starts with a label of its own is refused, naming the
+// field and the label: the card puts (a), (b) before it, and "(a) B：..."
+// reads as two labels that disagree. Text that merely starts with a
+// letter or a number passes.
+func TestOwnLabel(t *testing.T) {
+	card := func(short string) string {
+		return fmt.Sprintf(`{"question": "q", "options": [{"short": "x"}, {"short": %q}]}`, short)
+	}
+	for short, label := range map[string]string{
+		"B：加 thresholds 命令": "B：",
+		"A: hand-edit once": "A:",
+		"b. 手工改表一次":         "b.",
+		"1) 先回滚":            "1)",
+		"二、保持现状":            "二、",
+		"Ｃ）全角":              "Ｃ）",
+		"(a) 重复编号":          "(a)",
+		"【A】加命令":            "【A】",
+		"方案一：加命令":           "方案一：",
+		"选项A 手工改":           "选项A",
+		"Option B: keep it": "Option B:",
+	} {
+		_, err := Parse([]byte(card(short)))
+		want := fmt.Sprintf("options[1].short starts with its own label %q; the card labels the options (a), (b), (c) itself", label)
+		if err == nil || err.Error() != want {
+			t.Errorf("short %q: %v, want %q", short, err, want)
+		}
+	}
+	for _, short := range []string{"A 股", "B 端先上", "API 改造", "2 小时后再看", "1.5 倍超时", "A/B 测试", "3:00 之前", "方案十分可行", "一次性迁移", "Optional cleanup"} {
+		if _, err := Parse([]byte(card(short))); err != nil {
+			t.Errorf("short %q: %v, want nil", short, err)
+		}
+	}
+}
+
 // The JSON the agent gets: choice is null for "other", and absent with
 // note and by on a resurfaced card; what a person wrote is not escaped.
 func TestAnswerJSON(t *testing.T) {

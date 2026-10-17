@@ -274,13 +274,17 @@ commands:
         at most 5 options, at most one recommended, the context and the
         options' long at most 12000 characters together; a card over a limit
         is refused with the field, the limit and its length, never cut; the
-        card adds "other", a note box, submit, snooze (30 minutes, 2 hours,
-        tomorrow, a time picked) and close; REF is the caller's id of the
-        question: asking with a REF this machine asked with before posts no
-        second card and prints that one; the card goes out after the posts
-        and progress queued before it, and first closes the thread's
-        progress card, as a post does; the client and then the hub each
-        wait at most 15s for them, exiting 4 and 5 after that, with no card;
+        card labels the options (a), (b), (c), so short and long carry no
+        label of their own (A：, B., 1), (a), 方案一：), and a short that starts
+        with one is refused; question and context name an option by its short,
+        never by a letter or number of their own; the card adds "other", a
+        note box, submit, snooze (30 minutes, 2 hours, tomorrow, a time
+        picked) and close; REF is the caller's id of the question: asking with
+        a REF this machine asked with before posts no second card and prints
+        that one; the card goes out after the posts and progress queued
+        before it, and first closes the thread's progress card, as a post
+        does; the client and then the hub each wait at most 15s for them,
+        exiting 4 and 5 after that, with no card;
         -mention names users on the user list to mention on the card; each
         press of submit, snooze or close by a person on the user list, and
         each snoozed card posted again at the bottom of the thread when its
