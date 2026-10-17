@@ -208,9 +208,10 @@ func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
 
 // Upload gets an upload URL for each file (files.getUploadURLExternal),
 // posts the content there as the request's body, Size bytes with the
-// token and the type its name gives (contentType), then completes the upload (files.completeUploadExternal) into
-// the thread as one message with the files, text in a markdown block as
-// PostReply puts it, and returns once that message is in the thread. The
+// token and the type its name gives (contentType), then completes the
+// upload (files.completeUploadExternal) into the thread as one message
+// with the files, text in a markdown block as PostReply puts it, and
+// returns once that message is in the thread. The
 // content is posted once: the upload to the URL is not retried. The
 // upload URL gets the token only if it passes the same check as a
 // download URL.
