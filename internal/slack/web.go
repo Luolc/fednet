@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -207,8 +206,8 @@ func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
 }
 
 // Upload gets an upload URL for each file (files.getUploadURLExternal),
-// posts the content there as the request's body, Size bytes with the
-// token and the type its name gives (contentType), then completes the
+// Markdown asked for as a snippet (snippetType), posts the content there
+// as the request's body, Size bytes with the token, then completes the
 // upload (files.completeUploadExternal) into the thread as one message
 // with the files, text in a markdown block as PostReply puts it, and
 // returns once that message is in the thread. The
@@ -220,7 +219,7 @@ func (w *Web) Upload(ctx context.Context, channel, ts, text string, files []Uplo
 	for _, u := range files {
 		var res *slackgo.GetUploadURLExternalResponse
 		err := w.call(ctx, "files.getUploadURLExternal", func() (err error) {
-			res, err = w.c.GetUploadURLExternalContext(ctx, slackgo.GetUploadURLExternalParameters{FileName: u.Name, FileSize: int(u.Size)})
+			res, err = w.c.GetUploadURLExternalContext(ctx, slackgo.GetUploadURLExternalParameters{FileName: u.Name, FileSize: int(u.Size), SnippetType: snippetType(u.Name, u.Size)})
 			return err
 		})
 		if err != nil {
@@ -312,7 +311,7 @@ func (w *Web) upload(ctx context.Context, uploadURL string, u Upload) error {
 	}
 	req.ContentLength = u.Size
 	req.Header.Set("Authorization", "Bearer "+w.token)
-	req.Header.Set("Content-Type", contentType(u.Name))
+	req.Header.Set("Content-Type", "application/octet-stream")
 	res, err := w.files.Do(req)
 	if err != nil {
 		return redact(w.token, err)
@@ -325,19 +324,21 @@ func (w *Web) upload(ctx context.Context, uploadURL string, u Upload) error {
 	return nil
 }
 
-// contentType is the type an upload is posted with, taken from its
-// name's extension, so that Slack need not guess it from the content:
-// it guessed some Markdown with code blocks in it as binary. A name with
-// no known extension is posted as application/octet-stream.
-func contentType(name string) string {
+// snippetMax is the largest upload Slack makes a snippet of: "limited to
+// 1MB".
+const snippetMax = 1_000_000
+
+// snippetType is the snippet_type an upload is asked for with: markdown
+// for a Markdown file of at most snippetMax bytes, none for anything
+// else. Slack guesses the type from the name and the content together,
+// and took some Markdown with code blocks in it for binary, whatever the
+// upload's Content-Type said; as a snippet it is text.
+func snippetType(name string, size int64) string {
 	ext := path.Ext(name)
-	if strings.EqualFold(ext, ".md") || strings.EqualFold(ext, ".markdown") {
-		return "text/markdown; charset=utf-8"
+	if size <= snippetMax && (strings.EqualFold(ext, ".md") || strings.EqualFold(ext, ".markdown")) {
+		return "markdown"
 	}
-	if t := mime.TypeByExtension(ext); t != "" {
-		return t
-	}
-	return "application/octet-stream"
+	return ""
 }
 
 // mayReceiveToken checks that rawURL is one the token may be sent to.
