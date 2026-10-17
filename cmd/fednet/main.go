@@ -318,9 +318,10 @@ commands:
         never another, and returns as soon as it has started: how it goes
         is posted to the alerts channel, not printed here, as the hub
         restarts on the way; when the hub is on the latest release
-        already, upgrade says so and starts nothing; exits 3 when the hub refuses, and 5 when the hub is busy:
-        too many records of earlier requests are still waiting for the
-        alerts channel, so it did nothing; try again later
+        already, upgrade says so and starts nothing; exits 3 when the hub
+        refuses, and 5 when the hub is busy: too many records of earlier
+        requests are still waiting for the alerts channel, so it did
+        nothing; try again later
   client init -id CLIENT-ID -credential PATH
         create this machine's credential; prints CLIENT-ID and HASH, never the credential
   approval verify -pubkey PATH -approval PATH -action PATH -machine CLIENT-ID -agent NAME -used PATH
