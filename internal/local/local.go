@@ -134,12 +134,15 @@ const (
 
 // Timeout bounds one request on either side, except a Handoff, which is
 // bounded by how long the daemon gives the new process to become ready,
-// and a FetchFile or a Post with files, which get FileTimeout: a transfer
-// takes longer. The request itself, before the daemon knows which it is,
-// must arrive within headerTimeout.
+// a FetchFile or a Post with files, which get FileTimeout: a transfer
+// takes longer, and an Ask, which gets AskTimeout: it first waits for the
+// posts queued before it, on the client and then on the hub. The request
+// itself, before the daemon knows which it is, must arrive within
+// headerTimeout.
 const (
 	Timeout     = 10 * time.Second
 	FileTimeout = 5 * time.Minute
+	AskTimeout  = 45 * time.Second
 )
 
 // headerTimeout bounds the reading of the request; tests shorten it.
@@ -152,13 +155,24 @@ func timeout(ctx context.Context, req Request) (context.Context, context.CancelF
 		return context.WithCancel(ctx)
 	case req.Cmd == FetchFile || len(req.Files) > 0:
 		return context.WithTimeout(ctx, FileTimeout)
+	case req.Cmd == hubapi.Ask:
+		return context.WithTimeout(ctx, AskTimeout)
 	}
 	return context.WithTimeout(ctx, Timeout)
 }
 
 // hubTimeout bounds the hub's part of a request, so that a hub that does
-// not answer is reported before the request itself times out.
-const hubTimeout = Timeout / 2
+// not answer is reported before the request itself times out. An Ask
+// first waits at most askDrain for the outbox to empty, then gives the
+// hub askHubTimeout, which covers the hub's own wait for the posts
+// before it (15s) and posting the card.
+const (
+	hubTimeout    = Timeout / 2
+	askHubTimeout = 25 * time.Second
+)
+
+// askDrain is a variable so that tests can shorten it.
+var askDrain = 15 * time.Second
 
 // maxRequestBytes bounds a request: a post's text may grow up to six times
 // when escaped as a JSON string.
@@ -296,6 +310,11 @@ type Server struct {
 	// from body; it is link.Client.Upload. Nil means such a post is not
 	// served.
 	Upload func(ctx context.Context, u link.Upload, body io.Reader) error
+	// Drain waits, at most wait, until what Post queued has reached the
+	// hub; it is link.Client.Drain. An Ask goes to the hub only after it,
+	// so that the card lands below the posts before it. Nil means an Ask
+	// does not wait.
+	Drain func(ctx context.Context, wait time.Duration) error
 }
 
 // Serve answers connections on ln until ctx is done. When it returns it has
@@ -506,7 +525,16 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
-	ctx, cancel := context.WithTimeout(ctx, hubTimeout)
+	limit := hubTimeout
+	if req.Cmd == hubapi.Ask {
+		if s.Drain != nil {
+			if err := s.Drain(ctx, askDrain); err != nil {
+				return failed(req.Cmd, err)
+			}
+		}
+		limit = askHubTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	answer, err := s.Request(ctx, b)
 	if err != nil {

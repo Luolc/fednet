@@ -277,11 +277,15 @@ commands:
         card adds "other", a note box, submit, snooze (30 minutes, 2 hours,
         tomorrow, a time picked) and close; REF is the caller's id of the
         question: asking with a REF this machine asked with before posts no
-        second card and prints that one; -mention names users on the user
-        list to mention on the card; each press of submit, snooze or close by
-        a person on the user list, and each snoozed card posted again at the
-        bottom of the thread when its time comes, comes through the hook as
-        a message of type answer whose answer field is
+        second card and prints that one; the card goes out after the posts
+        and progress queued before it, and first closes the thread's
+        progress card, as a post does; the client and then the hub each
+        wait at most 15s for them, exiting 4 and 5 after that, with no card;
+        -mention names users on the user list to mention on the card; each
+        press of submit, snooze or close by a person on the user list, and
+        each snoozed card posted again at the bottom of the thread when its
+        time comes, comes through the hook as a message of type answer whose
+        answer field is
         {"question_id": REF, "card_id": ID, "outcome": "answered" | "snoozed"
          | "closed" | "resurfaced", "choice": {"index": N, "short": "..."} or
          null for "other", "note": "...", "snooze_until": RFC 3339,
@@ -787,7 +791,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	}
 	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals, Questions: questions,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
-		BeforeUpload: poster.BeforeUpload}
+		CatchUp: poster.CatchUp}
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Scopes: scopes, Request: *upgradeRequest, HandedOff: proc.Exit(),
@@ -1151,7 +1155,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	defer cancel()
 	served := make(chan error, 1)
 	go func() {
-		served <- (&local.Server{Machine: cred.ClientID, Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get, Upload: c.Upload}).Serve(ctx, ln)
+		served <- (&local.Server{Machine: cred.ClientID, Post: c.Post, Request: c.Request, Handoff: proc.Handoff, Version: version, Fetch: cache.Get, Upload: c.Upload, Drain: c.Drain}).Serve(ctx, ln)
 	}()
 	// Ready before the predecessor is told to go: a failure here means
 	// this process exits and the predecessor stays.

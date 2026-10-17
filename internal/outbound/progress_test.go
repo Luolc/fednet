@@ -195,22 +195,22 @@ func TestProgressCardGoneOrTooBig(t *testing.T) {
 	}
 }
 
-// BeforeUpload waits until the client's earlier posts are in Slack, then
+// CatchUp waits until the client's earlier posts are in Slack, then
 // closes the card: a progress queued just before an upload is closed
 // before the upload goes out. When the client's posts do not go out, it
 // gives up.
-func TestBeforeUpload(t *testing.T) {
-	uploadPoll = time.Millisecond
-	t.Cleanup(func() { uploadPoll = 100 * time.Millisecond })
+func TestCatchUp(t *testing.T) {
+	catchUpPoll = time.Millisecond
+	t.Cleanup(func() { catchUpPoll = 100 * time.Millisecond })
 	f := newFixture(t)
 	b, _ := json.Marshal(payload.Message{Type: payload.Progress, Thread: f.thread, Title: "taking a screenshot", Items: []slack.ProgressItem{item("shoot", slack.Doing)}})
 	f.putRaw("workstation", b)
 
 	ready := make(chan error, 1)
-	go func() { ready <- f.p.BeforeUpload(t.Context(), "workstation", f.thread) }()
+	go func() { ready <- f.p.CatchUp(t.Context(), "workstation", f.thread, time.Minute) }()
 	select {
 	case err := <-ready:
-		t.Fatalf("BeforeUpload = %v before the progress went out", err)
+		t.Fatalf("CatchUp = %v before the progress went out", err)
 	case <-time.After(20 * time.Millisecond):
 	}
 	if err := f.p.Pass(t.Context()); err != nil {
@@ -225,8 +225,7 @@ func TestBeforeUpload(t *testing.T) {
 	}
 
 	f.put("workstation", f.thread, "stuck")
-	f.p.UploadWait = 5 * time.Millisecond
-	if err := f.p.BeforeUpload(t.Context(), "workstation", f.thread); err == nil || !strings.Contains(err.Error(), "not in Slack") {
-		t.Fatalf("BeforeUpload with a post not out = %v, want it to give up", err)
+	if err := f.p.CatchUp(t.Context(), "workstation", f.thread, 5*time.Millisecond); err == nil || !strings.Contains(err.Error(), "not in Slack") {
+		t.Fatalf("CatchUp with a post not out = %v, want it to give up", err)
 	}
 }

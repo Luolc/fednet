@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -38,7 +39,9 @@ func serve(t *testing.T, c *link.Client) string {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- (&Server{Machine: "workstation", Post: c.Post, Request: c.Request}).Serve(ctx, ln) }()
+	go func() {
+		done <- (&Server{Machine: "workstation", Post: c.Post, Request: c.Request, Drain: c.Drain}).Serve(ctx, ln)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
@@ -511,6 +514,39 @@ func TestAskWhileHubDown(t *testing.T) {
 	}
 	if ms, err := st.Outbox.Pending(t.Context()); err != nil || len(ms) != 0 {
 		t.Fatalf("outbox = %+v, %v; want empty", ms, err)
+	}
+}
+
+// An Ask goes to the hub only once the posts queued before it have: while
+// one is still in the outbox it fails as unreachable, without the hub
+// seeing it, and once that post is with the hub it goes through.
+func TestAskWaitsForTheOutbox(t *testing.T) {
+	askDrain = 20 * time.Millisecond
+	t.Cleanup(func() { askDrain = 15 * time.Second })
+	ctx := t.Context()
+	st := openClientStore(t)
+	var asks atomic.Int32
+	hub := testHub(t, func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+		asks.Add(1)
+		return []byte(`{"question": {"id": "Q1", "channel": "C1", "ts": "1700000000.000200"}}`), nil
+	})
+	path := serve(t, &link.Client{Store: st, ID: "workstation", Hub: hub})
+	thread := "C1/1700000000.000100"
+	posted, err := Do(ctx, path, Request{Cmd: Post, Thread: thread, Text: "build is green"})
+	if err != nil || posted.Error != "" {
+		t.Fatalf("Do(post) = %+v, %v", posted, err)
+	}
+	card := []byte(`{"question": "合并吗？"}`)
+	res, err := Do(ctx, path, Request{Cmd: hubapi.Ask, Thread: thread, Ref: "q-1", Card: card})
+	if err != nil || res.Kind != Unreachable || asks.Load() != 0 {
+		t.Fatalf("Do(ask) behind a queued post = %+v, %v with %d asks at the hub; want kind %q and none", res, err, asks.Load(), Unreachable)
+	}
+	if err := st.Outbox.Ack(ctx, posted.MsgID); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Do(ctx, path, Request{Cmd: hubapi.Ask, Thread: thread, Ref: "q-1", Card: card})
+	if err != nil || res.Error != "" || res.Question == nil || res.Question.ID != "Q1" || asks.Load() != 1 {
+		t.Fatalf("Do(ask) with the outbox empty = %+v, %v with %d asks at the hub; want the card", res, err, asks.Load())
 	}
 }
 
