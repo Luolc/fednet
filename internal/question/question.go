@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -92,6 +94,9 @@ func (q Question) Check() error {
 		if err := over(fmt.Sprintf("options[%d].short", i), o.Short, MaxShort); err != nil {
 			return err
 		}
+		if m := ownLabel.FindStringSubmatch(o.Short); m != nil {
+			return fmt.Errorf("options[%d].short starts with its own label %q; the card labels the options (a), (b), (c) itself", i, strings.Join(m[1:], ""))
+		}
 		if err := over(fmt.Sprintf("options[%d].long", i), o.Long, MaxLong); err != nil {
 			return err
 		}
@@ -111,6 +116,23 @@ func (q Question) Check() error {
 	}
 	return nil
 }
+
+// ownLabel matches a label an agent put before an option's text, which
+// the card's own (a), (b) would then contradict: one letter, digit or
+// Chinese numeral, bracketed, followed by a separator, or after 方案, 选项
+// or Option and a space, after any leading space. It stays narrow so that
+// "A 股", "B 端", "API 改造", "2 小时后", "1.5 倍" and "Options" pass: a
+// separator followed by a letter or digit, as in "2.5" or "A:B", is not a
+// label. Of its three groups, the one that matched holds the label.
+var ownLabel = func() *regexp.Regexp {
+	const (
+		label  = `[A-Za-zＡ-Ｚａ-ｚ0-9０-９一二三四五六七八九十]`
+		prefix = `(?:方案\s*|选项\s*|(?i:option)\s+)`
+	)
+	return regexp.MustCompile(`^\s*(?:([(（\[【]` + label + `[)）\]】])` +
+		`|((?:` + prefix + `)?` + label + `[：:.．、)）])(?:$|[^A-Za-z0-9])` +
+		`|(` + prefix + label + `)(?:$|\s))`)
+}()
 
 // Letter is the label of option i: a, b, c and so on.
 func Letter(i int) string { return string(rune('a' + i)) }
