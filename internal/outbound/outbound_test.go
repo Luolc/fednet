@@ -404,7 +404,9 @@ func TestPartRecordIsRetried(t *testing.T) {
 	f.p.MaxChars = 4
 	f.p.Interval = 20 * time.Millisecond
 	f.put("workstation", f.thread, "abcdefgh")
-	db, err := sql.Open("sqlite", f.path)
+	// Like the store's own connections, wait for the write lock rather
+	// than fail on it.
+	db, err := sql.Open("sqlite", "file:"+f.path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,6 +428,21 @@ func TestPartRecordIsRetried(t *testing.T) {
 		t.Fatalf("Pass returned %v with the part unrecorded", err)
 	case <-time.After(100 * time.Millisecond):
 	}
+	// The poster's retries take the write lock; hold it here so that the
+	// DROP TRIGGER below meets it every run, not only when a retry
+	// happens to be under way.
+	lock, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.ExecContext(t.Context(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		lock.ExecContext(context.Background(), "COMMIT")
+		lock.Close()
+	}()
 	if _, err := db.ExecContext(t.Context(), "DROP TRIGGER fail"); err != nil {
 		t.Fatal(err)
 	}
