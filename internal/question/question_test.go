@@ -112,6 +112,7 @@ func TestOwnLabel(t *testing.T) {
 		"A: hand-edit once": "A:",
 		"b. 手工改表一次":         "b.",
 		"1) 先回滚":            "1)",
+		" B：开头带空白":          "B：",
 		"二、保持现状":            "二、",
 		"Ｃ）全角":              "Ｃ）",
 		"(a) 重复编号":          "(a)",
@@ -126,7 +127,7 @@ func TestOwnLabel(t *testing.T) {
 			t.Errorf("short %q: %v, want %q", short, err, want)
 		}
 	}
-	for _, short := range []string{"A 股", "B 端先上", "API 改造", "2 小时后再看", "1.5 倍超时", "A/B 测试", "3:00 之前", "方案十分可行", "一次性迁移", "Optional cleanup"} {
+	for _, short := range []string{"A 股", "B 端先上", "API 改造", "2 小时后再看", "1.5 倍超时", "A/B 测试", "3:00 之前", "方案十分可行", "一次性迁移", "Optional cleanup", "Options 都保留", "Options: keep all", "A、B 两端都改"} {
 		if _, err := Parse([]byte(card(short))); err != nil {
 			t.Errorf("short %q: %v, want nil", short, err)
 		}

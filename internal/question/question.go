@@ -120,16 +120,16 @@ func (q Question) Check() error {
 // ownLabel matches a label an agent put before an option's text, which
 // the card's own (a), (b) would then contradict: one letter, digit or
 // Chinese numeral, bracketed, followed by a separator, or after 方案, 选项
-// or Option. It stays narrow so that "A 股", "B 端", "API 改造", "2 小时后"
-// and "1.5 倍" pass: a separator followed by a letter or digit, as in
-// "2.5" or "A:B", is not a label. Of its three groups, the one that
-// matched holds the label.
+// or Option and a space, after any leading space. It stays narrow so that
+// "A 股", "B 端", "API 改造", "2 小时后", "1.5 倍" and "Options" pass: a
+// separator followed by a letter or digit, as in "2.5" or "A:B", is not a
+// label. Of its three groups, the one that matched holds the label.
 var ownLabel = func() *regexp.Regexp {
 	const (
 		label  = `[A-Za-zＡ-Ｚａ-ｚ0-9０-９一二三四五六七八九十]`
-		prefix = `(?:方案|选项|(?i:option))\s*`
+		prefix = `(?:方案\s*|选项\s*|(?i:option)\s+)`
 	)
-	return regexp.MustCompile(`^(?:([(（\[【]` + label + `[)）\]】])` +
+	return regexp.MustCompile(`^\s*(?:([(（\[【]` + label + `[)）\]】])` +
 		`|((?:` + prefix + `)?` + label + `[：:.．、)）])(?:$|[^A-Za-z0-9])` +
 		`|(` + prefix + label + `)(?:$|\s))`)
 }()
