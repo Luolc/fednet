@@ -775,6 +775,7 @@ func TestWebUpload(t *testing.T) {
 	var srv *httptest.Server
 	var uploaded = map[string]string{}
 	var n, infos int
+	var limited bool
 	host := func() string { return srv.URL }
 	w, ts, srv := newTestWeb(t, func(r request) (int, string) {
 		switch r.method {
@@ -787,6 +788,9 @@ func TestWebUpload(t *testing.T) {
 			// Slack shares the files in thread 1.1 only by the third
 			// look, and never in thread 2.2.
 			infos++
+			if limited {
+				return http.StatusTooManyRequests, `{"ok":false,"error":"ratelimited"}`
+			}
 			if infos < 3 {
 				return 200, `{"ok":true,"file":{"id":"` + r.form.Get("file") + `"}}`
 			}
@@ -851,9 +855,31 @@ func TestWebUpload(t *testing.T) {
 	if err := w.Upload(ctx, "C1", "2.2", "", []Upload{{Name: "d.txt", Size: 1, Body: strings.NewReader("d")}}); err != nil {
 		t.Fatalf("Upload without the share seen = %v, want it to succeed", err)
 	}
-	if _, after := ts.got(); infos != 3+shareTries || len(after)-len(waits) != shareTries {
-		t.Fatalf("Upload without the share seen asked files.info %d times, waited %d times; want %d each", infos-3, len(after)-len(waits), shareTries)
+	if _, after := ts.got(); infos != 3+shareTries || len(after)-len(waits) != shareTries-1 {
+		t.Fatalf("Upload without the share seen asked files.info %d times, waited %d times; want %d and %d", infos-3, len(after)-len(waits), shareTries, shareTries-1)
 	}
+	// files.info that Slack keeps rate-limiting holds the upload no longer
+	// than shareWait, its rate-limit waits included.
+	shareWait = 50 * time.Millisecond
+	sleep := w.sleep
+	w.sleep = func(ctx context.Context, d time.Duration) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	limited = true
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Upload(ctx, "C1", "2.2", "", []Upload{{Name: "e.txt", Size: 1, Body: strings.NewReader("e")}})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Upload with files.info rate-limited = %v, want it to succeed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upload with files.info rate-limited still waiting after 5s")
+	}
+	shareWait, w.sleep, limited = 10*time.Second, sleep, false
 	// An upload the URL refuses before reading the body fails without
 	// leaving anything running behind: the content is sent by the request
 	// itself, there is no writer to wait for.
@@ -874,7 +900,7 @@ func TestWebUpload(t *testing.T) {
 	// An upload URL on another host does not get the token.
 	host = func() string { return "https://files.example.invalid" }
 	err = w.Upload(ctx, "C1", "1.1", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
-	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 4 {
+	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 5 {
 		t.Fatalf("Upload to another host = %v, %d uploads; want it refused before any upload, without quoting the token", err, len(uploaded))
 	}
 }

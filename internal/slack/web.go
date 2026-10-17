@@ -243,12 +243,19 @@ func (w *Web) Upload(ctx context.Context, channel, ts, text string, files []Uplo
 	return nil
 }
 
-// How often, and how many times, awaitShare asks files.info: about 10s
-// in all.
+// awaitShare asks files.info every sharePoll, at most shareTries times
+// and within shareWait in all, rate-limit waits included; tests shorten
+// shareWait.
 const (
 	sharePoll  = 250 * time.Millisecond
 	shareTries = 40
 )
+
+var shareWait = 10 * time.Second
+
+// errNotShared is why awaitShare gave up when files.info answered but
+// showed no share in the thread.
+var errNotShared = errors.New("no share in the thread yet")
 
 // awaitShare waits until Slack has shared the file with id in the thread
 // channel/ts. Slack shares an upload in the thread only after
@@ -257,20 +264,28 @@ const (
 // seen in time is only logged: the files are Slack's already, and failing
 // the upload would invite posting them again.
 func (w *Web) awaitShare(ctx context.Context, id, channel, ts string) {
-	for range shareTries {
+	ctx, cancel := context.WithTimeout(ctx, shareWait)
+	defer cancel()
+	var err error
+	for i := range shareTries {
+		if i > 0 {
+			if err = w.sleep(ctx, sharePoll); err != nil {
+				break
+			}
+		}
 		var f *slackgo.File
-		err := w.call(ctx, "files.info", func() (err error) {
+		err = w.call(ctx, "files.info", func() (err error) {
 			f, _, _, err = w.c.GetFileInfoContext(ctx, id, 0, 0)
 			return err
 		})
-		if err == nil && shared(f.Shares, channel, ts) {
-			return
-		}
-		if err := w.sleep(ctx, sharePoll); err != nil {
-			break
+		if err == nil {
+			if shared(f.Shares, channel, ts) {
+				return
+			}
+			err = errNotShared
 		}
 	}
-	slog.Warn("slack: uploaded file not seen in its thread yet; what follows may land above it", "file", id, "thread", ThreadKey(channel, ts))
+	slog.Warn("slack: uploaded file not seen in its thread; what follows may land above it", "file", id, "thread", ThreadKey(channel, ts), "err", err)
 }
 
 // shared reports whether s has a share in the thread channel/ts.
