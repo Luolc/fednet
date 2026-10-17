@@ -21,8 +21,10 @@ import (
 
 // Defaults for the zero fields of Hub.
 const (
-	// DefaultInterval is how often the hub looks for a new release.
-	DefaultInterval = time.Hour
+	// DefaultInterval is how often the hub looks for a new release. The
+	// look is an unauthenticated GitHub API call, limited to 60 an hour
+	// for the machine's address; this takes 12.
+	DefaultInterval = 5 * time.Minute
 	// DefaultWait is how long the clients, and then the hub, get to come
 	// up on the new release.
 	DefaultWait = 10 * time.Minute

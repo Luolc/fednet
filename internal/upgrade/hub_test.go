@@ -572,6 +572,14 @@ func TestAutoCheck(t *testing.T) {
 	b.quiet(t)
 }
 
+// A release reaches the hub within five minutes of being published, and
+// the checks stay within GitHub's 60 unauthenticated calls an hour.
+func TestDefaultInterval(t *testing.T) {
+	if DefaultInterval != 5*time.Minute {
+		t.Fatalf("DefaultInterval = %v, want 5m", DefaultInterval)
+	}
+}
+
 // nextN returns the next n things the hub said, in any order: the record
 // of an ops request and the start of the upgrade it begins race.
 func (b *bench) nextN(t *testing.T, n int) string {
