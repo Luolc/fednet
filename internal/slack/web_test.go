@@ -774,7 +774,8 @@ func TestWebUpload(t *testing.T) {
 	ctx := context.Background()
 	var srv *httptest.Server
 	var uploaded = map[string]string{}
-	var n int
+	var n, infos int
+	var limited bool
 	host := func() string { return srv.URL }
 	w, ts, srv := newTestWeb(t, func(r request) (int, string) {
 		switch r.method {
@@ -783,6 +784,17 @@ func TestWebUpload(t *testing.T) {
 			return 200, `{"ok":true,"upload_url":"` + host() + `/upload/` + r.form.Get("filename") + `","file_id":"F` + strconv.Itoa(n) + `"}`
 		case "files.completeUploadExternal":
 			return 200, `{"ok":true,"files":[{"id":"F1","title":"shot.png"}]}`
+		case "files.info":
+			// Slack shares the files in thread 1.1 only by the third
+			// look, and never in thread 2.2.
+			infos++
+			if limited {
+				return http.StatusTooManyRequests, `{"ok":false,"error":"ratelimited"}`
+			}
+			if infos < 3 {
+				return 200, `{"ok":true,"file":{"id":"` + r.form.Get("file") + `"}}`
+			}
+			return 200, `{"ok":true,"file":{"id":"` + r.form.Get("file") + `","shares":{"public":{"C1":[{"ts":"1.5","thread_ts":"1.1"}]}}}}`
 		}
 		return 200, `{"ok":false,"error":"unknown_method"}`
 	})
@@ -807,6 +819,9 @@ func TestWebUpload(t *testing.T) {
 	files := []Upload{{Name: "shot.png", Size: 6, Body: strings.NewReader("PNG...")}, {Name: "build.log", Size: 5, Body: strings.NewReader("error")}}
 	if err := w.Upload(ctx, "C1", "1.1", "see these", files); err != nil {
 		t.Fatal(err)
+	}
+	if reqs, waits := ts.got(); infos != 3 || reqs[len(reqs)-1].method != "files.info" || reqs[len(reqs)-1].form.Get("file") != "F1" || len(waits) != 2 {
+		t.Fatalf("Upload returned after %d files.info and %d waits, want 3 and 2: not before the files are in the thread", infos, len(waits))
 	}
 	if uploaded["shot.png"] != "Bearer "+testToken+" PNG..." || uploaded["build.log"] != "Bearer "+testToken+" error" {
 		t.Fatalf("uploaded = %q, want both files' content with the token", uploaded)
@@ -833,6 +848,38 @@ func TestWebUpload(t *testing.T) {
 	if blocks := complete.form.Get("blocks"); blocks != "" {
 		t.Fatalf("without text: blocks = %s, want none", blocks)
 	}
+	// A share Slack never shows is waited for in vain, and the upload
+	// still succeeds: the files are in Slack.
+	_, waits := ts.got()
+	infos = 3
+	if err := w.Upload(ctx, "C1", "2.2", "", []Upload{{Name: "d.txt", Size: 1, Body: strings.NewReader("d")}}); err != nil {
+		t.Fatalf("Upload without the share seen = %v, want it to succeed", err)
+	}
+	if _, after := ts.got(); infos != 3+shareTries || len(after)-len(waits) != shareTries-1 {
+		t.Fatalf("Upload without the share seen asked files.info %d times, waited %d times; want %d and %d", infos-3, len(after)-len(waits), shareTries, shareTries-1)
+	}
+	// files.info that Slack keeps rate-limiting holds the upload no longer
+	// than shareWait, its rate-limit waits included.
+	shareWait = 50 * time.Millisecond
+	sleep := w.sleep
+	w.sleep = func(ctx context.Context, d time.Duration) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	limited = true
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Upload(ctx, "C1", "2.2", "", []Upload{{Name: "e.txt", Size: 1, Body: strings.NewReader("e")}})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Upload with files.info rate-limited = %v, want it to succeed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upload with files.info rate-limited still waiting after 5s")
+	}
+	shareWait, w.sleep, limited = 10*time.Second, sleep, false
 	// An upload the URL refuses before reading the body fails without
 	// leaving anything running behind: the content is sent by the request
 	// itself, there is no writer to wait for.
@@ -853,7 +900,7 @@ func TestWebUpload(t *testing.T) {
 	// An upload URL on another host does not get the token.
 	host = func() string { return "https://files.example.invalid" }
 	err = w.Upload(ctx, "C1", "1.1", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
-	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 3 {
+	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 5 {
 		t.Fatalf("Upload to another host = %v, %d uploads; want it refused before any upload, without quoting the token", err, len(uploaded))
 	}
 }
