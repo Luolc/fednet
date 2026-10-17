@@ -30,6 +30,15 @@ import (
 	"github.com/Luolc/fednet/internal/store"
 )
 
+// How long the hub waits for what a client posted before to be in Slack
+// before an upload or a question card from it goes out; tests shorten
+// them. An Ask waits less: its client gives the whole request less time
+// than an upload.
+var (
+	uploadWait = 30 * time.Second
+	askWait    = 15 * time.Second
+)
+
 // MaxTextChars is the longest Text, in characters, of an OpenThread or a
 // DM: each goes out as one message, as long as each message of a post.
 const MaxTextChars = outbound.DefaultMaxChars
@@ -90,8 +99,10 @@ const (
 	// Ask posts Card, a question card, in Thread, mentioning Mentions,
 	// each on the user list, and returns where it is. Ref is the
 	// requesting client's id of the question: a ref it asked with before
-	// posts nothing and returns that card. What people do with the card
-	// comes down the link later, as messages of type answer.
+	// posts nothing and returns that card. The card goes out after what
+	// the client posted before, so that it lands below it; when that is
+	// not in Slack within 15 seconds, Ask is refused as busy. What people do
+	// with the card comes down the link later, as messages of type answer.
 	Ask = "ask"
 	// AskClose takes back the card with ID, which the requesting client
 	// asked, with Text, if set, a note on the card.
@@ -219,9 +230,10 @@ type Server struct {
 	// how many one upload may have. Zero means the default.
 	MaxUploadBytes int64
 	MaxUploadFiles int
-	// BeforeUpload, if set, readies a thread for an upload from a client
-	// before the upload starts: it is outbound.Poster.BeforeUpload.
-	BeforeUpload func(ctx context.Context, client, thread string) error
+	// CatchUp, if set, readies a thread for an upload or a question card
+	// from a client before it goes out, waiting at most wait for what the
+	// client posted before: it is outbound.Poster.CatchUp.
+	CatchUp func(ctx context.Context, client, thread string, wait time.Duration) error
 	// Ops carries out an op for client, which is the id the link
 	// authenticated, never one the request names: it is upgrade.Hub.Op.
 	// Nil means Ops is refused.
@@ -295,8 +307,8 @@ func (s *Server) Upload(ctx context.Context, client string, u link.Upload, body 
 	if s.Slack == nil {
 		return errNoSlack
 	}
-	if s.BeforeUpload != nil {
-		if err := s.BeforeUpload(ctx, client, u.Thread); err != nil {
+	if s.CatchUp != nil {
+		if err := s.CatchUp(ctx, client, u.Thread, uploadWait); err != nil {
 			return err
 		}
 	}
@@ -874,6 +886,11 @@ func (s *Server) ask(ctx context.Context, client string, r Request) (*ask.Posted
 	}
 	if s.Questions == nil {
 		return nil, link.Refuse(link.ErrDenied, "the hub runs no question cards: it has no Slack")
+	}
+	if s.CatchUp != nil {
+		if err := s.CatchUp(ctx, client, r.Thread, askWait); err != nil {
+			return nil, link.Refuse(link.ErrBusy, "%v", err)
+		}
 	}
 	p, err := s.Questions.Ask(ctx, client, r.Thread, r.Ref, r.Card, r.Mentions)
 	switch {
