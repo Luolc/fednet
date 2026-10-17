@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -206,9 +208,10 @@ func (w *Web) Download(ctx context.Context, f File) (io.ReadCloser, error) {
 
 // Upload gets an upload URL for each file (files.getUploadURLExternal),
 // posts the content there as the request's body, Size bytes with the
-// token, then completes the upload (files.completeUploadExternal) into
-// the thread as one message with the files, text in a markdown block as
-// PostReply puts it, and returns once that message is in the thread. The
+// token and the type its name gives (contentType), then completes the
+// upload (files.completeUploadExternal) into the thread as one message
+// with the files, text in a markdown block as PostReply puts it, and
+// returns once that message is in the thread. The
 // content is posted once: the upload to the URL is not retried. The
 // upload URL gets the token only if it passes the same check as a
 // download URL.
@@ -309,7 +312,7 @@ func (w *Web) upload(ctx context.Context, uploadURL string, u Upload) error {
 	}
 	req.ContentLength = u.Size
 	req.Header.Set("Authorization", "Bearer "+w.token)
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Type", contentType(u.Name))
 	res, err := w.files.Do(req)
 	if err != nil {
 		return redact(w.token, err)
@@ -320,6 +323,21 @@ func (w *Web) upload(ctx context.Context, uploadURL string, u Upload) error {
 		return fmt.Errorf("the upload URL replied %s", res.Status)
 	}
 	return nil
+}
+
+// contentType is the type an upload is posted with, taken from its
+// name's extension, so that Slack need not guess it from the content:
+// it guessed some Markdown with code blocks in it as binary. A name with
+// no known extension is posted as application/octet-stream.
+func contentType(name string) string {
+	ext := path.Ext(name)
+	if strings.EqualFold(ext, ".md") || strings.EqualFold(ext, ".markdown") {
+		return "text/markdown; charset=utf-8"
+	}
+	if t := mime.TypeByExtension(ext); t != "" {
+		return t
+	}
+	return "application/octet-stream"
 }
 
 // mayReceiveToken checks that rawURL is one the token may be sent to.

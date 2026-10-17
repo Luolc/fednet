@@ -773,7 +773,7 @@ func TestWebFiles(t *testing.T) {
 func TestWebUpload(t *testing.T) {
 	ctx := context.Background()
 	var srv *httptest.Server
-	var uploaded = map[string]string{}
+	var uploaded, types = map[string]string{}, map[string]string{}
 	var n, infos int
 	var limited bool
 	host := func() string { return srv.URL }
@@ -811,12 +811,13 @@ func TestWebUpload(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		ts.mu.Lock()
 		uploaded[path.Base(r.URL.Path)] = r.Header.Get("Authorization") + " " + string(b)
+		types[path.Base(r.URL.Path)] = r.Header.Get("Content-Type")
 		ts.mu.Unlock()
 		rw.Write([]byte("OK"))
 	}))
 	mux.Handle("/", srv.Config.Handler)
 	srv.Config.Handler = mux
-	files := []Upload{{Name: "shot.png", Size: 6, Body: strings.NewReader("PNG...")}, {Name: "build.log", Size: 5, Body: strings.NewReader("error")}}
+	files := []Upload{{Name: "shot.png", Size: 6, Body: strings.NewReader("PNG...")}, {Name: "build.log", Size: 5, Body: strings.NewReader("error")}, {Name: "notes.md", Size: 4, Body: strings.NewReader("# hi")}, {Name: "core", Size: 1, Body: strings.NewReader("c")}}
 	if err := w.Upload(ctx, "C1", "1.1", "see these", files); err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +825,12 @@ func TestWebUpload(t *testing.T) {
 		t.Fatalf("Upload returned after %d files.info and %d waits, want 3 and 2: not before the files are in the thread", infos, len(waits))
 	}
 	if uploaded["shot.png"] != "Bearer "+testToken+" PNG..." || uploaded["build.log"] != "Bearer "+testToken+" error" {
-		t.Fatalf("uploaded = %q, want both files' content with the token", uploaded)
+		t.Fatalf("uploaded = %q, want the files' content with the token", uploaded)
+	}
+	// Each file goes up with the type its extension gives, Markdown as
+	// text/markdown, so that Slack need not guess it from the content.
+	if types["shot.png"] != "image/png" || types["notes.md"] != "text/markdown; charset=utf-8" || types["core"] != "application/octet-stream" {
+		t.Fatalf("uploaded with Content-Type %q, want image/png, text/markdown; charset=utf-8 and application/octet-stream", types)
 	}
 	reqs, _ := ts.got()
 	var complete request
@@ -833,7 +839,7 @@ func TestWebUpload(t *testing.T) {
 			complete = r
 		}
 	}
-	if complete.form.Get("channel_id") != "C1" || complete.form.Get("thread_ts") != "1.1" || complete.form.Get("files") != `[{"id":"F1","title":"shot.png"},{"id":"F2","title":"build.log"}]` {
+	if complete.form.Get("channel_id") != "C1" || complete.form.Get("thread_ts") != "1.1" || complete.form.Get("files") != `[{"id":"F1","title":"shot.png"},{"id":"F2","title":"build.log"},{"id":"F3","title":"notes.md"},{"id":"F4","title":"core"}]` {
 		t.Fatalf("completeUploadExternal got %v", complete.form)
 	}
 	if blocks := complete.form.Get("blocks"); blocks != `[{"type":"markdown","text":"see these"}]` || complete.form.Get("initial_comment") != "" {
@@ -900,7 +906,7 @@ func TestWebUpload(t *testing.T) {
 	// An upload URL on another host does not get the token.
 	host = func() string { return "https://files.example.invalid" }
 	err = w.Upload(ctx, "C1", "1.1", "x", []Upload{{Name: "b.txt", Size: 1, Body: strings.NewReader("b")}})
-	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 5 {
+	if err == nil || strings.Contains(err.Error(), testToken) || len(uploaded) != 7 {
 		t.Fatalf("Upload to another host = %v, %d uploads; want it refused before any upload, without quoting the token", err, len(uploaded))
 	}
 }
