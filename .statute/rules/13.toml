@@ -1,0 +1,29 @@
+id = 13
+slug = "no-linear-names"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R266"
+default = "on"
+authority = ["sensitive-info"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''不写 Linear 的名字和链接，只写「在 Linear 上」'''
+
+[text.statement]
+zh = '''在本仓的文件、commit message、pull request、评论和审查里，不写 Linear 的 workspace 名、team 名、issue 编号和链接，提到其中的内容只写「在 Linear 上」。'''
+
+[text.reason]
+zh = '''
+本仓是公开的，工单在私有的 Linear workspace 里；它的名字、编号和链接会告诉外人去哪里找。
+'''
+
+[text.verification]
+zh = '''
+本仓的文件、commit message、pull request、评论或审查里出现了 Linear 的 workspace 名、team 名、issue 编号或链接，即违反。
+'''

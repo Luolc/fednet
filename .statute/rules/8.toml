@@ -1,0 +1,35 @@
+id = 8
+slug = "touched-checks"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R276"
+default = "on"
+authority = ["evidence.grounds"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''本仓改动涉及的检查'''
+
+[text.statement]
+zh = '''
+本仓改动涉及的检查，除 commit 钩子 (`uvx pre-commit run --all-files`) 外，是：
+
+- 改了 Go 代码 (`*.go`、`go.mod`、`go.sum`) 的：`gofmt -l .` 的输出为空，`go vet ./...` 与 `go test -race ./...` 退出 0。
+'''
+
+[text.reason]
+zh = '''
+{@rule:R53} 要求 push 之前跑改动涉及的检查，以项目说明列出的为准；这里就是那份清单。commit 钩子不跑 Go 的检查。
+'''
+
+[text.verification]
+zh = '''
+`gofmt -l` 列出文件时退出码仍是 0，所以看它的输出是否为空。设计的行数检查和发版守卫的测试在 CI 的 `check` 里跑。
+
+push 的版本改了 Go 代码，而上面三项检查没有在这个版本上通过，即违反。
+'''

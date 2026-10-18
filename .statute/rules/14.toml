@@ -1,0 +1,29 @@
+id = 14
+slug = "hook-rev-bump-alone"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R77"
+default = "on"
+authority = ["simplicity"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''升级 commit 钩子的 `rev` 单独开 PR'''
+
+[text.statement]
+zh = '''改 `.pre-commit-config.yaml` 里某个钩子仓库的 `rev`，单独开一个 PR，不带别的改动；`statute-compile` 钩子的 `rev` 与 `statute.lock` 在同一个 PR 里一起改。'''
+
+[text.reason]
+zh = '''
+钩子换了版本，结论可能跟着变；单独成 PR，出了问题能看出是升级带来的。`statute compile --check` 不认别的版本写的 lock 文件，所以 `statute-compile` 的 `rev` 与 `statute.lock` 分开改，中间那个 PR 上钩子就会失败。
+'''
+
+[text.verification]
+zh = '''
+一个 PR 改了某个钩子仓库的 `rev`，又带了与这次升级无关的改动，或者只改了 `statute-compile` 的 `rev` 与 `statute.lock` 中的一个，即违反。
+'''

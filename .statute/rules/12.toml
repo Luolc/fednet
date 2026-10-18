@@ -1,0 +1,44 @@
+id = 12
+slug = "public-hostname-fednet-hub"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+overrides = "R259"
+authority = ["sensitive-info", "must-ask.irreversible-effects"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''公开仓库里不写私有信息，hub 机器的主机名 `fednet-hub` 除外'''
+
+[text.statement]
+zh = '''在本仓的文件、commit message、pull request、评论和审查里，不写能指认或定位私有资源、私有仓库、agent 实例或会话、agent 运行所在的 scope 的内容，也不写 agent 的用量、额度、型号或 effort；hub 机器的主机名 `fednet-hub` 是设计的一部分，可以写，其他机器按角色称呼，例如 hub 机器、agent 机器。'''
+
+[text.reason]
+zh = '''
+推送到公开仓库的内容，任何人都能读取、复制和索引，而且无法撤回 ({@constitution:must-ask.irreversible-effects})。主机、私有仓库、agent 会话或 agent 运行所在的 scope 的名字，会告诉外人去哪里找、可以试什么 ({@constitution:sensitive-info})。`fednet-hub` 是 fednet 自己给 hub 起的名字：systemd 单元、数据目录和示例 URL 都用它，部署文件和代码里随处可见；它说的是 fednet 怎么部署，不指向某个私有环境里的机器，所以可以写。
+'''
+
+[text.verification]
+zh = '''
+写进本仓的内容，包括它每个 commit 里的文件、commit message，以及 pull request 和 issue 的标题、正文和评论，审查意见和 verdict 也在内。
+
+不得写进本仓的：
+
+- 私有资源：`fednet-hub` 以外的机器、主机和内部服务的名字与地址，端口，密钥管理器里的路径，账号名，私有 issue 跟踪系统里的条目，聊天频道和会话线程；
+- 私有仓库的名字或地址；提到私有仓库时用它的角色指代，例如「私有 overlay」；
+- agent 实例和会话：具体某个 agent 的名字或 ID，它所在的 job 和会话的名字或 ID，以及它的终端 pane 的名字或 ID；
+- 起 agent 的工具运行 agent 所在的 scope 的名字，例如 Agent Fleet 的 scope；
+- agent 的用量和额度读数，以及它运行时用的型号和 effort。
+
+可以写的：主机名 `fednet-hub`；机器的角色名 (hub 机器、agent 机器)；角色名 (作者、审查方、lead)；公开项目和工具的名字；仓库所有者公开的身份 (账号、名字、commit 作者)，以及项目自己公开的地址，例如它的仓库 URL 和网站；虚构的值，例如 `example.test` 域名和文档专用的地址段。凭证由 {@rule:R291} 管，个人信息由 {@constitution:personal-info} 管。
+
+委托人依照 {@rule:R34} 给出的同意，不免除本规定。委托人已经公开的内容，不再属于私有。
+
+不确定某项内容是否私有的，按私有处理，不写。
+
+以上任何一项写进了本仓的文件、commit message、pull request、issue、评论或审查的，即为违反本规定。
+'''

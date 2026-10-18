@@ -1,0 +1,31 @@
+id = 5
+slug = "invariants-link-tests"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R232"
+default = "on"
+authority = ["evidence.grounds"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''每条不变量链到守护它的测试，没有测试的标 untested'''
+
+[text.statement]
+zh = '''`docs/design.md` 里的每条不变量都链到一个存在的、守护它的测试；没有测试的标「untested」，并在加入或改动它的那个 PR 的描述里列出来。'''
+
+[text.reason]
+zh = '''
+不变量有测试守着才算数；没有测试的要让读者和审查方一眼看出来。
+'''
+
+[text.verification]
+zh = '''
+链接指向的测试找不到是阻塞项。
+
+一条不变量既没有链到存在的测试、也没有标「untested」，或者 PR 加入或改动了一条标「untested」的不变量却没有在描述里列出，即违反。
+'''

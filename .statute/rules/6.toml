@@ -1,0 +1,31 @@
+id = 6
+slug = "design-impact"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R274"
+default = "on"
+authority = ["evidence.grounds"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''PR 描述写 Design impact'''
+
+[text.statement]
+zh = '''每个 PR 的描述都写「Design impact」：影响 `docs/design.md` 的哪一节或哪条不变量，以及守护它的测试；没有影响就写「无」。'''
+
+[text.reason]
+zh = '''
+审查方据此核对设计有没有跟上改动，不用自己从 diff 里推断。
+'''
+
+[text.verification]
+zh = '''
+审查时，PR 改了 `docs/design.md` 本身不是阻塞项。
+
+PR 描述缺这一节，或者写了「无」而 PR 改了 fednet 的行为、接口或不变量，即违反。
+'''

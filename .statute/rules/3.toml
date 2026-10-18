@@ -1,0 +1,29 @@
+id = 3
+slug = "no-adr-research-todo"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R16"
+default = "on"
+authority = ["simplicity"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''仓里不放 ADR、调研报告和待办清单'''
+
+[text.statement]
+zh = '''不往本仓写 ADR、调研报告和待办清单：决定和它的理由写在对应的 PR 描述里，尚未落实的设计和待办记在 Linear 上。'''
+
+[text.reason]
+zh = '''
+仓里的文档只有 `docs/design.md` 一份，读者不必在几处之间对照；决定跟着改它的那个 PR 走，待办跟着工单走。
+'''
+
+[text.verification]
+zh = '''
+变更在仓里新增了 ADR、调研报告或待办清单，或者把决定的理由写进了 `docs/design.md` 而不是 PR 描述，即违反。
+'''

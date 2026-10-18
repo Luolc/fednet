@@ -1,0 +1,29 @@
+id = 7
+slug = "pr-template"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R274"
+default = "on"
+authority = ["simplicity"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''PR 描述按模板写'''
+
+[text.statement]
+zh = '''PR 描述按 `.github/pull_request_template.md` 的各节写。'''
+
+[text.reason]
+zh = '''
+各 PR 的描述结构一致，审查方知道每一项去哪里找。
+'''
+
+[text.verification]
+zh = '''
+PR 描述缺了模板里的某一节，即违反。
+'''
