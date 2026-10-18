@@ -26,6 +26,7 @@ import (
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/question"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -50,6 +51,21 @@ const (
 	// OpenThread posts Text in Channel as a new thread, makes the
 	// requesting client its owner, and returns its key.
 	OpenThread = "open-thread"
+	// OpenThreadForRoute is OpenThread for the machine of the channel's
+	// route, which becomes the owner and gets Text as an inbound message
+	// of trigger handoff: the requesting client must be allowed to open
+	// threads in Channel and, unless it is that machine, to deliver to it.
+	// Thread, if set, is the thread the handoff comes from, which the
+	// requesting client must own: the new thread's hop count goes on from
+	// that thread's, so that handing work back and forth in new threads
+	// stops at the same limit as relays in one thread. It is not looked at
+	// when the requesting client is that machine, which nothing is
+	// delivered to.
+	OpenThreadForRoute = "open-thread-route"
+	// CheckRelay checks that the requesting client may deliver its posts
+	// in Thread to the thread's owner, before it queues a post to deliver.
+	// A hub that answers it also delivers such a post.
+	CheckRelay = "check-relay"
 	// Threads returns the threads the requesting client owns.
 	Threads = "threads"
 	// Adopt makes the requesting client the owner of Thread, which must
@@ -238,6 +254,14 @@ type Server struct {
 	// authenticated, never one the request names: it is upgrade.Hub.Op.
 	// Nil means Ops is refused.
 	Ops func(ctx context.Context, client, op string) (string, error)
+	// Relays is the relay list: which clients each client may deliver to.
+	Relays route.Relays
+	// Stored, if set, is called once a request has queued a message for a
+	// client, to wake the downlinks: it is link.Hub.WakeAll.
+	Stored func()
+	// Alert, if set, sends an alert to the alerts channel: it is
+	// alert.Webhook.Send. It reports a handoff refused for the hop limit.
+	Alert func(ctx context.Context, text string) error
 
 	// names holds the names of the routes' channels as Slack last gave
 	// them, by channel id.
@@ -402,7 +426,11 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 	case ReadThread:
 		reply, err = s.readThread(ctx, r)
 	case OpenThread:
-		reply, err = s.openThread(ctx, client, r)
+		reply, err = s.openThread(ctx, client, r, false)
+	case OpenThreadForRoute:
+		reply, err = s.openThread(ctx, client, r, true)
+	case CheckRelay:
+		err = s.checkRelay(ctx, client, r)
 	case Threads:
 		reply.Threads, err = s.Store.Threads(ctx, client)
 	case Adopt:
@@ -522,8 +550,10 @@ var deleteTimeout = 30 * time.Second
 // openThread posts the thread, then records its owner, with the channel's
 // name when Slack gives it and the scope of the channel's route. If
 // recording fails it deletes the message it posted, so no thread is left
-// in Slack without an owner, and fails.
-func (s *Server) openThread(ctx context.Context, client string, r Request) (Reply, error) {
+// in Slack without an owner, and fails. The owner is client or, forRoute,
+// the machine of the channel's route, for which the message is queued in
+// the same transaction as the owner is recorded.
+func (s *Server) openThread(ctx context.Context, client string, r Request, forRoute bool) (Reply, error) {
 	if r.Channel == "" || r.Text == "" {
 		return Reply{}, link.Refuse(link.ErrBadRequest, "needs a channel and a text")
 	}
@@ -536,6 +566,21 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	}
 	if r.Channel == store.DMRoute || !slices.Contains(rt.OpenThread, client) {
 		return Reply{}, link.Refuse(link.ErrDenied, "client %s may not open threads in %s", client, r.Channel)
+	}
+	owner, hop := client, 0
+	if forRoute {
+		owner = rt.Machine
+		switch {
+		case owner == "":
+			return Reply{}, link.Refuse(link.ErrDenied, "the route of %s has no machine", r.Channel)
+		case owner != client && !s.Relays.Allow(client, owner):
+			return Reply{}, link.Refuse(link.ErrDenied, "the hub's relay list does not let client %s deliver to %s", client, owner)
+		}
+		if r.Thread != "" && owner != client {
+			if hop, err = s.fromThread(ctx, client, owner, r); err != nil {
+				return Reply{}, err
+			}
+		}
 	}
 	if s.Slack == nil {
 		return Reply{}, errNoSlack
@@ -554,7 +599,17 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 	} else {
 		name = info.Name
 	}
-	if err := s.Store.Claim(ctx, key, client, name, rt.Scope); err != nil {
+	err = s.Store.Transact(ctx, func(tx *store.Hub) error {
+		if err := tx.Claim(ctx, key, owner, name, rt.Scope); err != nil || owner == client {
+			return err
+		}
+		if err := tx.SetHop(ctx, key, hop); err != nil {
+			return err
+		}
+		_, err := route.New(tx).Deliver(ctx, s.Relays, client, key, payload.Message{Type: payload.Inbound, Thread: key, Text: r.Text, TS: ts, Trigger: payload.Handoff})
+		return err
+	})
+	if err != nil {
 		// The caller may have given up already; the message goes anyway,
 		// within deleteTimeout.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deleteTimeout)
@@ -565,7 +620,59 @@ func (s *Server) openThread(ctx context.Context, client string, r Request) (Repl
 		}
 		return Reply{}, fmt.Errorf("recording the owner of thread %s failed, so its message was deleted: %w", key, err)
 	}
+	if owner != client && s.Stored != nil {
+		s.Stored()
+	}
 	return Reply{Thread: key}, nil
+}
+
+// fromThread returns the hop count of r.Thread, the thread a handoff by
+// client to owner comes from, which client must own. One at the limit is
+// refused, and alerted, before anything is posted.
+func (s *Server) fromThread(ctx context.Context, client, owner string, r Request) (int, error) {
+	if _, _, err := thread(r); err != nil {
+		return 0, err
+	}
+	from, err := s.Store.Owner(ctx, r.Thread)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return 0, link.Refuse(link.ErrNotFound, "thread %s has no owner", r.Thread)
+	case err != nil:
+		return 0, err
+	case from != client:
+		return 0, link.Refuse(link.ErrDenied, "client %s does not own thread %s", client, r.Thread)
+	}
+	hop, err := s.Store.Hop(ctx, r.Thread)
+	if err != nil || hop < route.MaxHop {
+		return hop, err
+	}
+	slog.Error("hubapi: handoff not delivered", "client", client, "to", owner, "from_thread", r.Thread, "err", route.ErrHopLimit)
+	if s.Alert != nil {
+		if err := s.Alert(ctx, fmt.Sprintf("handoff from %s to %s out of thread %s not delivered: %v", client, owner, r.Thread, route.ErrHopLimit)); err != nil {
+			slog.Warn("hubapi: alert", "err", err)
+		}
+	}
+	return 0, link.Refuse(link.ErrDenied, "thread %s has had %d relays in a row since a person last posted in it, the most the hub delivers", r.Thread, route.MaxHop)
+}
+
+// checkRelay refuses unless client may deliver its posts in r.Thread:
+// the thread has an owner, and it is client or one the relay list lets
+// client deliver to. How many relays in a row the thread has had is left
+// to the delivery, which is when it counts.
+func (s *Server) checkRelay(ctx context.Context, client string, r Request) error {
+	if _, _, err := thread(r); err != nil {
+		return err
+	}
+	owner, err := s.Store.Owner(ctx, r.Thread)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return link.Refuse(link.ErrNotFound, "thread %s has no owner", r.Thread)
+	case err != nil:
+		return err
+	case owner != client && !s.Relays.Allow(client, owner):
+		return link.Refuse(link.ErrDenied, "the hub's relay list does not let client %s deliver to %s, the owner of %s", client, owner, r.Thread)
+	}
+	return nil
 }
 
 func (s *Server) adopt(ctx context.Context, client string, r Request) error {

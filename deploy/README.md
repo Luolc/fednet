@@ -48,7 +48,7 @@ sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 
 两个 Slack 文件要么都给，要么都不给。都不给时 hub 只跑 client 用的 HTTP 服务，启动日志里有一句 `Slack not configured`，适合本地试跑。没给 Slack 时 webhook 文件不读，给了也不用；给了 Slack、没给 webhook 时，报警只进日志。
 
-`/fednet upgrade` 要在配置里的 `upgrade.admins` 写上谁能升级 (Slack 用户 id，每个都得在 `users` 名单上)；`upgrade.auto` 默认是 `true`。`fednet client ops` 要在配置里的 `ops.upgrade`、`ops.version` 分别写上哪些 client 能用 (client id)，没写就谁都不能用。
+`/fednet upgrade` 要在配置里的 `upgrade.admins` 写上谁能升级 (Slack 用户 id，每个都得在 `users` 名单上)；`upgrade.auto` 默认是 `true`。`fednet client ops` 要在配置里的 `ops.upgrade`、`ops.version` 分别写上哪些 client 能用 (client id)，没写就谁都不能用。`fednet client open-thread -owner route` 与 `fednet client post -deliver` 要在配置里的 `relay` 按 client 写上它能投给哪些 client，没写就谁都不能投。
 
 审批要有 Slack，还要在配置里的 `approvals` 写上审批卡发到哪个 channel (`channel`) 和谁能批 (`approvers`，Slack 用户 id，每个都得在 `users` 名单上)；缺一样，agent 的 `request-approval` 和 `request-route` 都直接被拒绝，不发卡。`request-approval` 还要私钥，没给私钥时它被拒绝、不签名，启动日志里有一句 `no approval key, only route requests are approved`；`request-route` 不签名，不要私钥。
 

@@ -19,6 +19,12 @@
 // thread, uploads and question cards included, first closes its open
 // card, as a progress with Close slack.Done does.
 //
+// A post may ask to be delivered too: once it is in Slack, the hub queues
+// it for the thread's owner as an inbound message of trigger relay, in the
+// same transaction as it marks the post delivered, unless the poster owns
+// the thread. The relay list and the hop limit are checked then; a relay
+// they refuse is alerted and logged, and the post stays in Slack.
+//
 // The inbox also holds the alerts clients raise, which only the hub can
 // send, since only the hub has the webhook: each goes to the webhook as
 // from the client that raised it, and one that fails stays in the inbox
@@ -40,6 +46,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -70,6 +77,12 @@ type Poster struct {
 	Interval time.Duration
 	// Users is the user list: a post mentions only the people on it.
 	Users map[string]string
+	// Relays is the relay list: which clients each client may deliver
+	// its posts to.
+	Relays route.Relays
+	// Stored, if set, is called once a post has been delivered to a
+	// client, to wake the downlinks: it is link.Hub.WakeAll.
+	Stored func()
 
 	// cards is held over each change to a progress card, which Run and
 	// CatchUp make.
@@ -189,10 +202,59 @@ func (p *Poster) Pass(ctx context.Context) error {
 			}
 		} else if err != nil {
 			return fmt.Errorf("msg_id %s: %w", u.MsgID, err)
+		} else if err := p.deliver(ctx, u); err != nil {
+			return err
 		}
 		if err := p.record(ctx, func() error { return p.Store.Inbox.MarkDelivered(ctx, u.MsgID) }); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// deliver, for u, a post in Slack that asks to be delivered, queues it for
+// its thread's owner and marks it delivered, in one transaction; marking
+// it again after is harmless. A relay that cannot be delivered is alerted.
+func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
+	var m payload.Message
+	if json.Unmarshal(u.Payload, &m) != nil || m.Type != payload.Post || !m.Deliver {
+		return nil
+	}
+	var to string
+	var refused error
+	err := p.record(ctx, func() error {
+		refused = nil
+		return p.Store.Transact(ctx, func(tx *store.Hub) error {
+			posted, err := tx.Posted(ctx, u.MsgID)
+			if err != nil {
+				return err
+			}
+			in := payload.Message{Type: payload.Inbound, Thread: m.Thread, Text: m.Text, Trigger: payload.Relay}
+			if len(posted.TS) > 0 {
+				in.TS = posted.TS[0]
+			}
+			to, err = route.New(tx).Deliver(ctx, p.Relays, u.Client, m.Thread, in)
+			if errors.Is(err, route.ErrNoOwner) || errors.Is(err, route.ErrRelayDenied) || errors.Is(err, route.ErrHopLimit) || errors.Is(err, route.ErrTooLong) {
+				refused, err = err, nil
+			}
+			if err != nil {
+				return err
+			}
+			return tx.Inbox.MarkDelivered(ctx, u.MsgID)
+		})
+	})
+	switch {
+	case err != nil:
+		return err
+	case refused != nil:
+		slog.Error("outbound: relay not delivered", "msg_id", u.MsgID, "client", u.Client, "thread", m.Thread, "err", refused)
+		if p.Alert != nil {
+			if aerr := p.Alert.Send(ctx, fmt.Sprintf("relay from %s in thread %s not delivered: msg_id %s: %v", u.Client, m.Thread, u.MsgID, refused)); aerr != nil {
+				slog.Warn("outbound: alert", "msg_id", u.MsgID, "err", aerr)
+			}
+		}
+	case to != "" && p.Stored != nil:
+		p.Stored()
 	}
 	return nil
 }

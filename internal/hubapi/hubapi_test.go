@@ -23,6 +23,7 @@ import (
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/question"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	slackgo "github.com/slack-go/slack"
@@ -1110,5 +1111,169 @@ func TestAskAfterQueuedPosts(t *testing.T) {
 	}
 	if tss, _ := f.Questions("C1"); len(tss) != 2 {
 		t.Fatalf("%d cards, want 2: none for the ask that gave up", len(tss))
+	}
+}
+
+// queued returns the payloads queued for client, decoded.
+func queued(t *testing.T, s *Server, client string) []payload.Message {
+	t.Helper()
+	ds, err := s.Store.Outbox.After(t.Context(), client, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ms []payload.Message
+	for _, d := range ds {
+		var m payload.Message
+		if err := json.Unmarshal(d.Payload, &m); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, m)
+	}
+	return ms
+}
+
+// open-thread for the route's machine makes that machine the owner and
+// queues the text for it as a handoff, from the caller, hop 1, and wakes
+// the downlinks; only a caller the channel lists and the relay list lets
+// deliver to that machine may, and a refused one posts nothing. A caller
+// that is the route's machine gets a thread of its own, with nothing
+// queued.
+func TestOpenThreadForRoute(t *testing.T) {
+	s, f := testServer(t)
+	f.RenameChannel("C1", "data-jobs")
+	posts := &countPosts{API: f}
+	s.Slack = posts
+	woken := 0
+	s.Stored = func() { woken++ }
+	s.Relays = route.Relays{"workstation": {"datamachine"}}
+	setRoute(t, s.Store, store.Route{Channel: "C1", Machine: "datamachine", Scope: "data", OpenThread: []string{"workstation", "datamachine", "other"}})
+	setRoute(t, s.Store, store.Route{Channel: "C2", OpenThread: []string{"workstation"}})
+	ctx := t.Context()
+
+	got, err := answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Text: "new rows to load"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner, err := s.Store.Owner(ctx, got.Thread); err != nil || owner != "datamachine" {
+		t.Fatalf("owner = %q, %v; want datamachine", owner, err)
+	}
+	_, ts, _ := slack.ParseThreadKey(got.Thread)
+	want := []payload.Message{{Type: payload.Inbound, Thread: got.Thread, Text: "new rows to load", TS: ts, Trigger: payload.Handoff,
+		FromClient: "workstation", Hop: 1, Scope: "data", ChannelName: "data-jobs"}}
+	if ms := queued(t, s, "datamachine"); !reflect.DeepEqual(ms, want) {
+		t.Fatalf("queued for datamachine = %+v, want %+v", ms, want)
+	}
+	if woken != 1 {
+		t.Fatalf("downlinks woken %d times, want 1", woken)
+	}
+
+	got, err = answer(t, s, "datamachine", Request{Cmd: OpenThreadForRoute, Channel: "C1", Text: "my own"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner, err := s.Store.Owner(ctx, got.Thread); err != nil || owner != "datamachine" || len(queued(t, s, "datamachine")) != 1 || woken != 1 {
+		t.Fatalf("the route's machine's own thread: owner %q, %v, %d queued, woken %d; want its own, nothing more", owner, err, len(queued(t, s, "datamachine")), woken)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		client string
+		relays route.Relays
+		req    Request
+	}{
+		{"a client the relay list does not list", "other", s.Relays, Request{Cmd: OpenThreadForRoute, Channel: "C1", Text: "x"}},
+		{"no relay list", "workstation", nil, Request{Cmd: OpenThreadForRoute, Channel: "C1", Text: "x"}},
+		{"a client the channel does not list", "unlisted", route.Relays{"unlisted": {"datamachine"}}, Request{Cmd: OpenThreadForRoute, Channel: "C1", Text: "x"}},
+		{"a route with no machine", "workstation", s.Relays, Request{Cmd: OpenThreadForRoute, Channel: "C2", Text: "x"}},
+	} {
+		s.Relays = tt.relays
+		if _, err := answer(t, s, tt.client, tt.req); !errors.Is(err, link.ErrDenied) {
+			t.Errorf("%s: open-thread-route = %v, want denied", tt.name, err)
+		}
+	}
+	if posts.n != 2 {
+		t.Fatalf("Slack got %d posts, want 2", posts.n)
+	}
+
+	// From a thread the caller owns, the hop goes on from that thread's;
+	// from one at the limit nothing is posted, and the hub alerts.
+	s.Relays = route.Relays{"workstation": {"datamachine"}}
+	var alerts []string
+	s.Alert = func(_ context.Context, text string) error {
+		alerts = append(alerts, text)
+		return nil
+	}
+	if err := s.Store.Claim(ctx, "C9/1.0", "workstation", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.SetHop(ctx, "C9/1.0", 2); err != nil {
+		t.Fatal(err)
+	}
+	got, err = answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/1.0", Text: "back to you"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ms := queued(t, s, "datamachine"); len(ms) != 2 || ms[1].Thread != got.Thread || ms[1].Hop != 3 {
+		t.Fatalf("queued for datamachine = %+v, want the handoff at hop 3", ms)
+	}
+	if hop, err := s.Store.Hop(ctx, got.Thread); err != nil || hop != 3 {
+		t.Fatalf("hop of the new thread = %d, %v; want 3", hop, err)
+	}
+	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.Claim(ctx, "C9/2.0", "datamachine", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name, from string
+		want       error
+	}{
+		{"from a thread at the limit", "C9/1.0", link.ErrDenied},
+		{"from a thread another client owns", "C9/2.0", link.ErrDenied},
+		{"from a thread with no owner", "C9/3.0", link.ErrNotFound},
+	} {
+		if _, err := answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: tt.from, Text: "x"}); !errors.Is(err, tt.want) {
+			t.Errorf("%s: open-thread-route = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if posts.n != 3 || len(queued(t, s, "datamachine")) != 2 {
+		t.Fatalf("Slack got %d posts and %d are queued, want 3 and 2", posts.n, len(queued(t, s, "datamachine")))
+	}
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "out of thread C9/1.0 not delivered") {
+		t.Fatalf("alerts = %q, want one for C9/1.0", alerts)
+	}
+	// The route's machine opening a thread of its own delivers nothing,
+	// so the hop of the thread it names does not matter.
+	if err := s.Store.SetHop(ctx, "C9/2.0", route.MaxHop); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := answer(t, s, "datamachine", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/2.0", Text: "my own"}); err != nil || len(alerts) != 1 {
+		t.Fatalf("the route's machine's own thread from a thread at the limit: %v, %d alerts; want it opened, no alert", err, len(alerts))
+	}
+}
+
+// check-relay lets a client deliver in a thread whose owner it is, or
+// whose owner the relay list lets it deliver to; a thread with no owner
+// is not found.
+func TestCheckRelay(t *testing.T) {
+	s, _ := testServer(t)
+	s.Relays = route.Relays{"workstation": {"datamachine"}}
+	if err := s.Store.Claim(t.Context(), "C1/1.0", "datamachine", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		client, thread string
+		want           error
+	}{
+		{"workstation", "C1/1.0", nil},
+		{"datamachine", "C1/1.0", nil},
+		{"other", "C1/1.0", link.ErrDenied},
+		{"workstation", "C1/2.0", link.ErrNotFound},
+		{"workstation", "C1", link.ErrBadRequest},
+	} {
+		if _, err := answer(t, s, tt.client, Request{Cmd: CheckRelay, Thread: tt.thread}); !errors.Is(err, tt.want) {
+			t.Errorf("check-relay by %s in %s = %v, want %v", tt.client, tt.thread, err, tt.want)
+		}
 	}
 }

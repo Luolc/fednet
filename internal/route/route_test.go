@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -257,5 +260,67 @@ func TestRouteInTransaction(t *testing.T) {
 	}
 	if got := queued(t, h, "workstation"); !slices.Equal(got, []string{"first"}) {
 		t.Fatalf("queued for workstation = %v, want [first]", got)
+	}
+}
+
+// Deliver queues a relay for the thread's owner with the caller, the
+// thread's scope and channel name and one hop more each time, up to
+// MaxHop; past it, to a client the relay list does not let the caller
+// deliver to, or for a message too long for the link, it queues nothing
+// and leaves the count. A caller that owns the thread gets nothing, and a
+// thread with no owner is ErrNoOwner.
+func TestDeliver(t *testing.T) {
+	ctx := t.Context()
+	h := openHub(t)
+	relays := Relays{"workstation": {"datamachine"}}
+	if err := h.Claim(ctx, "C1/1.0", "datamachine", "data-jobs", "data"); err != nil {
+		t.Fatal(err)
+	}
+	r := New(h)
+	m := payload.Message{Type: payload.Inbound, Thread: "C1/1.0", Text: "rows loaded", Trigger: payload.Relay}
+	for hop := 1; hop <= MaxHop; hop++ {
+		if to, err := r.Deliver(ctx, relays, "workstation", "C1/1.0", m); err != nil || to != "datamachine" {
+			t.Fatalf("relay %d: to %q, %v; want datamachine", hop, to, err)
+		}
+	}
+	ms := queuedMessages(t, h, "datamachine")
+	for i, got := range ms {
+		want := m
+		want.FromClient, want.Hop, want.Scope, want.ChannelName = "workstation", i+1, "data", "data-jobs"
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("relay %d = %+v, want %+v", i+1, got, want)
+		}
+	}
+	long := m
+	long.Text = strings.Repeat("x", link.MaxPayload)
+	for _, tt := range []struct {
+		name   string
+		from   string
+		thread string
+		m      payload.Message
+		want   error
+	}{
+		{"past MaxHop", "workstation", "C1/1.0", m, ErrHopLimit},
+		{"from a client not on the relay list", "other", "C1/1.0", m, ErrRelayDenied},
+		{"a thread with no owner", "workstation", "C1/2.0", m, ErrNoOwner},
+	} {
+		if _, err := r.Deliver(ctx, relays, tt.from, tt.thread, tt.m); !errors.Is(err, tt.want) {
+			t.Errorf("%s: %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if to, err := r.Deliver(ctx, relays, "datamachine", "C1/1.0", m); err != nil || to != "" {
+		t.Fatalf("from the owner: to %q, %v; want no one", to, err)
+	}
+	if err := h.SetHop(ctx, "C1/1.0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Deliver(ctx, relays, "workstation", "C1/1.0", long); !errors.Is(err, ErrTooLong) {
+		t.Fatalf("a message too long for the link: %v, want ErrTooLong", err)
+	}
+	if hop, err := h.Hop(ctx, "C1/1.0"); err != nil || hop != 0 {
+		t.Fatalf("hop after the refusal = %d, %v; want 0", hop, err)
+	}
+	if n := len(queuedMessages(t, h, "datamachine")); n != MaxHop {
+		t.Fatalf("%d queued, want %d", n, MaxHop)
 	}
 }

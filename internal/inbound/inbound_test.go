@@ -447,6 +447,34 @@ func TestHandleRepliesInAgentThread(t *testing.T) {
 	}
 }
 
+// A person's reply clears the relays in a row the thread has had; a
+// reaction does not.
+func TestHandleClearsHop(t *testing.T) {
+	ctx := t.Context()
+	r, f := newReceiver(t)
+	ts, err := f.Post(ctx, "C2", "I opened this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread := "C2/" + ts
+	if err := r.Store.Claim(ctx, thread, "workstation", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Store.SetHop(ctx, thread, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.React(ctx, Reaction{Channel: "C2", TS: ts, User: "U1", Name: "eyes"}); err != nil {
+		t.Fatal(err)
+	}
+	if hop, err := r.Store.Hop(ctx, thread); err != nil || hop != 3 {
+		t.Fatalf("hop after a reaction = %d, %v; want 3", hop, err)
+	}
+	handle(t, r, post(t, f, "C2", slack.Message{User: "U1", Text: "go on", ThreadTS: ts}))
+	if hop, err := r.Store.Hop(ctx, thread); err != nil || hop != 0 {
+		t.Fatalf("hop after a person's reply = %d, %v; want 0", hop, err)
+	}
+}
+
 // noChannelInfo is a Slack whose ChannelInfo fails.
 type noChannelInfo struct{ slack.API }
 

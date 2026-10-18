@@ -472,8 +472,58 @@ func TestPostWithMentions(t *testing.T) {
 	}
 }
 
-// A hub older than the client does not know delete or mentions: the
-// client says so, and queues nothing.
+// A post to deliver is queued, marked to deliver, only once the hub has
+// checked that this machine may deliver in the thread; not as a footer,
+// and not with the hub down.
+func TestPostToDeliver(t *testing.T) {
+	ctx := t.Context()
+	st := openClientStore(t)
+	hub := testHub(t, func(_ context.Context, _ string, req []byte) ([]byte, error) {
+		var r hubapi.Request
+		if err := json.Unmarshal(req, &r); err != nil {
+			return nil, err
+		}
+		if r.Cmd != hubapi.CheckRelay || r.Thread != "C1/1700000000.000100" {
+			return nil, link.Refuse(link.ErrDenied, "no")
+		}
+		return []byte(`{}`), nil
+	})
+	path := serve(t, &link.Client{Store: st, ID: "workstation", Hub: hub})
+	res, err := Do(ctx, path, Request{Cmd: Post, Thread: "C1/1700000000.000100", Text: "report", Deliver: true})
+	if err != nil || res.Error != "" || res.MsgID == "" {
+		t.Fatalf("Do(post -deliver) = %+v, %v; want a msg_id", res, err)
+	}
+	for _, tt := range []struct {
+		name string
+		req  Request
+		kind string
+	}{
+		{"a thread the hub refuses", Request{Cmd: Post, Thread: "C1/1700000000.000200", Text: "x", Deliver: true}, Denied},
+		{"a footer", Request{Cmd: Post, Thread: "C1/1700000000.000100", Text: "x", Footer: true, Deliver: true}, BadRequest},
+	} {
+		if res, err := Do(ctx, path, tt.req); err != nil || res.Kind != tt.kind || res.MsgID != "" {
+			t.Errorf("%s: Do = %+v, %v; want kind %q", tt.name, res, err, tt.kind)
+		}
+	}
+	ms, err := st.Outbox.Pending(ctx)
+	if err != nil || len(ms) != 1 || ms[0].MsgID != res.MsgID {
+		t.Fatalf("outbox = %+v, %v; want just %s", ms, err, res.MsgID)
+	}
+	var got payload.Message
+	if err := json.Unmarshal(ms[0].Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if want := (payload.Message{Type: payload.Post, Thread: "C1/1700000000.000100", Text: "report", Deliver: true}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("payload = %+v, want %+v", got, want)
+	}
+	if res, err := Do(ctx, path, Request{Cmd: Whoami}); err != nil || res.Text != "workstation" {
+		t.Fatalf("Do(whoami) = %+v, %v; want workstation", res, err)
+	}
+}
+
+// A hub older than the client does not know delete, mentions, posts to
+// deliver or threads opened for the route's machine: the client says so,
+// and queues nothing.
 func TestOlderHub(t *testing.T) {
 	st := openClientStore(t)
 	hub := testHub(t, func(_ context.Context, _ string, req []byte) ([]byte, error) {
@@ -487,6 +537,8 @@ func TestOlderHub(t *testing.T) {
 	for _, req := range []Request{
 		{Cmd: hubapi.Delete, MsgID: "m1"},
 		{Cmd: Post, Thread: "C1/1700000000.000100", Text: "x", Mentions: []string{"U1"}},
+		{Cmd: Post, Thread: "C1/1700000000.000100", Text: "x", Deliver: true},
+		{Cmd: hubapi.OpenThreadForRoute, Channel: "C1", Text: "x"},
 	} {
 		res, err := Do(t.Context(), path, req)
 		if err != nil || res.Kind != BadRequest || !strings.Contains(res.Error, "older fednet") {
