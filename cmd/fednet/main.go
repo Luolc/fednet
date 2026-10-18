@@ -41,6 +41,7 @@ import (
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/question"
 	"github.com/Luolc/fednet/internal/release"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	"github.com/Luolc/fednet/internal/upgrade"
@@ -97,8 +98,10 @@ commands:
         rather than in a block (for a Slack that takes no blocks with an
         upload), and names the users, from that list, who may upgrade with
         /fednet upgrade and whether the hub upgrades on its own when it
-        finds a new release (default yes), and, for each operation of
-        client ops, the clients that may ask for it (none unless listed):
+        finds a new release (default yes), for each operation of client
+        ops, the clients that may ask for it (none unless listed), and,
+        for each client, the clients it may deliver to with open-thread
+        -owner route and post -deliver (none unless listed):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
@@ -108,7 +111,8 @@ commands:
                    "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200,
                    "upload_max_bytes": 52428800, "upload_max_files": 10},
          "upgrade": {"admins": ["U123"], "auto": true},
-         "ops": {"upgrade": ["CLIENT-ID"], "version": ["CLIENT-ID"]}}
+         "ops": {"upgrade": ["CLIENT-ID"], "version": ["CLIENT-ID"]},
+         "relay": {"CLIENT-ID": ["OTHER-CLIENT-ID"], "OTHER-CLIENT-ID": ["CLIENT-ID"]}}
         the admin socket takes hub handoff; D is how long a new process may
         take to become ready at a handoff; the upgrade request is the file
         the hub writes to ask the machine's upgrader (fednet upgrade, run
@@ -151,7 +155,7 @@ commands:
   client handoff -socket PATH [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
-  client post -socket PATH -thread KEY [-file PATH]... [-footer] [-mention USER-ID]... [-json] [--] [TEXT]
+  client post -socket PATH -thread KEY [-file PATH]... [-footer] [-mention USER-ID]... [-deliver] [-json] [--] [TEXT]
         post TEXT to a thread; prints the msg_id once the client has queued it;
         put -- before a TEXT that starts with -; with -file (repeatable) the
         files are uploaded to the thread with TEXT, which may then be left
@@ -171,7 +175,16 @@ commands:
         list, at the start of the post, which then needs the hub reachable
         to check them before it is queued; @ written in TEXT mentions no
         one; -mention takes no -footer or -file; any post first closes the
-        thread's progress card, as progress -done does
+        thread's progress card, as progress -done does; with -deliver the
+        hub also delivers TEXT to the machine that owns the thread, once it
+        is in Slack, as a message of trigger relay with from_client (this
+        machine) and hop (the relays in a row since a person last posted
+        in the thread, this one included); nothing when this machine owns
+        the thread; the hub must be reachable to check, before the post is
+        queued, that its relay list lets this machine deliver to the owner
+        (else exits 3; 1 when the thread has no owner); a relay past hop 3
+        is not delivered, and the hub alerts: a person posting in the
+        thread starts the count again; -deliver takes no -footer or -file
   client delete -socket PATH [-json] MSG-ID
         delete from Slack the post that client post queued under MSG-ID,
         every message it went out as; only a post from this machine; exits
@@ -200,11 +213,17 @@ commands:
         never one a person added; the hub's bot token needs the
         reactions:write scope, else exits 3; exits 1 when Slack has no such
         message
-  client open-thread -socket PATH -channel CHANNEL [-json] [--] TEXT
+  client open-thread -socket PATH -channel CHANNEL [-owner route] [-json] [--] TEXT
         start a thread in CHANNEL with TEXT and print its key; this machine
         owns it; TEXT is standard Markdown, as with post, and goes out as one
         message of at most 4000 characters: for more, start the thread with
-        the first part, then post the rest to it
+        the first part, then post the rest to it; with -owner route the
+        machine of CHANNEL's route owns it instead, and gets TEXT as a
+        message of trigger handoff, hop 1, from_client this machine, unless
+        it is this machine; exits 3 when the route has no machine or the
+        hub's relay list does not let this machine deliver to it
+  client whoami -socket PATH [-json]
+        print this machine's client id
   client threads -socket PATH [-json]
         print the keys of the threads this machine owns
   client adopt -socket PATH [-json] THREAD-KEY
@@ -535,6 +554,8 @@ type hubConfig struct {
 		Upgrade []string `json:"upgrade"`
 		Version []string `json:"version"`
 	} `json:"ops"`
+	// Relay lists, for each client, the clients it may deliver to.
+	Relay route.Relays `json:"relay"`
 }
 
 // ops is the ops part of the config, as the upgrade package takes it.
@@ -775,7 +796,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 			slog.Warn("hub: ignoring the config's channels and dm: the routes are in the database", "config", *configPath)
 		}
 	}
-	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval, Users: cfg.Users}
+	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval, Users: cfg.Users, Relays: cfg.Relay}
 	hub := &link.Hub{
 		Store:         st,
 		Identify:      (&auth.Authenticator{Store: st}).Identify,
@@ -797,7 +818,8 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	}
 	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals, Questions: questions,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
-		CatchUp: poster.CatchUp}
+		CatchUp: poster.CatchUp, Relays: cfg.Relay, Stored: hub.WakeAll}
+	poster.Stored = hub.WakeAll
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Scopes: scopes, Request: *upgradeRequest, HandedOff: proc.Exit(),
@@ -1057,6 +1079,8 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return clientChannelContext(ctx, args[1:], stdout)
 		case "users":
 			return clientUsers(ctx, args[1:], stdout)
+		case "whoami":
+			return clientWhoami(ctx, args[1:], stdout)
 		case "dm":
 			return clientDM(ctx, args[1:], stdout)
 		case "handoff":
@@ -1394,6 +1418,7 @@ func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 		mentions = append(mentions, user)
 		return nil
 	})
+	deliver := fs.Bool("deliver", false, "deliver TEXT to the machine that owns the thread too")
 	if err := parseFlags(fs, args, -1); err != nil {
 		return err
 	}
@@ -1409,7 +1434,10 @@ func clientPost(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(mentions) > 0 && (*footer || len(paths) > 0 || fs.Arg(0) == "") {
 		return usageError("fednet client post: -mention takes a non-empty TEXT, and no -footer or -file")
 	}
-	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0), Footer: *footer, Mentions: mentions}
+	if *deliver && (*footer || len(paths) > 0) {
+		return usageError("fednet client post: -deliver takes no -footer or -file")
+	}
+	req := local.Request{Cmd: local.Post, Thread: *thread, Text: fs.Arg(0), Footer: *footer, Mentions: mentions, Deliver: *deliver}
 	var files []io.Reader
 	for _, path := range paths {
 		f, err := os.Open(path)
@@ -1574,16 +1602,25 @@ func clientOpenThread(ctx context.Context, args []string, stdout io.Writer) erro
 	fs := flag.NewFlagSet("fednet client open-thread", flag.ContinueOnError)
 	socket, asJSON := socketFlags(fs)
 	channel := fs.String("channel", "", "channel to start the thread in (required)")
+	owner := fs.String("owner", "", "route: the machine of the channel's route owns the thread")
 	if err := parseFlags(fs, args, 1); err != nil {
 		return err
 	}
 	if *socket == "" || *channel == "" || fs.Arg(0) == "" {
 		return usageError("fednet client open-thread: -socket, -channel and a non-empty TEXT are required")
 	}
+	cmd := hubapi.OpenThread
+	switch *owner {
+	case "":
+	case "route":
+		cmd = hubapi.OpenThreadForRoute
+	default:
+		return usageError(fmt.Sprintf("fednet client open-thread: -owner takes route, not %q", *owner))
+	}
 	if err := checkLength("fednet client open-thread", fs.Arg(0)); err != nil {
 		return err
 	}
-	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.OpenThread, Channel: *channel, Text: fs.Arg(0)})
+	res, err := do(ctx, *socket, local.Request{Cmd: cmd, Channel: *channel, Text: fs.Arg(0)})
 	if err != nil {
 		return err
 	}
@@ -1715,6 +1752,28 @@ func clientUsers(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// clientWhoami prints this client's id, which the daemon knows; it reads
+// no credential.
+func clientWhoami(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("fednet client whoami", flag.ContinueOnError)
+	socket, asJSON := socketFlags(fs)
+	if err := parseFlags(fs, args, 0); err != nil {
+		return err
+	}
+	if *socket == "" {
+		return usageError("fednet client whoami: -socket is required")
+	}
+	res, err := do(ctx, *socket, local.Request{Cmd: local.Whoami})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return json.NewEncoder(stdout).Encode(res)
+	}
+	_, err = fmt.Fprintln(stdout, res.Text)
+	return err
 }
 
 // clientDM sends a direct message to a user on the user list through the

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/alert"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	_ "modernc.org/sqlite"
@@ -529,5 +531,75 @@ func TestClientAlertIsRelayed(t *testing.T) {
 	defer mu.Unlock()
 	if len(alerts) != 1 || !strings.HasPrefix(alerts[0], "[workstation] ") || !strings.Contains(alerts[0], "d1") {
 		t.Fatalf("alerts = %q, want one, from workstation, about d1", alerts)
+	}
+}
+
+// A post to deliver goes to Slack as any post, then is queued for the
+// thread's owner as a relay with the ts it went out at, and the downlinks
+// are woken; the owner's own is queued for no one; one the relay list
+// does not allow is in Slack all the same, delivered to no one, and
+// alerted.
+func TestDeliver(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	var mu sync.Mutex
+	var alerts []string
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m struct{ Text string }
+		json.NewDecoder(r.Body).Decode(&m)
+		mu.Lock()
+		alerts = append(alerts, m.Text)
+		mu.Unlock()
+	}))
+	defer hook.Close()
+	f.p.Alert = &alert.Webhook{URL: hook.URL, From: "fednet-hub"}
+	f.p.Relays = route.Relays{"workstation": {"datamachine"}}
+	woken := 0
+	f.p.Stored = func() { woken++ }
+	if err := f.st.Claim(ctx, f.thread, "datamachine", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	put := func(client, text string) string {
+		b, err := json.Marshal(payload.Message{Type: payload.Post, Thread: f.thread, Text: text, Deliver: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.putRaw(client, b)
+	}
+	put("workstation", "report")
+	put("datamachine", "my own")
+	refused := put("other", "not allowed")
+	if err := f.p.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replies := f.replies()
+	if got := texts(replies); !slices.Equal(got, []string{"report", "my own", "not allowed"}) {
+		t.Fatalf("thread = %q, want all three", got)
+	}
+	if u := f.undelivered(); len(u) != 0 {
+		t.Fatalf("undelivered = %v, want none", u)
+	}
+	ds, err := f.st.Outbox.After(ctx, "datamachine", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ds) != 1 {
+		t.Fatalf("%d queued for datamachine, want 1", len(ds))
+	}
+	var m payload.Message
+	if err := json.Unmarshal(ds[0].Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	want := payload.Message{Type: payload.Inbound, Thread: f.thread, Text: "report", TS: replies[0].TS, Trigger: payload.Relay, FromClient: "workstation", Hop: 1}
+	if !reflect.DeepEqual(m, want) {
+		t.Fatalf("queued = %+v, want %+v", m, want)
+	}
+	if woken != 1 {
+		t.Fatalf("downlinks woken %d times, want 1", woken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "relay from other") || !strings.Contains(alerts[0], refused) {
+		t.Fatalf("alerts = %q, want one for %s", alerts, refused)
 	}
 }

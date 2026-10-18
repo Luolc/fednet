@@ -58,6 +58,12 @@ const (
 	Reply = "reply"
 	// DM is a message in a direct message conversation.
 	DM = "dm"
+	// Handoff is the first message of a thread another machine opened
+	// for the client, the machine of the channel's route.
+	Handoff = "handoff"
+	// Relay is a post another machine made in a thread the client owns
+	// and asked the hub to deliver to it.
+	Relay = "relay"
 )
 
 // File is a file uploaded with a message. ID is Slack's id of the file,
@@ -144,8 +150,15 @@ type Message struct {
 	// thread. Empty when the route had none, which the receiver takes as
 	// its default.
 	Scope string `json:"scope,omitempty"`
-	// Trigger says why an inbound message was sent: Mention, Reply or DM.
+	// Trigger says why an inbound message was sent: Mention, Reply, DM,
+	// Handoff or Relay.
 	Trigger string `json:"trigger,omitempty"`
+	// FromClient and Hop are set on a Handoff or a Relay: the client that
+	// sent it, as the hub authenticated it, and how many relays in a row
+	// the thread has had since a person last posted in it, this one
+	// included.
+	FromClient string `json:"from_client,omitempty"`
+	Hop        int    `json:"hop,omitempty"`
 	// UserName is User's name on the hub's user list.
 	UserName string `json:"user_name,omitempty"`
 	// Files are the files uploaded with an inbound message, which Text
@@ -176,6 +189,9 @@ type Message struct {
 	Answer json.RawMessage `json:"answer,omitempty"`
 	// Version is, on an Upgrade, the release to upgrade to.
 	Version string `json:"version,omitempty"`
+	// Deliver is set on a post the hub also delivers to the thread's
+	// owner, as an inbound message of trigger Relay, once it is in Slack.
+	Deliver bool `json:"deliver,omitempty"`
 	// Footer is set on a post whose Text goes out as one line of small
 	// grey text.
 	Footer bool `json:"footer,omitempty"`

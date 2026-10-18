@@ -239,8 +239,11 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		case errors.Is(err, route.ErrNoOwner):
 			slog.Warn("inbound: reply in a thread with no owner, dropped", "thread", thread, "ts", ev.TS)
 			return nil
+		case err != nil:
+			return err
 		}
-		return err
+		// A person posted: the machines may relay in the thread again.
+		return tx.SetHop(ctx, thread, 0)
 	})
 	if err != nil {
 		return fmt.Errorf("inbound: %s: %w", slack.ThreadKey(ev.Channel, ev.TS), err)

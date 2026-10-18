@@ -487,7 +487,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
-	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 {
+	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 || !cfg.Relay.Allow("workstation", "datamachine") {
 		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }

@@ -49,6 +49,8 @@ const (
 	// the client's files directory, unless it is there already, and
 	// replies with its path.
 	FetchFile = "fetch-file"
+	// Whoami replies with the client's id as Text.
+	Whoami = "whoami"
 )
 
 // Request is what a caller sends. Cmd selects the command; the other fields
@@ -73,6 +75,10 @@ type Request struct {
 	Files []link.FileHeader `json:"files,omitempty"`
 	// Footer makes a Post one line of small grey text.
 	Footer bool `json:"footer,omitempty"`
+	// Deliver makes the hub deliver a Post to the thread's owner too. The
+	// daemon has the hub check that it may before it queues the post, so
+	// such a post needs the hub.
+	Deliver bool `json:"deliver,omitempty"`
 	// Mentions are the Slack user ids a Post mentions at its start. The
 	// daemon has the hub check them before it queues the post, so such a
 	// post needs the hub.
@@ -387,7 +393,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 			return badRequest("progress is not served on this socket")
 		}
 		return s.progress(ctx, req)
-	case hubapi.ReadThread, hubapi.OpenThread, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
+	case hubapi.ReadThread, hubapi.OpenThread, hubapi.OpenThreadForRoute, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
 		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.RequestChannel, hubapi.Routes, hubapi.Ops, hubapi.Delete,
 		hubapi.Ask, hubapi.AskClose, hubapi.ReadAnswer, hubapi.React, hubapi.Unreact:
 		if s.Request == nil {
@@ -404,6 +410,11 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 		return s.version()
 	case Version:
 		return s.version()
+	case Whoami:
+		if s.Machine == "" {
+			return badRequest("whoami is not served on this socket")
+		}
+		return Response{Text: s.Machine}
 	case FetchFile:
 		if s.Fetch == nil {
 			return badRequest("fetch-file is not served on this socket")
@@ -423,6 +434,18 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 	if req.Footer && !slack.FooterFits(slack.MachineFooter(req.Text, s.Machine)) {
 		return badRequest(fmt.Sprintf("post: a footer takes at most %d characters, links written out and the machine's name added", slack.MaxFooterChars))
 	}
+	if req.Deliver {
+		if req.Footer {
+			return badRequest("post: a footer is not delivered")
+		}
+		if s.Request == nil {
+			return badRequest("post to deliver is not served on this socket")
+		}
+		if res := s.ask(ctx, Request{Cmd: hubapi.CheckRelay, Thread: req.Thread}); res.Error != "" {
+			res.Error = "post: " + res.Error
+			return res
+		}
+	}
 	if len(req.Mentions) > 0 {
 		if req.Footer {
 			return badRequest("post: a footer mentions no one")
@@ -435,7 +458,7 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 			return res
 		}
 	}
-	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text, Footer: req.Footer, Mentions: req.Mentions})
+	return s.queue(ctx, req.Cmd, payload.Message{Type: payload.Post, Thread: req.Thread, Text: req.Text, Footer: req.Footer, Mentions: req.Mentions, Deliver: req.Deliver})
 }
 
 func (s *Server) progress(ctx context.Context, req Request) Response {

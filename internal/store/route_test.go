@@ -133,6 +133,9 @@ func TestOlderHubOpensTheDatabase(t *testing.T) {
 	if err := h.PutQuestion(ctx, Question{ID: "q1", Client: "workstation", Ref: "r1", Thread: "C1/1.1", Card: []byte(`{"question": "q?"}`), AskedAt: at, TS: "1.3"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.SetHop(ctx, "C1/1.1", 2); err != nil {
+		t.Fatal(err)
+	}
 	h.Close()
 
 	db, err := open(ctx, path, hubMigrations[:releasedHubMigrations])
