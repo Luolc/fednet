@@ -57,6 +57,7 @@ func TestRun(t *testing.T) {
 		{"open-thread for an unknown owner", []string{"client", "open-thread", "-socket", "x", "-channel", "C1", "-owner", "self", "hello"}, 2, "", "-owner takes route"},
 		{"deliver a footer", []string{"client", "post", "-socket", "x", "-thread", "t", "-footer", "-deliver", "a"}, 2, "", "-deliver takes no -footer or -file"},
 		{"deliver with a file", []string{"client", "post", "-socket", "x", "-thread", "t", "-deliver", "-file", "/dev/null", "a"}, 2, "", "-deliver takes no -footer or -file"},
+		{"from-thread without -owner route", []string{"client", "open-thread", "-socket", "x", "-channel", "C1", "-from-thread", "C1/1.0", "hello"}, 2, "", "-from-thread takes -owner route"},
 		{"whoami without a socket", []string{"client", "whoami"}, 2, "", "-socket is required"},
 		{"threads without a socket", []string{"client", "threads"}, 2, "", "-socket is required"},
 		{"client handoff without a socket", []string{"client", "handoff"}, 2, "", "-socket is required"},

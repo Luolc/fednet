@@ -1194,6 +1194,55 @@ func TestOpenThreadForRoute(t *testing.T) {
 	if posts.n != 2 {
 		t.Fatalf("Slack got %d posts, want 2", posts.n)
 	}
+
+	// From a thread the caller owns, the hop goes on from that thread's;
+	// from one at the limit nothing is posted, and the hub alerts.
+	s.Relays = route.Relays{"workstation": {"datamachine"}}
+	var alerts []string
+	s.Alert = func(_ context.Context, text string) error {
+		alerts = append(alerts, text)
+		return nil
+	}
+	if err := s.Store.Claim(ctx, "C9/1.0", "workstation", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.SetHop(ctx, "C9/1.0", 2); err != nil {
+		t.Fatal(err)
+	}
+	got, err = answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/1.0", Text: "back to you"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ms := queued(t, s, "datamachine"); len(ms) != 2 || ms[1].Thread != got.Thread || ms[1].Hop != 3 {
+		t.Fatalf("queued for datamachine = %+v, want the handoff at hop 3", ms)
+	}
+	if hop, err := s.Store.Hop(ctx, got.Thread); err != nil || hop != 3 {
+		t.Fatalf("hop of the new thread = %d, %v; want 3", hop, err)
+	}
+	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.Claim(ctx, "C9/2.0", "datamachine", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name, from string
+		want       error
+	}{
+		{"from a thread at the limit", "C9/1.0", link.ErrDenied},
+		{"from a thread another client owns", "C9/2.0", link.ErrDenied},
+		{"from a thread with no owner", "C9/3.0", link.ErrNotFound},
+	} {
+		if _, err := answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: tt.from, Text: "x"}); !errors.Is(err, tt.want) {
+			t.Errorf("%s: open-thread-route = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if posts.n != 3 || len(queued(t, s, "datamachine")) != 2 {
+		t.Fatalf("Slack got %d posts and %d are queued, want 3 and 2", posts.n, len(queued(t, s, "datamachine")))
+	}
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "out of thread C9/1.0 not delivered") {
+		t.Fatalf("alerts = %q, want one for C9/1.0", alerts)
+	}
 }
 
 // check-relay lets a client deliver in a thread whose owner it is, or

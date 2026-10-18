@@ -236,6 +236,19 @@ func TestRelay(t *testing.T) {
 		t.Fatalf("first relay = %+v", m)
 	}
 
+	// Handing the work back in a new thread goes on from the count of the
+	// thread it comes from: from one at the limit, nothing is posted.
+	if code, _ := cli("open-thread", "-socket", machines["workstation"].socket, "-channel", "C2", "-owner", "route", "-from-thread", home, "back again"); code != 3 {
+		t.Fatalf("open-thread -from-thread a thread at the limit: exit %d, want 3", code)
+	}
+	waitFor(t, "the handoff alerted", func() bool { return len(wh.got()) == 2 })
+	if a := wh.got()[1]; !strings.Contains(a, "handoff from workstation to datamachine out of thread "+home+" not delivered") {
+		t.Fatalf("alert = %q", a)
+	}
+	if ms, _ := f.History(ctx, "C2", "0"); len(ms) != 1 {
+		t.Fatalf("C2 has %d threads, want just the first", len(ms))
+	}
+
 	// A person posts in the thread: it reaches the owner, and the count
 	// there starts again.
 	ts, err := f.Reply("C2", root, "U1", "go on")
@@ -256,7 +269,17 @@ func TestRelay(t *testing.T) {
 	if m := relayed("datamachine")[4]; m.Hop != 1 || m.Text != "after the person" {
 		t.Fatalf("relay after the person = %+v, want hop 1", m)
 	}
-	if n := len(wh.got()); n != 1 {
-		t.Fatalf("%d alerts, want 1", n)
+	// The data machine hands back out of that thread: the new thread
+	// starts one hop on.
+	code, back := cli("open-thread", "-socket", machines["datamachine"].socket, "-channel", "C1", "-owner", "route", "-from-thread", thread, "done, over to you")
+	if code != 0 || back == "" {
+		t.Fatalf("open-thread -from-thread: exit %d, printed %q", code, back)
+	}
+	waitFor(t, "the handoff back", func() bool { return len(relayed("workstation")) == 4 })
+	if m := relayed("workstation")[3]; m.Trigger != payload.Handoff || m.Thread != back || m.Hop != 2 || m.FromClient != "datamachine" {
+		t.Fatalf("handoff back = %+v, want hop 2 from datamachine", m)
+	}
+	if n := len(wh.got()); n != 2 {
+		t.Fatalf("%d alerts, want 2", n)
 	}
 }

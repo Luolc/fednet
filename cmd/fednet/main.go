@@ -213,15 +213,19 @@ commands:
         never one a person added; the hub's bot token needs the
         reactions:write scope, else exits 3; exits 1 when Slack has no such
         message
-  client open-thread -socket PATH -channel CHANNEL [-owner route] [-json] [--] TEXT
+  client open-thread -socket PATH -channel CHANNEL [-owner route [-from-thread KEY]] [-json] [--] TEXT
         start a thread in CHANNEL with TEXT and print its key; this machine
         owns it; TEXT is standard Markdown, as with post, and goes out as one
         message of at most 4000 characters: for more, start the thread with
         the first part, then post the rest to it; with -owner route the
         machine of CHANNEL's route owns it instead, and gets TEXT as a
         message of trigger handoff, hop 1, from_client this machine, unless
-        it is this machine; exits 3 when the route has no machine or the
-        hub's relay list does not let this machine deliver to it
+        it is this machine; with -from-thread, the thread this machine owns
+        that the work comes from, the hop goes on from that thread's, and
+        a thread at hop 3 hands nothing over: the hub alerts; exits 3 when
+        the route has no machine, the hub's relay list does not let this
+        machine deliver to it, this machine does not own the -from-thread
+        thread or it is at hop 3, and 1 when that thread has no owner
   client whoami -socket PATH [-json]
         print this machine's client id
   client threads -socket PATH [-json]
@@ -819,6 +823,9 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals, Questions: questions,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
 		CatchUp: poster.CatchUp, Relays: cfg.Relay, Stored: hub.WakeAll}
+	if webhook != nil {
+		api.Alert = webhook.Send
+	}
 	poster.Stored = hub.WakeAll
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
@@ -1603,6 +1610,7 @@ func clientOpenThread(ctx context.Context, args []string, stdout io.Writer) erro
 	socket, asJSON := socketFlags(fs)
 	channel := fs.String("channel", "", "channel to start the thread in (required)")
 	owner := fs.String("owner", "", "route: the machine of the channel's route owns the thread")
+	from := fs.String("from-thread", "", "with -owner route, key of the thread the work comes from")
 	if err := parseFlags(fs, args, 1); err != nil {
 		return err
 	}
@@ -1617,10 +1625,13 @@ func clientOpenThread(ctx context.Context, args []string, stdout io.Writer) erro
 	default:
 		return usageError(fmt.Sprintf("fednet client open-thread: -owner takes route, not %q", *owner))
 	}
+	if *from != "" && *owner == "" {
+		return usageError("fednet client open-thread: -from-thread takes -owner route")
+	}
 	if err := checkLength("fednet client open-thread", fs.Arg(0)); err != nil {
 		return err
 	}
-	res, err := do(ctx, *socket, local.Request{Cmd: cmd, Channel: *channel, Text: fs.Arg(0)})
+	res, err := do(ctx, *socket, local.Request{Cmd: cmd, Channel: *channel, Thread: *from, Text: fs.Arg(0)})
 	if err != nil {
 		return err
 	}

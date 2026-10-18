@@ -55,6 +55,10 @@ const (
 	// route, which becomes the owner and gets Text as an inbound message
 	// of trigger handoff: the requesting client must be allowed to open
 	// threads in Channel and, unless it is that machine, to deliver to it.
+	// Thread, if set, is the thread the handoff comes from, which the
+	// requesting client must own: the new thread's hop count goes on from
+	// that thread's, so that handing work back and forth in new threads
+	// stops at the same limit as relays in one thread.
 	OpenThreadForRoute = "open-thread-route"
 	// CheckRelay checks that the requesting client may deliver its posts
 	// in Thread to the thread's owner, before it queues a post to deliver.
@@ -253,6 +257,9 @@ type Server struct {
 	// Stored, if set, is called once a request has queued a message for a
 	// client, to wake the downlinks: it is link.Hub.WakeAll.
 	Stored func()
+	// Alert, if set, sends an alert to the alerts channel: it is
+	// alert.Webhook.Send. It reports a handoff refused for the hop limit.
+	Alert func(ctx context.Context, text string) error
 
 	// names holds the names of the routes' channels as Slack last gave
 	// them, by channel id.
@@ -558,7 +565,7 @@ func (s *Server) openThread(ctx context.Context, client string, r Request, forRo
 	if r.Channel == store.DMRoute || !slices.Contains(rt.OpenThread, client) {
 		return Reply{}, link.Refuse(link.ErrDenied, "client %s may not open threads in %s", client, r.Channel)
 	}
-	owner := client
+	owner, hop := client, 0
 	if forRoute {
 		owner = rt.Machine
 		switch {
@@ -566,6 +573,11 @@ func (s *Server) openThread(ctx context.Context, client string, r Request, forRo
 			return Reply{}, link.Refuse(link.ErrDenied, "the route of %s has no machine", r.Channel)
 		case owner != client && !s.Relays.Allow(client, owner):
 			return Reply{}, link.Refuse(link.ErrDenied, "the hub's relay list does not let client %s deliver to %s", client, owner)
+		}
+		if r.Thread != "" {
+			if hop, err = s.fromThread(ctx, client, owner, r); err != nil {
+				return Reply{}, err
+			}
 		}
 	}
 	if s.Slack == nil {
@@ -589,6 +601,9 @@ func (s *Server) openThread(ctx context.Context, client string, r Request, forRo
 		if err := tx.Claim(ctx, key, owner, name, rt.Scope); err != nil || owner == client {
 			return err
 		}
+		if err := tx.SetHop(ctx, key, hop); err != nil {
+			return err
+		}
 		_, err := route.New(tx).Deliver(ctx, s.Relays, client, key, payload.Message{Type: payload.Inbound, Thread: key, Text: r.Text, TS: ts, Trigger: payload.Handoff})
 		return err
 	})
@@ -607,6 +622,35 @@ func (s *Server) openThread(ctx context.Context, client string, r Request, forRo
 		s.Stored()
 	}
 	return Reply{Thread: key}, nil
+}
+
+// fromThread returns the hop count of r.Thread, the thread a handoff by
+// client to owner comes from, which client must own. One at the limit is
+// refused, and alerted, before anything is posted.
+func (s *Server) fromThread(ctx context.Context, client, owner string, r Request) (int, error) {
+	if _, _, err := thread(r); err != nil {
+		return 0, err
+	}
+	from, err := s.Store.Owner(ctx, r.Thread)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return 0, link.Refuse(link.ErrNotFound, "thread %s has no owner", r.Thread)
+	case err != nil:
+		return 0, err
+	case from != client:
+		return 0, link.Refuse(link.ErrDenied, "client %s does not own thread %s", client, r.Thread)
+	}
+	hop, err := s.Store.Hop(ctx, r.Thread)
+	if err != nil || hop < route.MaxHop {
+		return hop, err
+	}
+	slog.Error("hubapi: handoff not delivered", "client", client, "to", owner, "from_thread", r.Thread, "err", route.ErrHopLimit)
+	if s.Alert != nil {
+		if err := s.Alert(ctx, fmt.Sprintf("handoff from %s to %s out of thread %s not delivered: %v", client, owner, r.Thread, route.ErrHopLimit)); err != nil {
+			slog.Warn("hubapi: alert", "err", err)
+		}
+	}
+	return 0, link.Refuse(link.ErrDenied, "thread %s has had %d relays in a row since a person last posted in it, the most the hub delivers", r.Thread, route.MaxHop)
 }
 
 // checkRelay refuses unless client may deliver its posts in r.Thread:
