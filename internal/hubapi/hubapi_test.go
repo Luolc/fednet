@@ -1243,6 +1243,14 @@ func TestOpenThreadForRoute(t *testing.T) {
 	if len(alerts) != 1 || !strings.Contains(alerts[0], "out of thread C9/1.0 not delivered") {
 		t.Fatalf("alerts = %q, want one for C9/1.0", alerts)
 	}
+	// The route's machine opening a thread of its own delivers nothing,
+	// so the hop of the thread it names does not matter.
+	if err := s.Store.SetHop(ctx, "C9/2.0", route.MaxHop); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := answer(t, s, "datamachine", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/2.0", Text: "my own"}); err != nil || len(alerts) != 1 {
+		t.Fatalf("the route's machine's own thread from a thread at the limit: %v, %d alerts; want it opened, no alert", err, len(alerts))
+	}
 }
 
 // check-relay lets a client deliver in a thread whose owner it is, or

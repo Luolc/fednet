@@ -58,7 +58,9 @@ const (
 	// Thread, if set, is the thread the handoff comes from, which the
 	// requesting client must own: the new thread's hop count goes on from
 	// that thread's, so that handing work back and forth in new threads
-	// stops at the same limit as relays in one thread.
+	// stops at the same limit as relays in one thread. It is not looked at
+	// when the requesting client is that machine, which nothing is
+	// delivered to.
 	OpenThreadForRoute = "open-thread-route"
 	// CheckRelay checks that the requesting client may deliver its posts
 	// in Thread to the thread's owner, before it queues a post to deliver.
@@ -574,7 +576,7 @@ func (s *Server) openThread(ctx context.Context, client string, r Request, forRo
 		case owner != client && !s.Relays.Allow(client, owner):
 			return Reply{}, link.Refuse(link.ErrDenied, "the hub's relay list does not let client %s deliver to %s", client, owner)
 		}
-		if r.Thread != "" {
+		if r.Thread != "" && owner != client {
 			if hop, err = s.fromThread(ctx, client, owner, r); err != nil {
 				return Reply{}, err
 			}

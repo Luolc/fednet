@@ -226,6 +226,8 @@ func TestRelay(t *testing.T) {
 		}
 		return hs
 	}
+	// The alert can come before the last relay reaches its hook.
+	waitFor(t, "three relays each way", func() bool { return len(hops("workstation")) == 3 && len(hops("datamachine")) == 3 })
 	if got := hops("workstation"); !slices.Equal(got, []int{1, 2, 3}) {
 		t.Fatalf("hops the workstation got = %v, want 1, 2, 3", got)
 	}
