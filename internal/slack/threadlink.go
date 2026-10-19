@@ -24,13 +24,12 @@ var (
 	urlAt = regexp.MustCompile(`^https?://\S*`)
 )
 
-// Limits on linking the thread keys in one text: at most maxLinks keys
-// are looked up, all of them within linkWait, so a post is not held up
-// long when Slack is slow or rate-limits.
-const (
-	maxLinks = 10
-	linkWait = 5 * time.Second
-)
+// maxLinks is the most thread keys looked up for one text.
+const maxLinks = 10
+
+// linkWait bounds the lookups for one text, so a post is not held up long
+// when Slack is slow or rate-limits; tests shorten it.
+var linkWait = 5 * time.Second
 
 // maxMarkdownChars is the most a markdown block takes, in characters.
 const maxMarkdownChars = 12000
@@ -44,7 +43,9 @@ const maxCachedLinks = 4096
 // block, in a code span, in a link, its text or its URL, or in a bare URL
 // are not, nor are keys right after or before a letter, a digit, "_",
 // "/", or after "." or "-", which are parts of something longer, such
-// as a path.
+// as a path, nor keys right after "<", which Slack's mrkdwn reads as
+// the start of a link or mention. Indented code blocks are not told
+// apart from text.
 func threadKeys(text string) [][2]int {
 	var spans [][2]int
 	var fence string
@@ -56,7 +57,7 @@ func threadKeys(text string) [][2]int {
 			fence = f
 			continue
 		} else if fence != "" {
-			if f != "" && f[0] == fence[0] && len(f) >= len(fence) && strings.TrimSpace(strings.TrimLeft(line, " ")[len(f):]) == "" {
+			if f != "" && f[0] == fence[0] && len(f) >= len(fence) && strings.TrimSpace(fenceInfo(line, f)) == "" {
 				fence = ""
 			}
 			continue
@@ -96,10 +97,12 @@ func threadKeys(text string) [][2]int {
 }
 
 // fenceOf returns the run of backticks or tildes that opens or closes a
-// fenced code block when line is such a fence, and "" when it is not.
+// fenced code block when line is such a fence, in a block quote or not,
+// and "" when it is not.
 func fenceOf(line string) string {
-	t := strings.TrimLeft(line, " ")
-	if len(line)-len(t) > 3 || len(t) < 3 || (t[0] != '`' && t[0] != '~') {
+	u := unquote(line)
+	t := strings.TrimLeft(u, " ")
+	if len(u)-len(t) > 3 || len(t) < 3 || (t[0] != '`' && t[0] != '~') {
 		return ""
 	}
 	n := len(t) - len(strings.TrimLeft(t, t[:1]))
@@ -107,6 +110,22 @@ func fenceOf(line string) string {
 		return ""
 	}
 	return t[:n]
+}
+
+// unquote returns line without the block quote markers it starts with.
+func unquote(line string) string {
+	for {
+		t := strings.TrimLeft(line, " ")
+		if !strings.HasPrefix(t, ">") {
+			return line
+		}
+		line = t[1:]
+	}
+}
+
+// fenceInfo returns what follows f, the fence line opens or closes with.
+func fenceInfo(line, f string) string {
+	return strings.TrimLeft(unquote(line), " ")[len(f):]
 }
 
 // codeSpan returns how many bytes of s, which starts with a backtick, a
@@ -140,7 +159,7 @@ func keyBefore(line string, i int) bool {
 		return true
 	}
 	b := line[i-1]
-	return !wordByte(b) && b != '/' && b != '.' && b != '-'
+	return !wordByte(b) && b != '/' && b != '.' && b != '-' && b != '<'
 }
 
 // keyAfter reports whether a key may end where rest starts.

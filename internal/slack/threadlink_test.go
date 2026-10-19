@@ -3,9 +3,16 @@ package slack
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	slackgo "github.com/slack-go/slack"
 )
 
 // The ids and ts in these tests are made up.
@@ -33,11 +40,13 @@ func TestThreadKeys(t *testing.T) {
 		{"`" + keyA + "` " + keyB, []string{keyB}},
 		{"``a ` " + keyA + "`` " + keyB, []string{keyB}},
 		{"` " + keyA, []string{keyA}},
+		{"> ```\n> " + keyA + "\n> ```\n" + keyB, []string{keyB}},
 		{"[" + keyA + "](https://example.invalid/x) " + keyB, []string{keyB}},
 		{"[thread](https://example.invalid/?t=" + keyA + ") " + keyB, []string{keyB}},
 		{"<https://example.invalid/" + keyA + "|t> " + keyB, []string{keyB}},
 		{"https://example.invalid/?t=" + keyA + " " + keyB, []string{keyB}},
 		{"a/" + keyA, nil},
+		{"<" + keyA + ">", nil},
 		{keyA + "/b", nil},
 		{"x" + keyA, nil},
 		{keyA + "x", nil},
@@ -201,5 +210,83 @@ func TestWebPostsKeysAsTheyAreWithoutLinks(t *testing.T) {
 	}
 	if got := blockText(t, posts[1].form.Get("blocks")); got != long {
 		t.Fatalf("markdown block of %d characters, want the %d of the post as given", len(got), len(long))
+	}
+}
+
+// At most maxLinks keys of one text are asked of Slack; the rest stay as
+// they are.
+func TestWebLinksAtMostMaxLinks(t *testing.T) {
+	w, ts, _ := newTestWeb(t, func(r request) (int, string) {
+		switch r.method {
+		case "chat.getPermalink":
+			return 200, `{"ok":true,"permalink":"https://example.invalid/archives/` + r.query.Get("channel") + `/p1"}`
+		case "chat.postMessage":
+			return 200, `{"ok":true,"channel":"C1","ts":"1.5"}`
+		}
+		return 200, `{"ok":false,"error":"unknown_method"}`
+	})
+	var keys []string
+	for i := range maxLinks + 1 {
+		keys = append(keys, fmt.Sprintf("C0FAKE%04d/1700000000.000100", i))
+	}
+	if _, err := w.PostReply(context.Background(), "C1", "1.1", strings.Join(keys, " ")); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := ts.got()
+	var asked int
+	var blocks string
+	for _, r := range rs {
+		switch r.method {
+		case "chat.getPermalink":
+			asked++
+		case "chat.postMessage":
+			blocks = r.form.Get("blocks")
+		}
+	}
+	if asked != maxLinks {
+		t.Fatalf("asked Slack %d times, want %d", asked, maxLinks)
+	}
+	last := keys[maxLinks]
+	if got := blockText(t, blocks); !strings.HasSuffix(got, " "+last) || strings.Count(got, "](") != maxLinks {
+		t.Fatalf("markdown block = %q, want %d keys linked and %s as it is", got, maxLinks, last)
+	}
+}
+
+// A post goes out as given, within linkWait, when Slack does not answer
+// for the permalinks.
+func TestWebDoesNotWaitLongForLinks(t *testing.T) {
+	defer func(d time.Duration) { linkWait = d }(linkWait)
+	linkWait = 50 * time.Millisecond
+	var mu sync.Mutex
+	var blocks string
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/chat.getPermalink") {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		blocks = r.PostForm.Get("blocks")
+		mu.Unlock()
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write([]byte(`{"ok":true,"channel":"C1","ts":"1.5"}`))
+	}))
+	t.Cleanup(srv.Close)
+	w := &Web{c: newClient(testToken, slackgo.OptionAPIURL(srv.URL+"/")), token: testToken, base: srv.URL + "/", files: &http.Client{}, sleep: sleep}
+	text := "see " + keyA + " and " + keyB
+	start := time.Now()
+	got, err := w.PostReply(context.Background(), "C1", "1.1", text)
+	if took := time.Since(start); err != nil || got != "1.5" || took > 2*time.Second {
+		t.Fatalf("PostReply = %q, %v after %v; want 1.5 well within 2s", got, err, took)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := blockText(t, blocks); got != text {
+		t.Fatalf("markdown block = %q, want the post as given, %q", got, text)
 	}
 }
