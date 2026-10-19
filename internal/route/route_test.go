@@ -264,8 +264,8 @@ func TestRouteInTransaction(t *testing.T) {
 }
 
 // Deliver queues a relay for the thread's owner with the caller, the
-// thread's scope and channel name and one hop more each time, up to
-// MaxHop; past it, to a client the relay list does not let the caller
+// thread's scope and channel name and one hop more each time, however
+// many in a row; to a client the relay list does not let the caller
 // deliver to, or for a message too long for the link, it queues nothing
 // and leaves the count. A caller that owns the thread gets nothing, and a
 // thread with no owner is ErrNoOwner.
@@ -278,7 +278,8 @@ func TestDeliver(t *testing.T) {
 	}
 	r := New(h)
 	m := payload.Message{Type: payload.Inbound, Thread: "C1/1.0", Text: "rows loaded", Trigger: payload.Relay}
-	for hop := 1; hop <= MaxHop; hop++ {
+	const many = 30
+	for hop := 1; hop <= many; hop++ {
 		if to, err := r.Deliver(ctx, relays, "workstation", "C1/1.0", m); err != nil || to != "datamachine" {
 			t.Fatalf("relay %d: to %q, %v; want datamachine", hop, to, err)
 		}
@@ -300,7 +301,6 @@ func TestDeliver(t *testing.T) {
 		m      payload.Message
 		want   error
 	}{
-		{"past MaxHop", "workstation", "C1/1.0", m, ErrHopLimit},
 		{"from a client not on the relay list", "other", "C1/1.0", m, ErrRelayDenied},
 		{"a thread with no owner", "workstation", "C1/2.0", m, ErrNoOwner},
 	} {
@@ -320,7 +320,7 @@ func TestDeliver(t *testing.T) {
 	if hop, err := h.Hop(ctx, "C1/1.0"); err != nil || hop != 0 {
 		t.Fatalf("hop after the refusal = %d, %v; want 0", hop, err)
 	}
-	if n := len(queuedMessages(t, h, "datamachine")); n != MaxHop {
-		t.Fatalf("%d queued, want %d", n, MaxHop)
+	if n := len(queuedMessages(t, h, "datamachine")); n != many {
+		t.Fatalf("%d queued, want %d", n, many)
 	}
 }

@@ -184,11 +184,11 @@ commands:
         queued, that its relay list lets this machine deliver to the owner
         and that TEXT is not too long to relay (else exits 3, saying why; 1
         when the thread has no owner); a hub older than that checks the
-        relay list only; a relay past the hub's hop limit is not delivered:
-        a person posting in the thread starts the count again; a relay the
-        hub refuses once the post is in Slack is not delivered, and the hub
-        tells this machine with a message of trigger refused, says so in
-        the thread and alerts; -deliver takes no -footer or -file
+        relay list only; a person posting in the thread starts the hop
+        count again; a relay the hub refuses once the post is in Slack is
+        not delivered, and the hub tells this machine with a message of
+        trigger refused, says so in the thread and alerts; -deliver takes
+        no -footer or -file
   client delete -socket PATH [-json] MSG-ID
         delete from Slack the post that client post queued under MSG-ID,
         every message it went out as; only a post from this machine; exits
@@ -225,12 +225,10 @@ commands:
         machine of CHANNEL's route owns it instead, and gets TEXT as a
         message of trigger handoff, hop 1, from_client this machine, unless
         it is this machine; with -from-thread, the thread this machine owns
-        that the work comes from, the hop goes on from that thread's, and
-        a thread at the hop limit hands nothing over: the hub alerts; exits
+        that the work comes from, the hop goes on from that thread's; exits
         3 when the route has no machine, the hub's relay list does not let
-        this machine deliver to it, this machine does not own the
-        -from-thread thread or it is at the hop limit, and 1 when that
-        thread has no owner
+        this machine deliver to it or this machine does not own the
+        -from-thread thread, and 1 when that thread has no owner
   client whoami -socket PATH [-json]
         print this machine's client id
   client threads -socket PATH [-json]
@@ -834,9 +832,6 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals, Questions: questions,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
 		CatchUp: poster.CatchUp, Relays: cfg.Relay, Stored: hub.WakeAll}
-	if webhook != nil {
-		api.Alert = webhook.Send
-	}
 	poster.Stored = hub.WakeAll
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{

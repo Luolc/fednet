@@ -22,7 +22,7 @@
 // A post may ask to be delivered too: once it is in Slack, the hub queues
 // it for the thread's owner as an inbound message of trigger relay, in the
 // same transaction as it marks the post delivered, unless the poster owns
-// the thread. The relay list and the hop limit are checked then; a relay
+// the thread. The relay list and the length are checked then; a relay
 // they refuse stays in Slack, and the hub tells the poster's machine in
 // that transaction, says so in a line in the thread, alerts and logs.
 //
@@ -238,7 +238,7 @@ func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 			}
 			in := payload.Message{Type: payload.Inbound, Thread: m.Thread, Text: m.Text, TS: ts, Trigger: payload.Relay}
 			to, err = route.New(tx).Deliver(ctx, p.Relays, u.Client, m.Thread, in)
-			if errors.Is(err, route.ErrNoOwner) || errors.Is(err, route.ErrRelayDenied) || errors.Is(err, route.ErrHopLimit) || errors.Is(err, route.ErrTooLong) {
+			if errors.Is(err, route.ErrNoOwner) || errors.Is(err, route.ErrRelayDenied) || errors.Is(err, route.ErrTooLong) {
 				refused, err = err, nil
 				notice := payload.Message{Type: payload.Inbound, Thread: m.Thread, TS: ts, Trigger: payload.Refused,
 					Text: fmt.Sprintf("Your post %s in this thread was not delivered to %s: %s.", u.MsgID, owner(to), route.Reason(refused))}
@@ -271,7 +271,7 @@ func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 			}
 		}
 		if p.Alert != nil {
-			text := fmt.Sprintf("relay from %s to %s in %s not delivered: %s (msg_id %s)", u.Client, owner(to), ThreadRef(ctx, p.Store, p.Slack, m.Thread, ts), route.Reason(refused), u.MsgID)
+			text := fmt.Sprintf("relay from %s to %s in %s not delivered: %s (msg_id %s)", u.Client, owner(to), threadRef(ctx, p.Store, p.Slack, m.Thread, ts), route.Reason(refused), u.MsgID)
 			if aerr := p.Alert.Send(ctx, text); aerr != nil {
 				slog.Warn("outbound: alert", "msg_id", u.MsgID, "err", aerr)
 			}
@@ -291,11 +291,11 @@ func owner(client string) string {
 	return client
 }
 
-// ThreadRef names thread for an alert: its channel, by the name recorded
+// threadRef names thread for an alert: its channel, by the name recorded
 // with the thread's owner or else by id, and a link to the message at ts
 // in it, or to the thread's first message when ts is empty, in the
 // alert webhook's syntax; without the link when Slack gives none.
-func ThreadRef(ctx context.Context, st *store.Hub, api slack.API, thread, ts string) string {
+func threadRef(ctx context.Context, st *store.Hub, api slack.API, thread, ts string) string {
 	channel, root, ok := slack.ParseThreadKey(thread)
 	if !ok {
 		return "thread " + thread
