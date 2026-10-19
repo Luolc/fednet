@@ -1126,7 +1126,7 @@ var hookEnv = []string{"PATH", "HOME"}
 // it serves from the start.
 func clientServe(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("fednet client", flag.ContinueOnError)
-	hubURL := fs.String("hub", "", "hub base URL, such as http://fednet-hub:8080 (required)")
+	hubURL := fs.String("hub", "", "hub base URL, such as http://hub.example.test:8080 (required)")
 	dbPath := fs.String("db", "", "client database file (required)")
 	credPath := fs.String("credential", "", "credential file written by client init (required)")
 	socket := fs.String("socket", "", "unix socket for the agents (required)")

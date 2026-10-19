@@ -30,7 +30,7 @@ type Client struct {
 	// Header is sent to the hub on every request, in addition to
 	// ClientHeader; the credential goes here.
 	Header http.Header
-	// Hub is the hub's base URL, such as http://fednet-hub:8080.
+	// Hub is the hub's base URL, such as http://hub.example.test:8080.
 	Hub string
 	// Heartbeat is the interval between pings on the downlink. Zero means
 	// DefaultHeartbeat.

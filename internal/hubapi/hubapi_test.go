@@ -652,17 +652,17 @@ func TestRequestApproval(t *testing.T) {
 // rename shows later.
 func TestRoutesWithNames(t *testing.T) {
 	s, f := testServer(t)
-	f.RenameChannel("C1", "repo-fednet")
+	f.RenameChannel("C1", "repo-example")
 	for _, ch := range []string{"C1", "C8", store.DMRoute} {
 		setRoute(t, s.Store, store.Route{Channel: ch, Machine: "workstation"})
 	}
-	want := []store.Route{{Channel: "C1", Machine: "workstation", Name: "repo-fednet"}, {Channel: "C8", Machine: "workstation"}, {Channel: store.DMRoute, Machine: "workstation"}}
+	want := []store.Route{{Channel: "C1", Machine: "workstation", Name: "repo-example"}, {Channel: "C8", Machine: "workstation"}, {Channel: store.DMRoute, Machine: "workstation"}}
 	got, err := answer(t, s, "workstation", Request{Cmd: Routes})
 	if err != nil || !reflect.DeepEqual(got.Routes, want) {
 		t.Fatalf("routes = %+v, %v; want %+v", got.Routes, err, want)
 	}
 	f.RenameChannel("C1", "repo-renamed")
-	if got, err := answer(t, s, "workstation", Request{Cmd: Routes}); err != nil || got.Routes[0].Name != "repo-fednet" {
+	if got, err := answer(t, s, "workstation", Request{Cmd: Routes}); err != nil || got.Routes[0].Name != "repo-example" {
 		t.Fatalf("routes right after a rename = %+v, %v; want the name as it was", got.Routes, err)
 	}
 }
@@ -700,7 +700,7 @@ func TestRequestRoute(t *testing.T) {
 		{"no agent", Request{Cmd: RequestRoute, Text: "x", Route: &RouteRequest{Channel: "C1", Machine: "workstation"}}, link.ErrBadRequest},
 		{"no text", Request{Cmd: RequestRoute, Agent: "a", Route: &RouteRequest{Channel: "C1", Machine: "workstation"}}, link.ErrBadRequest},
 		{"no route", Request{Cmd: RequestRoute, Agent: "a", Text: "x"}, link.ErrBadRequest},
-		{"not a channel id", req(RouteRequest{Channel: "#repo-fednet", Machine: "workstation"}), link.ErrBadRequest},
+		{"not a channel id", req(RouteRequest{Channel: "#repo-example", Machine: "workstation"}), link.ErrBadRequest},
 		{"a scope out of [a-z0-9-]", req(RouteRequest{Channel: "C1", Machine: "workstation", Scope: "Control_Plane"}), link.ErrBadRequest},
 		{"an unknown machine", req(RouteRequest{Channel: "C1", Machine: "nobody"}), link.ErrBadRequest},
 		{"a revoked machine", req(RouteRequest{Channel: "C1", Machine: "retired"}), link.ErrBadRequest},
