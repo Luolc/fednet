@@ -22,8 +22,8 @@
 // A post may ask to be delivered too: once it is in Slack, the hub queues
 // it for the thread's owner as an inbound message of trigger relay, in the
 // same transaction as it marks the post delivered, unless the poster owns
-// the thread. The relay list and the hop limit are checked then; a relay
-// they refuse is alerted and logged, and the post stays in Slack.
+// the thread. The relay list is checked then; a relay it refuses is
+// alerted and logged, and the post stays in Slack.
 //
 // The inbox also holds the alerts clients raise, which only the hub can
 // send, since only the hub has the webhook: each goes to the webhook as
@@ -234,7 +234,7 @@ func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 				in.TS = posted.TS[0]
 			}
 			to, err = route.New(tx).Deliver(ctx, p.Relays, u.Client, m.Thread, in)
-			if errors.Is(err, route.ErrNoOwner) || errors.Is(err, route.ErrRelayDenied) || errors.Is(err, route.ErrHopLimit) || errors.Is(err, route.ErrTooLong) {
+			if errors.Is(err, route.ErrNoOwner) || errors.Is(err, route.ErrRelayDenied) || errors.Is(err, route.ErrTooLong) {
 				refused, err = err, nil
 			}
 			if err != nil {

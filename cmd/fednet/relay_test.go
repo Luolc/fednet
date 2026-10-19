@@ -16,7 +16,6 @@ import (
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/inbound"
 	"github.com/Luolc/fednet/internal/payload"
-	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -44,9 +43,8 @@ func (a *alerts) got() []string {
 // End to end, with two machines the relay list lets deliver to each other
 // and a third it does not list: a thread one opens for the machine of the
 // channel's route reaches that machine's hook as a handoff, the two then
-// relay back and forth until route.MaxHop relays in a row, after which
-// the hub delivers nothing and alerts, though the post is in the thread; a
-// person posting in the thread lets them relay again. The unlisted
+// relay back and forth, each relay one hop more however many there are in
+// a row, and a person posting in the thread starts the count again. The unlisted
 // machine can do neither, and its refused open-thread posts nothing.
 func TestRelay(t *testing.T) {
 	ctx := t.Context()
@@ -212,15 +210,16 @@ func TestRelay(t *testing.T) {
 		t.Fatalf("open-thread: exit %d, printed %q", code, home)
 	}
 	_, homeRoot, _ := slack.ParseThreadKey(home)
-	// The two answer each other until each thread has had route.MaxHop
-	// relays in a row; the next one is not delivered. The thread the
-	// workstation posts in holds the data machine's post already.
+	// The two answer each other many times over, every relay delivered.
+	// The thread the workstation posts in holds the data machine's post
+	// already.
 	type step struct {
 		from, thread, root string
 		posts              int
 	}
+	const many = 30
 	var steps []step
-	for i := 1; i <= route.MaxHop; i++ {
+	for i := 1; i <= many; i++ {
 		steps = append(steps, step{"datamachine", home, homeRoot, i}, step{"workstation", thread, root, i + 1})
 	}
 	for _, s := range steps {
@@ -233,10 +232,6 @@ func TestRelay(t *testing.T) {
 			return len(ms) == s.posts+1
 		})
 	}
-	waitFor(t, "the relay alerted", func() bool { return len(wh.got()) == 1 })
-	if a := wh.got()[0]; !strings.Contains(a, "relay from workstation in thread "+thread+" not delivered") {
-		t.Fatalf("alert = %q", a)
-	}
 	hops := func(id string) []int {
 		var hs []int
 		for _, m := range relayed(id) {
@@ -246,35 +241,32 @@ func TestRelay(t *testing.T) {
 		}
 		return hs
 	}
-	// The alert can come before the last relay reaches its hook.
 	var want []int
-	for i := 1; i <= route.MaxHop; i++ {
+	for i := 1; i <= many+1; i++ {
 		want = append(want, i)
 	}
-	waitFor(t, "route.MaxHop relays each way", func() bool {
-		return len(hops("workstation")) == route.MaxHop && len(hops("datamachine")) == route.MaxHop
+	waitFor(t, "the relays each way", func() bool {
+		return len(hops("workstation")) == many && len(hops("datamachine")) == many+1
 	})
-	if got := hops("workstation"); !slices.Equal(got, want) {
-		t.Fatalf("hops the workstation got = %v, want %v", got, want)
+	if got := hops("workstation"); !slices.Equal(got, want[:many]) {
+		t.Fatalf("hops the workstation got = %v, want %v", got, want[:many])
 	}
 	if got := hops("datamachine"); !slices.Equal(got, want) {
-		t.Fatalf("hops the data machine got = %v, want the handoff's 1, then up to %d", got, route.MaxHop)
+		t.Fatalf("hops the data machine got = %v, want the handoff's 1, then up to %d", got, many+1)
 	}
 	if m := relayed("workstation")[0]; m.Trigger != payload.Relay || m.FromClient != "datamachine" || m.Thread != home || m.Text != "relay from datamachine" {
 		t.Fatalf("first relay = %+v", m)
 	}
 
 	// Handing the work back in a new thread goes on from the count of the
-	// thread it comes from: from one at the limit, nothing is posted.
-	if code, _ := cli("open-thread", "-socket", machines["workstation"].socket, "-channel", "C2", "-owner", "route", "-from-thread", home, "back again"); code != 3 {
-		t.Fatalf("open-thread -from-thread a thread at the limit: exit %d, want 3", code)
+	// thread it comes from.
+	code, again := cli("open-thread", "-socket", machines["workstation"].socket, "-channel", "C2", "-owner", "route", "-from-thread", home, "back again")
+	if code != 0 || again == "" {
+		t.Fatalf("open-thread -from-thread %s: exit %d, printed %q", home, code, again)
 	}
-	waitFor(t, "the handoff alerted", func() bool { return len(wh.got()) == 2 })
-	if a := wh.got()[1]; !strings.Contains(a, "handoff from workstation to datamachine out of thread "+home+" not delivered") {
-		t.Fatalf("alert = %q", a)
-	}
-	if ms, _ := f.History(ctx, "C2", "0"); len(ms) != 1 {
-		t.Fatalf("C2 has %d threads, want just the first", len(ms))
+	waitFor(t, "the handoff out of the busy thread", func() bool { return len(relayed("datamachine")) == many+2 })
+	if m := relayed("datamachine")[many+1]; m.Trigger != payload.Handoff || m.Thread != again || m.Hop != many+1 {
+		t.Fatalf("handoff out of %s = %+v, want hop %d", home, m, many+1)
 	}
 
 	// A person posts in the thread: it reaches the owner, and the count
@@ -286,15 +278,15 @@ func TestRelay(t *testing.T) {
 	if err := sr.r.Handle(ctx, inbound.Event{ID: "Ev1", Channel: "C2", Message: slack.Message{TS: ts, ThreadTS: root, User: "U1", Text: "go on"}}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the reply to reach the data machine", func() bool { return len(relayed("datamachine")) == route.MaxHop+1 })
-	if m := relayed("datamachine")[route.MaxHop]; m.Trigger != payload.Reply || m.Text != "go on" {
+	waitFor(t, "the reply to reach the data machine", func() bool { return len(relayed("datamachine")) == many+3 })
+	if m := relayed("datamachine")[many+2]; m.Trigger != payload.Reply || m.Text != "go on" {
 		t.Fatalf("the data machine got %+v, want the person's reply", m)
 	}
 	if code, _ := cli("post", "-socket", machines["workstation"].socket, "-thread", thread, "-deliver", "after the person"); code != 0 {
 		t.Fatalf("post -deliver after the person: exit %d", code)
 	}
-	waitFor(t, "the relay after the person", func() bool { return len(relayed("datamachine")) == route.MaxHop+2 })
-	if m := relayed("datamachine")[route.MaxHop+1]; m.Hop != 1 || m.Text != "after the person" {
+	waitFor(t, "the relay after the person", func() bool { return len(relayed("datamachine")) == many+4 })
+	if m := relayed("datamachine")[many+3]; m.Hop != 1 || m.Text != "after the person" {
 		t.Fatalf("relay after the person = %+v, want hop 1", m)
 	}
 	// The data machine hands back out of that thread: the new thread
@@ -303,11 +295,11 @@ func TestRelay(t *testing.T) {
 	if code != 0 || back == "" {
 		t.Fatalf("open-thread -from-thread: exit %d, printed %q", code, back)
 	}
-	waitFor(t, "the handoff back", func() bool { return len(relayed("workstation")) == route.MaxHop+1 })
-	if m := relayed("workstation")[route.MaxHop]; m.Trigger != payload.Handoff || m.Thread != back || m.Hop != 2 || m.FromClient != "datamachine" {
+	waitFor(t, "the handoff back", func() bool { return len(relayed("workstation")) == many+1 })
+	if m := relayed("workstation")[many]; m.Trigger != payload.Handoff || m.Thread != back || m.Hop != 2 || m.FromClient != "datamachine" {
 		t.Fatalf("handoff back = %+v, want hop 2 from datamachine", m)
 	}
-	if n := len(wh.got()); n != 2 {
-		t.Fatalf("%d alerts, want 2", n)
+	if n := len(wh.got()); n != 0 {
+		t.Fatalf("%d alerts, want none", n)
 	}
 }
