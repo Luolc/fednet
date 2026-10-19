@@ -652,17 +652,17 @@ func TestRequestApproval(t *testing.T) {
 // rename shows later.
 func TestRoutesWithNames(t *testing.T) {
 	s, f := testServer(t)
-	f.RenameChannel("C1", "repo-fednet")
+	f.RenameChannel("C1", "repo-example")
 	for _, ch := range []string{"C1", "C8", store.DMRoute} {
 		setRoute(t, s.Store, store.Route{Channel: ch, Machine: "workstation"})
 	}
-	want := []store.Route{{Channel: "C1", Machine: "workstation", Name: "repo-fednet"}, {Channel: "C8", Machine: "workstation"}, {Channel: store.DMRoute, Machine: "workstation"}}
+	want := []store.Route{{Channel: "C1", Machine: "workstation", Name: "repo-example"}, {Channel: "C8", Machine: "workstation"}, {Channel: store.DMRoute, Machine: "workstation"}}
 	got, err := answer(t, s, "workstation", Request{Cmd: Routes})
 	if err != nil || !reflect.DeepEqual(got.Routes, want) {
 		t.Fatalf("routes = %+v, %v; want %+v", got.Routes, err, want)
 	}
 	f.RenameChannel("C1", "repo-renamed")
-	if got, err := answer(t, s, "workstation", Request{Cmd: Routes}); err != nil || got.Routes[0].Name != "repo-fednet" {
+	if got, err := answer(t, s, "workstation", Request{Cmd: Routes}); err != nil || got.Routes[0].Name != "repo-example" {
 		t.Fatalf("routes right after a rename = %+v, %v; want the name as it was", got.Routes, err)
 	}
 }
