@@ -359,7 +359,8 @@ func cardSlack(t *testing.T, linkA, linkB string, fail *bool) (*Web, func() ([]s
 // The thread keys in a question card's context and options show as
 // links to their threads, but not those in code; the card drawn again,
 // answered, shows the same links without asking Slack again, even when
-// the permalinks by key are forgotten and Slack would give none by then. The plain text is the card's as it is.
+// the permalinks by key are forgotten and Slack would give none by then.
+// The plain text is the card's as it is.
 func TestWebLinksThreadKeysOnCards(t *testing.T) {
 	ctx := context.Background()
 	linkA := "https://example.invalid/archives/C0FAKE0001/p1700000000000100"
