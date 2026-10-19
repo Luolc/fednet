@@ -346,6 +346,16 @@ func CompareTS(a, b string) int {
 	return cmp.Compare(af, bf)
 }
 
+// TSTime returns the time ts stands for; ok is false for a ts that does
+// not parse.
+func TSTime(ts string) (t time.Time, ok bool) {
+	sec, usec := splitTS(ts)
+	if sec < 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(sec, usec*1000).UTC(), true
+}
+
 // splitTS parses ts into its seconds and its fraction scaled to
 // microseconds; both are -1 for a ts that does not parse.
 func splitTS(ts string) (sec, usec int64) {

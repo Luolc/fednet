@@ -101,6 +101,8 @@ type Request struct {
 	ID   string `json:"id,omitempty"`
 	// Name is the argument of hubapi.React and hubapi.Unreact.
 	Name string `json:"name,omitempty"`
+	// Limit is the argument of hubapi.ChannelThreads.
+	Limit int `json:"limit,omitempty"`
 }
 
 // Response is the daemon's reply. Error is set when the request failed, and
@@ -121,6 +123,10 @@ type Response struct {
 	PID        int             `json:"pid,omitempty"`
 	Error      string          `json:"error,omitempty"`
 	Kind       string          `json:"kind,omitempty"`
+
+	// ChannelThreads is the answer to hubapi.ChannelThreads; absent for
+	// a channel with no thread that has an owner.
+	ChannelThreads []hubapi.ChannelThread `json:"channel_threads,omitempty"`
 }
 
 // Why a request failed, for Response.Kind.
@@ -393,7 +399,7 @@ func (s *Server) handle(ctx context.Context, req Request, body io.Reader) Respon
 			return badRequest("progress is not served on this socket")
 		}
 		return s.progress(ctx, req)
-	case hubapi.ReadThread, hubapi.OpenThread, hubapi.OpenThreadForRoute, hubapi.Threads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
+	case hubapi.ReadThread, hubapi.OpenThread, hubapi.OpenThreadForRoute, hubapi.Threads, hubapi.ChannelThreads, hubapi.Adopt, hubapi.GetChannelContext, hubapi.SetChannelContext,
 		hubapi.Users, hubapi.DM, hubapi.RequestApproval, hubapi.RequestRoute, hubapi.RequestChannel, hubapi.Routes, hubapi.Ops, hubapi.Delete,
 		hubapi.Ask, hubapi.AskClose, hubapi.ReadAnswer, hubapi.React, hubapi.Unreact:
 		if s.Request == nil {
@@ -544,7 +550,7 @@ var kinds = []struct {
 func (s *Server) ask(ctx context.Context, req Request) Response {
 	b, err := json.Marshal(hubapi.Request{Cmd: req.Cmd, Thread: req.Thread, Channel: req.Channel, Text: req.Text, User: req.User,
 		Agent: req.Agent, Requester: req.Requester, Action: req.Action, Op: req.Op, MsgID: req.MsgID, Mentions: req.Mentions, Route: req.Route,
-		Ref: req.Ref, Card: req.Card, ID: req.ID, Name: req.Name})
+		Ref: req.Ref, Card: req.Card, ID: req.ID, Name: req.Name, Limit: req.Limit})
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
@@ -571,7 +577,8 @@ func (s *Server) ask(ctx context.Context, req Request) Response {
 	if err := json.Unmarshal(answer, &reply); err != nil {
 		return Response{Error: req.Cmd + ": unreadable answer from the hub: " + err.Error()}
 	}
-	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID, Routes: reply.Routes, Question: reply.Question, Card: reply.Card}
+	return Response{Messages: reply.Messages, Text: reply.Text, Thread: reply.Thread, Threads: reply.Threads, Users: reply.Users, ApprovalID: reply.ApprovalID, Routes: reply.Routes, Question: reply.Question, Card: reply.Card,
+		ChannelThreads: reply.ChannelThreads}
 }
 
 // Do sends req to the socket at path and returns the daemon's response. An

@@ -170,3 +170,33 @@ func (h *Hub) ThreadsIn(ctx context.Context, channel string) ([]string, error) {
 	}
 	return threads, rows.Err()
 }
+
+// Owned is a thread with its owner, as the owner table records it.
+type Owned struct {
+	Thread string
+	Client string
+	// ChannelName is the name of the thread's channel as Slack gave it
+	// when the thread got its owner; empty when the hub had none then.
+	ChannelName string
+}
+
+// OwnedIn returns the threads in channel that have an owner, with their
+// owners, in order of their keys.
+func (h *Hub) OwnedIn(ctx context.Context, channel string) ([]Owned, error) {
+	prefix := channel + "/"
+	rows, err := h.db.QueryContext(ctx,
+		"SELECT thread, client_id, channel_name FROM owner WHERE substr(thread, 1, ?) = ? ORDER BY thread", len(prefix), prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var owned []Owned
+	for rows.Next() {
+		var o Owned
+		if err := rows.Scan(&o.Thread, &o.Client, &o.ChannelName); err != nil {
+			return nil, err
+		}
+		owned = append(owned, o)
+	}
+	return owned, rows.Err()
+}

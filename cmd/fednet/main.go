@@ -230,6 +230,12 @@ commands:
         print this machine's client id
   client threads -socket PATH [-json]
         print the keys of the threads this machine owns
+  client threads -socket PATH -channel CHANNEL [-limit N] [-json]
+        print the threads in a channel that some machine owns, latest first,
+        at most N (default 20): each a line of its key, the client id of
+        its owner, when it started (RFC 3339, UTC) and the channel's name
+        when the hub has it, all from the hub's database; exits 2 when the
+        hub runs a fednet too old to list them
   client adopt -socket PATH [-json] THREAD-KEY
         make this machine the owner of a thread: people's replies in it come here
   client channel-context get -socket PATH [-json] CHANNEL
@@ -1642,17 +1648,32 @@ func clientOpenThread(ctx context.Context, args []string, stdout io.Writer) erro
 	return err
 }
 
-// clientThreads prints the threads this client owns, one key a line.
+// clientThreads prints the threads this client owns, one key a line, or,
+// with -channel, the threads in that channel, whoever owns them.
 func clientThreads(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet client threads", flag.ContinueOnError)
 	socket, asJSON := socketFlags(fs)
+	channel := fs.String("channel", "", "list the threads in this channel, whoever owns them")
+	limit := fs.Int("limit", hubapi.DefaultChannelThreads, "with -channel, list at most this many threads")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
 	if *socket == "" {
 		return usageError("fednet client threads: -socket is required")
 	}
-	res, err := do(ctx, *socket, local.Request{Cmd: hubapi.Threads})
+	limitSet := false
+	fs.Visit(func(f *flag.Flag) { limitSet = limitSet || f.Name == "limit" })
+	switch {
+	case *channel == "" && limitSet:
+		return usageError("fednet client threads: -limit takes -channel")
+	case *channel != "" && *limit <= 0:
+		return usageError(fmt.Sprintf("fednet client threads: -limit must be positive, not %d", *limit))
+	}
+	req := local.Request{Cmd: hubapi.Threads}
+	if *channel != "" {
+		req = local.Request{Cmd: hubapi.ChannelThreads, Channel: *channel, Limit: *limit}
+	}
+	res, err := do(ctx, *socket, req)
 	if err != nil {
 		return err
 	}
@@ -1661,6 +1682,12 @@ func clientThreads(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	for _, t := range res.Threads {
 		if _, err := fmt.Fprintln(stdout, t); err != nil {
+			return err
+		}
+	}
+	for _, t := range res.ChannelThreads {
+		line := strings.TrimSpace(strings.Join([]string{t.Thread, t.Owner, t.StartedAt.Format(time.RFC3339), t.ChannelName}, " "))
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
 			return err
 		}
 	}

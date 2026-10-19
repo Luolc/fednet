@@ -445,6 +445,35 @@ func TestThreads(t *testing.T) {
 	}
 }
 
+func TestChannelThreads(t *testing.T) {
+	s, _ := testServer(t)
+	// 999.5 sorts after 1000.1 as a string; it is the older thread.
+	for _, o := range [][3]string{{"C1/1000.000100", "workstation", "fednet"}, {"C1/999.500000", "datamachine", "fednet"},
+		{"C1/1000.000200", "datamachine", ""}, {"C2/2000.000000", "workstation", "other"}} {
+		if err := s.Store.Claim(t.Context(), o[0], o[1], o[2], ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := answer(t, s, "nobody", Request{Cmd: ChannelThreads, Channel: "C1"})
+	want := []ChannelThread{
+		{Thread: "C1/1000.000200", Owner: "datamachine", StartedAt: time.Unix(1000, 200_000).UTC()},
+		{Thread: "C1/1000.000100", Owner: "workstation", ChannelName: "fednet", StartedAt: time.Unix(1000, 100_000).UTC()},
+		{Thread: "C1/999.500000", Owner: "datamachine", ChannelName: "fednet", StartedAt: time.Unix(999, 500_000_000).UTC()},
+	}
+	if err != nil || !reflect.DeepEqual(got.ChannelThreads, want) {
+		t.Fatalf("channel-threads C1 = %+v, %v; want %+v", got.ChannelThreads, err, want)
+	}
+	if got, err := answer(t, s, "nobody", Request{Cmd: ChannelThreads, Channel: "C1", Limit: 2}); err != nil || !reflect.DeepEqual(got.ChannelThreads, want[:2]) {
+		t.Fatalf("channel-threads C1 limit 2 = %+v, %v; want %+v", got.ChannelThreads, err, want[:2])
+	}
+	if got, err := answer(t, s, "nobody", Request{Cmd: ChannelThreads, Channel: "C3"}); err != nil || len(got.ChannelThreads) != 0 {
+		t.Fatalf("channel-threads of a channel with none = %+v, %v; want none", got, err)
+	}
+	if _, err := answer(t, s, "nobody", Request{Cmd: ChannelThreads, Channel: "C1/1"}); !errors.Is(err, link.ErrBadRequest) {
+		t.Fatalf("channel-threads of a thread key = %v, want a bad request", err)
+	}
+}
+
 func TestUsers(t *testing.T) {
 	s, _ := testServer(t)
 	s.Users = map[string]string{"U2": "", "U1": "maintainer"}
@@ -983,7 +1012,7 @@ func TestReadAnswer(t *testing.T) {
 		t.Fatalf("question as posted = %+v", posted)
 	}
 
-	commands := []string{ReadThread, OpenThread, Threads, Adopt, GetChannelContext, SetChannelContext, Users, DM, RequestApproval,
+	commands := []string{ReadThread, OpenThread, Threads, ChannelThreads, Adopt, GetChannelContext, SetChannelContext, Users, DM, RequestApproval,
 		RequestRoute, RequestChannel, Routes, Ops, Delete, CheckMentions, Ask, AskClose, React, Unreact, ReadAnswer}
 	for _, client := range []string{"other", "workstation"} {
 		for _, cmd := range commands {
