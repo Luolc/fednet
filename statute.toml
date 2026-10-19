@@ -23,8 +23,6 @@ rules = [
   "R211",
   # CI runners are pinned to a fixed Ubuntu release.
   "R212",
-  # The hostname of the hub machine is part of the design and may be written (L12).
-  "L12",
 ]
 
 exclude = [

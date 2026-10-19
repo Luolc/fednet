@@ -636,7 +636,7 @@ rule = "R259"
 revision = 5
 sha256 = "73b17cc0e5ab852823d1b8adc7cc513db498a5d458a0d50d973f6a44013cd799"
 original-sha256 = "ee761d0823d9bca4942b9407f18cd6291b4e753dbfc5e6ab1cb42df2f0483f5e"
-overridden-by = "L12"
+by = "default"
 
 [[rules]]
 rule = "R261"
@@ -854,12 +854,6 @@ revision = 1
 sha256 = "37e6e9cbcda3597f7ecaccb96928373bc7fc94957607e208135f1100ee955450"
 original-sha256 = "f52dac88ab8ec27f6893c80575a86ecacf0af2a49fae611eca5b34169cb7a7a3"
 by = "default"
-
-[[rules]]
-rule = "L12"
-revision = 1
-sha256 = "f55713e33bc8efeabf24379f208b643a064adc908779ca94a5f84079e3bef9e6"
-original-sha256 = "630745ae27245a02cfe619fb03c986fc0da7d24ed693462f4d3edeaf3f13e725"
 
 [[rules]]
 rule = "L13"

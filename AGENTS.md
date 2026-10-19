@@ -218,7 +218,7 @@
 
 ### 私有材料
 
-- L12 在本仓的文件、commit message、pull request、评论和审查里，不写能指认或定位私有资源、私有仓库、agent 实例或会话、agent 运行所在的 scope 的内容，也不写 agent 的用量、额度、型号或 effort；hub 机器的主机名 `fednet-hub` 是设计的一部分，可以写，其他机器按角色称呼，例如 hub 机器、agent 机器。
+- R259 在公开仓库的文件、commit message、pull request、评论和审查里，不写能指认或定位私有资源、私有仓库、agent 实例或会话、agent 运行所在的 scope 的内容，也不写 agent 的用量、额度、型号或 effort。
 - R52 向公开仓库 push 之前，先让审查方读 diff、commit message 和 pull request 的文字，查有没有私有内容，只 push 审查方通过的那个 head。
 - L13 在本仓的文件、commit message、pull request、评论和审查里，不写 Linear 的 workspace 名、team 名、issue 编号和链接，提到其中的内容只写「在 Linear 上」。
 
