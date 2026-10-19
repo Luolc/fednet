@@ -87,7 +87,11 @@ type ChannelInfo struct {
 	Purpose string
 }
 
-// API is what the hub needs from Slack.
+// API is what the hub needs from Slack. Post, PostReply,
+// PostReplyMentioning, DM, Upload and PostFooter show each thread key
+// that text has outside code and links, such as C0123ABCD/1700000000.000100,
+// as a link to its thread where Slack gives the link in time, and as it
+// is otherwise; the message's plain text keeps text as given.
 type API interface {
 	// Self returns the Slack user id of the bot the token belongs to,
 	// and the scopes the token has; nil scopes means Slack did not say.

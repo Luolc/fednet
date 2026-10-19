@@ -42,6 +42,8 @@ type Web struct {
 	http, files *http.Client
 	// sleep waits for d or until ctx is done; tests replace it.
 	sleep func(ctx context.Context, d time.Duration) error
+	// links is the permalinks of the threads posts have named.
+	links linkCache
 }
 
 // New returns a Web that calls Slack with token, a bot token.
@@ -233,7 +235,7 @@ func (w *Web) Upload(ctx context.Context, channel, ts, text string, files []Uplo
 	}
 	p := slackgo.CompleteUploadExternalParameters{Files: ids, Channel: channel, ThreadTimestamp: ts}
 	if text != "" {
-		p.Blocks = slackgo.Blocks{BlockSet: []slackgo.Block{slackgo.NewMarkdownBlock("", text)}}
+		p.Blocks = slackgo.Blocks{BlockSet: []slackgo.Block{slackgo.NewMarkdownBlock("", w.linkThreadKeys(ctx, text))}}
 	}
 	err := w.call(ctx, "files.completeUploadExternal", func() error {
 		_, err := w.c.CompleteUploadExternalContext(ctx, p)
@@ -440,8 +442,10 @@ func (w *Web) Post(ctx context.Context, channel, text string) (string, error) {
 	return w.postMarkdown(ctx, channel, text)
 }
 
-// PostReply puts text in a markdown block. text is also the message's
-// plain text, which notifications and conversations.replies show.
+// PostReply puts text in a markdown block, its thread keys linked to
+// their threads as linkThreadKeys links them. text as given is also the
+// message's plain text, which notifications and conversations.replies
+// show.
 func (w *Web) PostReply(ctx context.Context, channel, ts, text string) (string, error) {
 	return w.postMarkdown(ctx, channel, text, slackgo.MsgOptionTS(ts))
 }
@@ -460,13 +464,13 @@ func (w *Web) PostReplyMentioning(ctx context.Context, channel, ts, text string,
 		plain.WriteString("<@" + u + "> ")
 	}
 	return w.post(ctx, channel, slackgo.MsgOptionTS(ts), slackgo.MsgOptionText(plain.String()+text, false),
-		slackgo.MsgOptionBlocks(slackgo.NewRichTextBlock("", slackgo.NewRichTextSection(els...)), slackgo.NewMarkdownBlock("", text)))
+		slackgo.MsgOptionBlocks(slackgo.NewRichTextBlock("", slackgo.NewRichTextSection(els...)), slackgo.NewMarkdownBlock("", w.linkThreadKeys(ctx, text))))
 }
 
-// postMarkdown posts text in channel in a markdown block, with text as
-// the plain text too, and opts.
+// postMarkdown posts text in channel in a markdown block, its thread keys
+// linked, with text as given as the plain text, and opts.
 func (w *Web) postMarkdown(ctx context.Context, channel, text string, opts ...slackgo.MsgOption) (string, error) {
-	return w.post(ctx, channel, append(opts, slackgo.MsgOptionText(text, false), slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", text)))...)
+	return w.post(ctx, channel, append(opts, slackgo.MsgOptionText(text, false), slackgo.MsgOptionBlocks(slackgo.NewMarkdownBlock("", w.linkThreadKeys(ctx, text))))...)
 }
 
 // post posts a message with opts in channel and returns its ts.
