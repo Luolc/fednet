@@ -700,7 +700,7 @@ func TestRequestRoute(t *testing.T) {
 		{"no agent", Request{Cmd: RequestRoute, Text: "x", Route: &RouteRequest{Channel: "C1", Machine: "workstation"}}, link.ErrBadRequest},
 		{"no text", Request{Cmd: RequestRoute, Agent: "a", Route: &RouteRequest{Channel: "C1", Machine: "workstation"}}, link.ErrBadRequest},
 		{"no route", Request{Cmd: RequestRoute, Agent: "a", Text: "x"}, link.ErrBadRequest},
-		{"not a channel id", req(RouteRequest{Channel: "#repo-fednet", Machine: "workstation"}), link.ErrBadRequest},
+		{"not a channel id", req(RouteRequest{Channel: "#repo-example", Machine: "workstation"}), link.ErrBadRequest},
 		{"a scope out of [a-z0-9-]", req(RouteRequest{Channel: "C1", Machine: "workstation", Scope: "Control_Plane"}), link.ErrBadRequest},
 		{"an unknown machine", req(RouteRequest{Channel: "C1", Machine: "nobody"}), link.ErrBadRequest},
 		{"a revoked machine", req(RouteRequest{Channel: "C1", Machine: "retired"}), link.ErrBadRequest},
