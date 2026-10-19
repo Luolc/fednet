@@ -202,9 +202,14 @@ func TestRelay(t *testing.T) {
 	if e := stderr.String()[errStart:]; !strings.Contains(e, "the hub's relay list does not let client other deliver to datamachine") {
 		t.Fatalf("stderr of the unlisted machine's post = %q, want the reason", e)
 	}
-	// A text too long to relay is refused before it is queued, saying why.
+	// A text the post carries but its relay, with what the hub adds, does
+	// not is refused before it is queued, saying why.
+	post, err := json.Marshal(payload.Message{Type: payload.Post, Thread: thread, Text: "x", Deliver: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	errStart = len(stderr.String())
-	if code, _ := cli("post", "-socket", machines["workstation"].socket, "-thread", thread, "-deliver", strings.Repeat("x", link.MaxPayload)); code != 3 {
+	if code, _ := cli("post", "-socket", machines["workstation"].socket, "-thread", thread, "-deliver", strings.Repeat("x", link.MaxPayload-len(post)+1)); code != 3 {
 		t.Fatalf("post -deliver of a text too long to relay: exit %d, want 3", code)
 	}
 	if e := stderr.String()[errStart:]; !strings.Contains(e, "the message is too long to relay") {

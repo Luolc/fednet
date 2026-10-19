@@ -1277,7 +1277,14 @@ func TestCheckRelay(t *testing.T) {
 	if err := s.Store.Claim(ctx, "C1/1.0", "datamachine", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	long := strings.Repeat("x", link.MaxPayload)
+	// fits is the longest text whose relay, as the delivery writes it with
+	// the ts the post will have, fits down the link.
+	relay, err := json.Marshal(payload.Message{Type: payload.Inbound, Thread: "C1/1.0", Text: "x", TS: "1700000000.000100", Trigger: payload.Relay, FromClient: "workstation", Hop: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fits := strings.Repeat("x", link.MaxPayload-len(relay)+1)
+	long := fits + "x"
 	for _, tt := range []struct {
 		client, thread, text string
 		want                 error
@@ -1286,6 +1293,7 @@ func TestCheckRelay(t *testing.T) {
 		{"datamachine", "C1/1.0", "hi", nil},
 		{"datamachine", "C1/1.0", long, nil},
 		{"other", "C1/1.0", "hi", link.ErrDenied},
+		{"workstation", "C1/1.0", fits, nil},
 		{"workstation", "C1/1.0", long, link.ErrDenied},
 		{"workstation", "C1/2.0", "hi", link.ErrNotFound},
 		{"workstation", "C1", "hi", link.ErrBadRequest},
@@ -1296,7 +1304,7 @@ func TestCheckRelay(t *testing.T) {
 		}
 	}
 	// The refusal says why in words, which the client prints.
-	_, err := answer(t, s, "workstation", Request{Cmd: CheckRelay, Thread: "C1/1.0", Text: long})
+	_, err = answer(t, s, "workstation", Request{Cmd: CheckRelay, Thread: "C1/1.0", Text: long})
 	if err == nil || !strings.Contains(err.Error(), "not delivered to datamachine: the message is too long to relay") {
 		t.Errorf("check-relay of a text too long = %v, want the reason in words", err)
 	}
