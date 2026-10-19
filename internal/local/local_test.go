@@ -483,7 +483,7 @@ func TestPostToDeliver(t *testing.T) {
 		if err := json.Unmarshal(req, &r); err != nil {
 			return nil, err
 		}
-		if r.Cmd != hubapi.CheckRelay || r.Thread != "C1/1700000000.000100" {
+		if r.Cmd != hubapi.CheckRelay || r.Thread != "C1/1700000000.000100" || r.Text != "report" {
 			return nil, link.Refuse(link.ErrDenied, "no")
 		}
 		return []byte(`{}`), nil

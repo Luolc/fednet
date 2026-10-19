@@ -1268,26 +1268,48 @@ func TestOpenThreadForRoute(t *testing.T) {
 }
 
 // check-relay lets a client deliver in a thread whose owner it is, or
-// whose owner the relay list lets it deliver to; a thread with no owner
-// is not found.
+// whose owner the relay list lets it deliver to, with a text short enough
+// to relay; a thread with no owner is not found.
 func TestCheckRelay(t *testing.T) {
+	ctx := t.Context()
 	s, _ := testServer(t)
 	s.Relays = route.Relays{"workstation": {"datamachine"}}
-	if err := s.Store.Claim(t.Context(), "C1/1.0", "datamachine", "", ""); err != nil {
+	if err := s.Store.Claim(ctx, "C1/1.0", "datamachine", "", ""); err != nil {
 		t.Fatal(err)
 	}
+	// fits is the longest text whose relay, as the delivery writes it with
+	// the ts the post will have, fits down the link.
+	relay, err := json.Marshal(payload.Message{Type: payload.Inbound, Thread: "C1/1.0", Text: "x", TS: "1700000000.000100", Trigger: payload.Relay, FromClient: "workstation", Hop: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fits := strings.Repeat("x", link.MaxPayload-len(relay)+1)
+	long := fits + "x"
 	for _, tt := range []struct {
-		client, thread string
-		want           error
+		client, thread, text string
+		want                 error
 	}{
-		{"workstation", "C1/1.0", nil},
-		{"datamachine", "C1/1.0", nil},
-		{"other", "C1/1.0", link.ErrDenied},
-		{"workstation", "C1/2.0", link.ErrNotFound},
-		{"workstation", "C1", link.ErrBadRequest},
+		{"workstation", "C1/1.0", "hi", nil},
+		{"datamachine", "C1/1.0", "hi", nil},
+		{"datamachine", "C1/1.0", long, nil},
+		{"other", "C1/1.0", "hi", link.ErrDenied},
+		{"workstation", "C1/1.0", fits, nil},
+		{"workstation", "C1/1.0", long, link.ErrDenied},
+		{"workstation", "C1/2.0", "hi", link.ErrNotFound},
+		{"workstation", "C1", "hi", link.ErrBadRequest},
 	} {
-		if _, err := answer(t, s, tt.client, Request{Cmd: CheckRelay, Thread: tt.thread}); !errors.Is(err, tt.want) {
-			t.Errorf("check-relay by %s in %s = %v, want %v", tt.client, tt.thread, err, tt.want)
+		_, err := answer(t, s, tt.client, Request{Cmd: CheckRelay, Thread: tt.thread, Text: tt.text})
+		if !errors.Is(err, tt.want) {
+			t.Errorf("check-relay by %s in %s with %d characters = %v, want %v", tt.client, tt.thread, len(tt.text), err, tt.want)
 		}
+	}
+	// The refusal says why in words, which the client prints.
+	_, err = answer(t, s, "workstation", Request{Cmd: CheckRelay, Thread: "C1/1.0", Text: long})
+	if err == nil || !strings.Contains(err.Error(), "not delivered to datamachine: the message is too long to relay") {
+		t.Errorf("check-relay of a text too long = %v, want the reason in words", err)
+	}
+	// Checking queues nothing.
+	if n := len(queued(t, s, "datamachine")); n != 0 {
+		t.Errorf("after check-relay: %d queued for datamachine, want none", n)
 	}
 }

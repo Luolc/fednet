@@ -182,9 +182,13 @@ commands:
         in the thread, this one included); nothing when this machine owns
         the thread; the hub must be reachable to check, before the post is
         queued, that its relay list lets this machine deliver to the owner
-        (else exits 3; 1 when the thread has no owner); a person posting in
-        the thread starts the hop count again; -deliver takes no -footer or
-        -file
+        and that TEXT is not too long to relay (else exits 3, saying why; 1
+        when the thread has no owner); a hub older than that checks the
+        relay list only; a person posting in the thread starts the hop
+        count again; a relay the hub refuses once the post is in Slack is
+        not delivered, and the hub tells this machine with a message of
+        trigger refused, says so in the thread and alerts; -deliver takes
+        no -footer or -file
   client delete -socket PATH [-json] MSG-ID
         delete from Slack the post that client post queued under MSG-ID,
         every message it went out as; only a post from this machine; exits

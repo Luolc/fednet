@@ -15,6 +15,7 @@ import (
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/inbound"
+	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
@@ -194,8 +195,28 @@ func TestRelay(t *testing.T) {
 		m.Text != "job for the data machine" || m.TS != root || m.ChannelName != "data-jobs" {
 		t.Fatalf("handoff = %+v", m)
 	}
+	errStart := len(stderr.String())
 	if code, _ := cli("post", "-socket", machines["other"].socket, "-thread", thread, "-deliver", "not mine"); code != 3 {
 		t.Fatalf("post -deliver from an unlisted machine: exit %d, want 3", code)
+	}
+	if e := stderr.String()[errStart:]; !strings.Contains(e, "the hub's relay list does not let client other deliver to datamachine") {
+		t.Fatalf("stderr of the unlisted machine's post = %q, want the reason", e)
+	}
+	// A text the post carries but its relay, with what the hub adds, does
+	// not is refused before it is queued, saying why.
+	post, err := json.Marshal(payload.Message{Type: payload.Post, Thread: thread, Text: "x", Deliver: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errStart = len(stderr.String())
+	if code, _ := cli("post", "-socket", machines["workstation"].socket, "-thread", thread, "-deliver", strings.Repeat("x", link.MaxPayload-len(post)+1)); code != 3 {
+		t.Fatalf("post -deliver of a text too long to relay: exit %d, want 3", code)
+	}
+	if e := stderr.String()[errStart:]; !strings.Contains(e, "the message is too long to relay") {
+		t.Fatalf("stderr of the refused post = %q, want the reason", e)
+	}
+	if ms, _ := f.Replies(ctx, "C2", root); len(ms) != 1 {
+		t.Fatalf("the thread has %d messages after the refused post, want 1", len(ms))
 	}
 
 	// The data machine owns this thread: its own post there is delivered
