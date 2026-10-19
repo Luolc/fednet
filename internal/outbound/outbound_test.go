@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -537,8 +538,8 @@ func TestClientAlertIsRelayed(t *testing.T) {
 // A post to deliver goes to Slack as any post, then is queued for the
 // thread's owner as a relay with the ts it went out at, and the downlinks
 // are woken; the owner's own is queued for no one; one the relay list
-// does not allow is in Slack all the same, delivered to no one, and
-// alerted.
+// does not allow is in Slack all the same, delivered to no one, told
+// to its machine and in the thread, and alerted.
 func TestDeliver(t *testing.T) {
 	f := newFixture(t)
 	ctx := t.Context()
@@ -573,8 +574,9 @@ func TestDeliver(t *testing.T) {
 		t.Fatal(err)
 	}
 	replies := f.replies()
-	if got := texts(replies); !slices.Equal(got, []string{"report", "my own", "not allowed"}) {
-		t.Fatalf("thread = %q, want all three", got)
+	line := "The post above from other was not delivered to datamachine: the hub's relay list does not let the sender deliver to the thread's owner. other has been told."
+	if got := texts(replies); !slices.Equal(got, []string{"report", "my own", "not allowed", line}) {
+		t.Fatalf("thread = %q, want all three and the line on the refused one", got)
 	}
 	if u := f.undelivered(); len(u) != 0 {
 		t.Fatalf("undelivered = %v, want none", u)
@@ -594,12 +596,96 @@ func TestDeliver(t *testing.T) {
 	if !reflect.DeepEqual(m, want) {
 		t.Fatalf("queued = %+v, want %+v", m, want)
 	}
-	if woken != 1 {
-		t.Fatalf("downlinks woken %d times, want 1", woken)
+	notice := payload.Message{Type: payload.Inbound, Thread: f.thread, TS: replies[2].TS, Trigger: payload.Refused,
+		Text: "Your post " + refused + " in this thread was not delivered to datamachine: the hub's relay list does not let the sender deliver to the thread's owner."}
+	if got := queuedFor(t, f.st, "other"); !reflect.DeepEqual(got, []payload.Message{notice}) {
+		t.Fatalf("queued for other = %+v, want the notice %+v", got, notice)
+	}
+	if got := queuedFor(t, f.st, "workstation"); len(got) != 0 {
+		t.Fatalf("queued for workstation = %+v, want nothing", got)
+	}
+	if woken != 2 {
+		t.Fatalf("downlinks woken %d times, want 2", woken)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(alerts) != 1 || !strings.Contains(alerts[0], "relay from other") || !strings.Contains(alerts[0], refused) {
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "relay from other to datamachine in channel C1 (<https://slack.example.invalid/archives/C1/p"+replies[2].TS+"|open in Slack>) not delivered") || !strings.Contains(alerts[0], refused) {
 		t.Fatalf("alerts = %q, want one for %s", alerts, refused)
 	}
+}
+
+// A relay past the hop limit, which the client could not see when it
+// queued the post, is in Slack all the same: the hub tells the machine
+// that posted it, says so in the thread and alerts with the channel's
+// name, a link and the reason; under the limit it is delivered.
+func TestDeliverAtHopLimit(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	var mu sync.Mutex
+	var alerts []string
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m struct{ Text string }
+		json.NewDecoder(r.Body).Decode(&m)
+		mu.Lock()
+		alerts = append(alerts, m.Text)
+		mu.Unlock()
+	}))
+	defer hook.Close()
+	f.p.Alert = &alert.Webhook{URL: hook.URL, From: "fednet-hub"}
+	f.p.Relays = route.Relays{"workstation": {"datamachine"}}
+	if err := f.st.Claim(ctx, f.thread, "datamachine", "ops", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.SetHop(ctx, f.thread, route.MaxHop-1); err != nil {
+		t.Fatal(err)
+	}
+	put := func(text string) string {
+		b, err := json.Marshal(payload.Message{Type: payload.Post, Thread: f.thread, Text: text, Deliver: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.putRaw("workstation", b)
+	}
+	put("the last one")
+	over := put("one too many")
+	if err := f.p.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replies := f.replies()
+	reason := fmt.Sprintf("the thread has had %d relays in a row, the most the hub delivers; a person posting in the thread starts the count again", route.MaxHop)
+	if got := texts(replies); !slices.Equal(got, []string{"the last one", "one too many", "The post above from workstation was not delivered to datamachine: " + reason + ". workstation has been told."}) {
+		t.Fatalf("thread = %q, want both posts and the line on the second", got)
+	}
+	if got := queuedFor(t, f.st, "datamachine"); len(got) != 1 || got[0].Text != "the last one" || got[0].Hop != route.MaxHop {
+		t.Fatalf("queued for datamachine = %+v, want the first at hop %d", got, route.MaxHop)
+	}
+	notice := payload.Message{Type: payload.Inbound, Thread: f.thread, TS: replies[1].TS, Trigger: payload.Refused,
+		Text: "Your post " + over + " in this thread was not delivered to datamachine: " + reason + "."}
+	if got := queuedFor(t, f.st, "workstation"); !reflect.DeepEqual(got, []payload.Message{notice}) {
+		t.Fatalf("queued for workstation = %+v, want the notice %+v", got, notice)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := "[fednet-hub] relay from workstation to datamachine in #ops (<https://slack.example.invalid/archives/C1/p" + replies[1].TS + "|open in Slack>) not delivered: " + reason + " (msg_id " + over + ")"
+	if !slices.Equal(alerts, []string{want}) {
+		t.Fatalf("alerts = %q, want %q", alerts, want)
+	}
+}
+
+// queuedFor returns the messages queued for client, in order.
+func queuedFor(t *testing.T, st *store.Hub, client string) []payload.Message {
+	t.Helper()
+	ds, err := st.Outbox.After(t.Context(), client, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ms []payload.Message
+	for _, d := range ds {
+		var m payload.Message
+		if err := json.Unmarshal(d.Payload, &m); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, m)
+	}
+	return ms
 }

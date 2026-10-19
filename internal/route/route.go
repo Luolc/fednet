@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/Luolc/fednet/internal/link"
@@ -117,41 +118,80 @@ func (rs Relays) Allow(from, to string) bool { return slices.Contains(rs[from], 
 // delivered. Nothing is queued when relays does not let from deliver to
 // the owner (ErrRelayDenied), when the thread has had MaxHop relays in a
 // row (ErrHopLimit) or when the message is too long for the link
-// (ErrTooLong).
+// (ErrTooLong); the owner is returned with these errors too.
 func (r *Router) Deliver(ctx context.Context, relays Relays, from, thread string, m payload.Message) (string, error) {
-	owner, err := r.hub.Owner(ctx, thread)
-	if errors.Is(err, store.ErrNotFound) {
-		return "", ErrNoOwner
-	}
-	if err != nil || owner == from {
-		return "", err
-	}
-	if !relays.Allow(from, owner) {
-		return "", ErrRelayDenied
-	}
-	hop, err := r.hub.Hop(ctx, thread)
+	owner, b, err := r.prepare(ctx, relays, from, thread, &m)
 	if err != nil {
-		return "", err
+		return owner, err
 	}
-	if hop >= MaxHop {
-		return "", ErrHopLimit
-	}
-	m.FromClient, m.Hop = from, hop+1
-	if m.Scope, err = r.hub.ThreadScope(ctx, thread); err != nil {
-		return "", err
-	}
-	if m.ChannelName, err = r.hub.ChannelName(ctx, thread); err != nil {
-		return "", err
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	if len(b) > link.MaxPayload {
-		return "", ErrTooLong
+	if owner == from {
+		return "", nil
 	}
 	if _, err := r.hub.Outbox.Enqueue(ctx, owner, b); err != nil {
 		return "", err
 	}
 	return owner, r.hub.SetHop(ctx, thread, m.Hop)
+}
+
+// Check returns the error Deliver would return for the same arguments,
+// queueing and recording nothing.
+func (r *Router) Check(ctx context.Context, relays Relays, from, thread string, m payload.Message) (string, error) {
+	owner, _, err := r.prepare(ctx, relays, from, thread, &m)
+	if owner == from {
+		return "", err
+	}
+	return owner, err
+}
+
+// prepare fills in m as Deliver queues it and returns the owner and m as
+// JSON; nothing when from is the owner.
+func (r *Router) prepare(ctx context.Context, relays Relays, from, thread string, m *payload.Message) (string, []byte, error) {
+	owner, err := r.hub.Owner(ctx, thread)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", nil, ErrNoOwner
+	}
+	if err != nil || owner == from {
+		return owner, nil, err
+	}
+	if !relays.Allow(from, owner) {
+		return owner, nil, ErrRelayDenied
+	}
+	hop, err := r.hub.Hop(ctx, thread)
+	if err != nil {
+		return "", nil, err
+	}
+	if hop >= MaxHop {
+		return owner, nil, ErrHopLimit
+	}
+	m.FromClient, m.Hop = from, hop+1
+	if m.Scope, err = r.hub.ThreadScope(ctx, thread); err != nil {
+		return "", nil, err
+	}
+	if m.ChannelName, err = r.hub.ChannelName(ctx, thread); err != nil {
+		return "", nil, err
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(b) > link.MaxPayload {
+		return owner, nil, ErrTooLong
+	}
+	return owner, b, nil
+}
+
+// Reason says in plain words why Deliver delivered nothing, for a person
+// or an agent to read: err is one of its refusals, or ErrNoOwner.
+func Reason(err error) string {
+	switch {
+	case errors.Is(err, ErrHopLimit):
+		return fmt.Sprintf("the thread has had %d relays in a row, the most the hub delivers; a person posting in the thread starts the count again", MaxHop)
+	case errors.Is(err, ErrTooLong):
+		return fmt.Sprintf("the message is too long to relay: with what the hub adds, it is over the %d KiB a message down the link may carry", link.MaxPayload>>10)
+	case errors.Is(err, ErrNoOwner):
+		return "the thread has no owner to deliver to"
+	case errors.Is(err, ErrRelayDenied):
+		return "the hub's relay list does not let the sender deliver to the thread's owner"
+	}
+	return err.Error()
 }

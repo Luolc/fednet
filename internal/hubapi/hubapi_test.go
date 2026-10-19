@@ -1232,7 +1232,7 @@ func TestOpenThreadForRoute(t *testing.T) {
 		alerts = append(alerts, text)
 		return nil
 	}
-	if err := s.Store.Claim(ctx, "C9/1.0", "workstation", "", ""); err != nil {
+	if err := s.Store.Claim(ctx, "C9/1.0", "workstation", "ops", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop-1); err != nil {
@@ -1269,8 +1269,10 @@ func TestOpenThreadForRoute(t *testing.T) {
 	if posts.n != 3 || len(queued(t, s, "datamachine")) != 2 {
 		t.Fatalf("Slack got %d posts and %d are queued, want 3 and 2", posts.n, len(queued(t, s, "datamachine")))
 	}
-	if len(alerts) != 1 || !strings.Contains(alerts[0], "out of thread C9/1.0 not delivered") {
-		t.Fatalf("alerts = %q, want one for C9/1.0", alerts)
+	// The alert names the channel, links the thread and says why in words.
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "out of #ops (<https://slack.example.invalid/archives/C9/p1.0|open in Slack>) not delivered") ||
+		!strings.Contains(alerts[0], "a person posting in the thread starts the count again") {
+		t.Fatalf("alerts = %q, want one for #ops with its link and the reason", alerts)
 	}
 	// The route's machine opening a thread of its own delivers nothing,
 	// so the hop of the thread it names does not matter.
@@ -1283,26 +1285,49 @@ func TestOpenThreadForRoute(t *testing.T) {
 }
 
 // check-relay lets a client deliver in a thread whose owner it is, or
-// whose owner the relay list lets it deliver to; a thread with no owner
-// is not found.
+// whose owner the relay list lets it deliver to, below the hop limit and
+// with a text short enough to relay; a thread with no owner is not found.
 func TestCheckRelay(t *testing.T) {
+	ctx := t.Context()
 	s, _ := testServer(t)
 	s.Relays = route.Relays{"workstation": {"datamachine"}}
-	if err := s.Store.Claim(t.Context(), "C1/1.0", "datamachine", "", ""); err != nil {
+	for _, thread := range []string{"C1/1.0", "C1/3.0"} {
+		if err := s.Store.Claim(ctx, thread, "datamachine", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Store.SetHop(ctx, "C1/1.0", route.MaxHop-1); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Store.SetHop(ctx, "C1/3.0", route.MaxHop); err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("x", link.MaxPayload)
 	for _, tt := range []struct {
-		client, thread string
-		want           error
+		client, thread, text string
+		want                 error
 	}{
-		{"workstation", "C1/1.0", nil},
-		{"datamachine", "C1/1.0", nil},
-		{"other", "C1/1.0", link.ErrDenied},
-		{"workstation", "C1/2.0", link.ErrNotFound},
-		{"workstation", "C1", link.ErrBadRequest},
+		{"workstation", "C1/1.0", "hi", nil},
+		{"datamachine", "C1/1.0", "hi", nil},
+		{"datamachine", "C1/3.0", long, nil},
+		{"other", "C1/1.0", "hi", link.ErrDenied},
+		{"workstation", "C1/3.0", "hi", link.ErrDenied},
+		{"workstation", "C1/1.0", long, link.ErrDenied},
+		{"workstation", "C1/2.0", "hi", link.ErrNotFound},
+		{"workstation", "C1", "hi", link.ErrBadRequest},
 	} {
-		if _, err := answer(t, s, tt.client, Request{Cmd: CheckRelay, Thread: tt.thread}); !errors.Is(err, tt.want) {
-			t.Errorf("check-relay by %s in %s = %v, want %v", tt.client, tt.thread, err, tt.want)
+		_, err := answer(t, s, tt.client, Request{Cmd: CheckRelay, Thread: tt.thread, Text: tt.text})
+		if !errors.Is(err, tt.want) {
+			t.Errorf("check-relay by %s in %s with %d characters = %v, want %v", tt.client, tt.thread, len(tt.text), err, tt.want)
 		}
+	}
+	// The refusal says why in words, which the client prints.
+	_, err := answer(t, s, "workstation", Request{Cmd: CheckRelay, Thread: "C1/3.0", Text: "hi"})
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("not delivered to datamachine: the thread has had %d relays in a row", route.MaxHop)) {
+		t.Errorf("check-relay at the hop limit = %v, want the reason in words", err)
+	}
+	// Checking delivers and counts nothing.
+	if hop, err := s.Store.Hop(ctx, "C1/1.0"); err != nil || hop != route.MaxHop-1 || len(queued(t, s, "datamachine")) != 0 {
+		t.Errorf("after check-relay: hop %d, %v, %d queued; want %d and none", hop, err, len(queued(t, s, "datamachine")), route.MaxHop-1)
 	}
 }

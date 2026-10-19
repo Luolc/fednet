@@ -17,7 +17,8 @@ const (
 	// Progress sets or closes the progress card of a thread.
 	Progress = "progress"
 	// Inbound is a message a person posted in a Slack thread, sent down to
-	// the thread's owner.
+	// the thread's owner; or, of trigger Relay or Refused, what the hub
+	// sends down about a post an agent asked it to deliver.
 	Inbound = "message"
 	// Alert is an alert a client raises, such as a dead letter, for the
 	// hub to send to the alerts webhook, which only the hub knows.
@@ -64,6 +65,10 @@ const (
 	// Relay is a post another machine made in a thread the client owns
 	// and asked the hub to deliver to it.
 	Relay = "relay"
+	// Refused tells the client that a post it asked the hub to deliver
+	// was not: Text says why, in plain words, and TS is the post's ts
+	// in Thread. It is not a person's message.
+	Refused = "refused"
 )
 
 // File is a file uploaded with a message. ID is Slack's id of the file,
@@ -151,7 +156,7 @@ type Message struct {
 	// its default.
 	Scope string `json:"scope,omitempty"`
 	// Trigger says why an inbound message was sent: Mention, Reply, DM,
-	// Handoff or Relay.
+	// Handoff, Relay or Refused.
 	Trigger string `json:"trigger,omitempty"`
 	// FromClient and Hop are set on a Handoff or a Relay: the client that
 	// sent it, as the hub authenticated it, and how many relays in a row

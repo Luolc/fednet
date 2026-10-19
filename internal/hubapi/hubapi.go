@@ -62,9 +62,11 @@ const (
 	// when the requesting client is that machine, which nothing is
 	// delivered to.
 	OpenThreadForRoute = "open-thread-route"
-	// CheckRelay checks that the requesting client may deliver its posts
-	// in Thread to the thread's owner, before it queues a post to deliver.
-	// A hub that answers it also delivers such a post.
+	// CheckRelay checks that the requesting client may deliver its post
+	// of Text in Thread to the thread's owner, before it queues the post
+	// to deliver: the relay list, the hop limit and the length. A hub that
+	// answers it also delivers such a post. A hub from before it checked
+	// the hop limit and the length here checks only the relay list.
 	CheckRelay = "check-relay"
 	// Threads returns the threads the requesting client owns.
 	Threads = "threads"
@@ -701,31 +703,38 @@ func (s *Server) fromThread(ctx context.Context, client, owner string, r Request
 	}
 	slog.Error("hubapi: handoff not delivered", "client", client, "to", owner, "from_thread", r.Thread, "err", route.ErrHopLimit)
 	if s.Alert != nil {
-		if err := s.Alert(ctx, fmt.Sprintf("handoff from %s to %s out of thread %s not delivered: %v", client, owner, r.Thread, route.ErrHopLimit)); err != nil {
+		text := fmt.Sprintf("handoff from %s to %s out of %s not delivered: %s", client, owner, outbound.ThreadRef(ctx, s.Store, s.Slack, r.Thread, ""), route.Reason(route.ErrHopLimit))
+		if err := s.Alert(ctx, text); err != nil {
 			slog.Warn("hubapi: alert", "err", err)
 		}
 	}
-	return 0, link.Refuse(link.ErrDenied, "thread %s has had %d relays in a row since a person last posted in it, the most the hub delivers", r.Thread, route.MaxHop)
+	return 0, link.Refuse(link.ErrDenied, "handoff out of thread %s not delivered: %s", r.Thread, route.Reason(route.ErrHopLimit))
 }
 
-// checkRelay refuses unless client may deliver its posts in r.Thread:
-// the thread has an owner, and it is client or one the relay list lets
-// client deliver to. How many relays in a row the thread has had is left
-// to the delivery, which is when it counts.
+// checkRelay refuses unless client may deliver its post in r.Thread now,
+// as the delivery would check once the post is in Slack: the thread has
+// an owner, the relay list lets client deliver to it, the thread is not
+// at the hop limit, and r.Text, the post's text, is not too long to
+// relay. A post in a thread client owns is delivered to no one, and
+// passes. The delivery checks again, since the thread may change between.
 func (s *Server) checkRelay(ctx context.Context, client string, r Request) error {
 	if _, _, err := thread(r); err != nil {
 		return err
 	}
-	owner, err := s.Store.Owner(ctx, r.Thread)
+	// tsPlaceholder is as long as the ts the post will have, which counts
+	// towards the length of what is relayed.
+	const tsPlaceholder = "0000000000.000000"
+	m := payload.Message{Type: payload.Inbound, Thread: r.Thread, Text: r.Text, TS: tsPlaceholder, Trigger: payload.Relay}
+	owner, err := route.New(s.Store).Check(ctx, s.Relays, client, r.Thread, m)
 	switch {
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, route.ErrNoOwner):
 		return link.Refuse(link.ErrNotFound, "thread %s has no owner", r.Thread)
-	case err != nil:
-		return err
-	case owner != client && !s.Relays.Allow(client, owner):
+	case errors.Is(err, route.ErrRelayDenied):
 		return link.Refuse(link.ErrDenied, "the hub's relay list does not let client %s deliver to %s, the owner of %s", client, owner, r.Thread)
+	case errors.Is(err, route.ErrHopLimit), errors.Is(err, route.ErrTooLong):
+		return link.Refuse(link.ErrDenied, "not delivered to %s: %s", owner, route.Reason(err))
 	}
-	return nil
+	return err
 }
 
 func (s *Server) adopt(ctx context.Context, client string, r Request) error {

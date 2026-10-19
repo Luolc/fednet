@@ -23,7 +23,8 @@
 // it for the thread's owner as an inbound message of trigger relay, in the
 // same transaction as it marks the post delivered, unless the poster owns
 // the thread. The relay list and the hop limit are checked then; a relay
-// they refuse is alerted and logged, and the post stays in Slack.
+// they refuse stays in Slack, and the hub tells the poster's machine in
+// that transaction, says so in a line in the thread, alerts and logs.
 //
 // The inbox also holds the alerts clients raise, which only the hub can
 // send, since only the hub has the webhook: each goes to the webhook as
@@ -214,13 +215,16 @@ func (p *Poster) Pass(ctx context.Context) error {
 
 // deliver, for u, a post in Slack that asks to be delivered, queues it for
 // its thread's owner and marks it delivered, in one transaction; marking
-// it again after is harmless. A relay that cannot be delivered is alerted.
+// it again after is harmless. A relay refused is told to the client that
+// posted it, as an inbound message of trigger payload.Refused queued in
+// that transaction, then said in a line in the thread and alerted; the
+// line and the alert are not tried again.
 func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 	var m payload.Message
 	if json.Unmarshal(u.Payload, &m) != nil || m.Type != payload.Post || !m.Deliver {
 		return nil
 	}
-	var to string
+	var to, ts string
 	var refused error
 	err := p.record(ctx, func() error {
 		refused = nil
@@ -229,13 +233,22 @@ func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 			if err != nil {
 				return err
 			}
-			in := payload.Message{Type: payload.Inbound, Thread: m.Thread, Text: m.Text, Trigger: payload.Relay}
 			if len(posted.TS) > 0 {
-				in.TS = posted.TS[0]
+				ts = posted.TS[0]
 			}
+			in := payload.Message{Type: payload.Inbound, Thread: m.Thread, Text: m.Text, TS: ts, Trigger: payload.Relay}
 			to, err = route.New(tx).Deliver(ctx, p.Relays, u.Client, m.Thread, in)
 			if errors.Is(err, route.ErrNoOwner) || errors.Is(err, route.ErrRelayDenied) || errors.Is(err, route.ErrHopLimit) || errors.Is(err, route.ErrTooLong) {
 				refused, err = err, nil
+				notice := payload.Message{Type: payload.Inbound, Thread: m.Thread, TS: ts, Trigger: payload.Refused,
+					Text: fmt.Sprintf("Your post %s in this thread was not delivered to %s: %s.", u.MsgID, owner(to), route.Reason(refused))}
+				b, err := json.Marshal(notice)
+				if err != nil {
+					return err
+				}
+				if _, err := tx.Outbox.Enqueue(ctx, u.Client, b); err != nil {
+					return err
+				}
 			}
 			if err != nil {
 				return err
@@ -247,9 +260,19 @@ func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 	case err != nil:
 		return err
 	case refused != nil:
-		slog.Error("outbound: relay not delivered", "msg_id", u.MsgID, "client", u.Client, "thread", m.Thread, "err", refused)
+		if p.Stored != nil {
+			p.Stored()
+		}
+		slog.Error("outbound: relay not delivered", "msg_id", u.MsgID, "client", u.Client, "to", to, "thread", m.Thread, "err", refused)
+		if channel, root, ok := slack.ParseThreadKey(m.Thread); ok {
+			line := fmt.Sprintf("The post above from %s was not delivered to %s: %s. %s has been told.", u.Client, owner(to), route.Reason(refused), u.Client)
+			if _, err := p.Slack.PostReply(ctx, channel, root, line); err != nil {
+				slog.Warn("outbound: saying in the thread that a relay was not delivered", "msg_id", u.MsgID, "err", err)
+			}
+		}
 		if p.Alert != nil {
-			if aerr := p.Alert.Send(ctx, fmt.Sprintf("relay from %s in thread %s not delivered: msg_id %s: %v", u.Client, m.Thread, u.MsgID, refused)); aerr != nil {
+			text := fmt.Sprintf("relay from %s to %s in %s not delivered: %s (msg_id %s)", u.Client, owner(to), ThreadRef(ctx, p.Store, p.Slack, m.Thread, ts), route.Reason(refused), u.MsgID)
+			if aerr := p.Alert.Send(ctx, text); aerr != nil {
 				slog.Warn("outbound: alert", "msg_id", u.MsgID, "err", aerr)
 			}
 		}
@@ -257,6 +280,41 @@ func (p *Poster) deliver(ctx context.Context, u store.Uplink) error {
 		p.Stored()
 	}
 	return nil
+}
+
+// owner names client, the owner of a thread a relay was refused in, for
+// a person: "any machine" when the thread has none.
+func owner(client string) string {
+	if client == "" {
+		return "any machine"
+	}
+	return client
+}
+
+// ThreadRef names thread for an alert: its channel, by the name recorded
+// with the thread's owner or else by id, and a link to the message at ts
+// in it, or to the thread's first message when ts is empty, in the
+// alert webhook's syntax; without the link when Slack gives none.
+func ThreadRef(ctx context.Context, st *store.Hub, api slack.API, thread, ts string) string {
+	channel, root, ok := slack.ParseThreadKey(thread)
+	if !ok {
+		return "thread " + thread
+	}
+	where := "channel " + channel
+	if name, err := st.ChannelName(ctx, thread); err == nil && name != "" {
+		where = "#" + name
+	}
+	if ts == "" {
+		ts = root
+	}
+	if api == nil {
+		return where
+	}
+	link, err := api.Permalink(ctx, channel, ts)
+	if err != nil || link == "" {
+		return where
+	}
+	return fmt.Sprintf("%s (<%s|open in Slack>)", where, link)
 }
 
 // record runs write, a store write about something already in Slack,

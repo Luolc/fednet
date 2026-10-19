@@ -447,7 +447,7 @@ func (s *Server) post(ctx context.Context, req Request) Response {
 		if s.Request == nil {
 			return badRequest("post to deliver is not served on this socket")
 		}
-		if res := s.ask(ctx, Request{Cmd: hubapi.CheckRelay, Thread: req.Thread}); res.Error != "" {
+		if res := s.ask(ctx, Request{Cmd: hubapi.CheckRelay, Thread: req.Thread, Text: req.Text}); res.Error != "" {
 			res.Error = "post: " + res.Error
 			return res
 		}
