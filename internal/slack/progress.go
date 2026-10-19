@@ -96,9 +96,14 @@ func (w *Web) UpdateProgress(ctx context.Context, channel, ts string, p Progress
 }
 
 // PostFooter posts a message of a single context block, whose text is
-// Footer's mrkdwn; the plain text is Footer's plain version.
+// Footer's mrkdwn of text with its thread keys linked, unless that takes
+// it over MaxFooterChars; the plain text is Footer's plain version of
+// text as given.
 func (w *Web) PostFooter(ctx context.Context, channel, ts, text string) (string, error) {
 	mrkdwn, plain := Footer(text)
+	if linked := w.linkThreadKeys(ctx, text); FooterFits(linked) {
+		mrkdwn, _ = Footer(linked)
+	}
 	block := slackgo.NewContextBlock("", slackgo.NewTextBlockObject(slackgo.MarkdownType, mrkdwn, false, false))
 	var posted string
 	err := w.call(ctx, "chat.postMessage", func() (err error) {
