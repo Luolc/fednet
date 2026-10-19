@@ -35,6 +35,10 @@ type QuestionCard struct {
 	Note   string
 	// Warning, on a card that waits, is a line shown above submit.
 	Warning string
+
+	// markdown, when set, is the card's markdown blocks to show, in the
+	// order questionMarkdown gives them.
+	markdown []string
 }
 
 // States of a QuestionCard besides the outcomes of an answer.
@@ -159,11 +163,12 @@ func questionBlocks(c QuestionCard) []slackgo.Block {
 	if c.State == QuestionMoved {
 		return append(bs, slackgo.NewSectionBlock(mrkdwn("💤 已延后，卡片重发在下方"), nil, nil), idLine)
 	}
-	if q.Context != "" {
-		bs = append(bs, slackgo.NewMarkdownBlock("", q.Context))
+	md := c.markdown
+	if md == nil {
+		md = questionMarkdown(q)
 	}
-	for i := range q.Options {
-		bs = append(bs, slackgo.NewMarkdownBlock("", q.OptionMarkdown(i)))
+	for _, s := range md {
+		bs = append(bs, slackgo.NewMarkdownBlock("", s))
 	}
 	bs = append(bs, slackgo.NewDividerBlock())
 	switch c.State {
@@ -203,6 +208,19 @@ func questionBlocks(c QuestionCard) []slackgo.Block {
 		slackgo.NewRichTextBlock("", &slackgo.RichTextPreformatted{Type: slackgo.RTEPreformatted, Elements: []slackgo.RichTextSectionElement{slackgo.NewRichTextSectionTextElement(string(j), nil)}}),
 		idLine,
 	)
+}
+
+// questionMarkdown is what the markdown blocks of a card asking q hold:
+// the context, when there is one, then each option written out.
+func questionMarkdown(q question.Question) []string {
+	var md []string
+	if q.Context != "" {
+		md = append(md, q.Context)
+	}
+	for i := range q.Options {
+		md = append(md, q.OptionMarkdown(i))
+	}
+	return md
 }
 
 // waitingBlocks are the buttons and the note box of a card that waits.
@@ -282,13 +300,18 @@ func PickedTime(values map[string]map[string]slackgo.BlockAction) (time.Time, bo
 	return time.Unix(a.SelectedDateTime, 0), true
 }
 
-// PostQuestion posts the card's blocks as a reply; the plain text, which
+// PostQuestion posts the card's blocks as a reply, the thread keys in its
+// markdown blocks linked as linkCard links them; the plain text, which
 // notifications show, starts with the mentions.
 func (w *Web) PostQuestion(ctx context.Context, channel, ts string, c QuestionCard) (string, error) {
+	c.markdown = w.linkCard(ctx, c)
 	return w.post(ctx, channel, slackgo.MsgOptionTS(ts), slackgo.MsgOptionText(questionText(c), false), slackgo.MsgOptionBlocks(questionBlocks(c)...))
 }
 
+// UpdateQuestion draws the card again, with the links it was first drawn
+// with; see linkCard.
 func (w *Web) UpdateQuestion(ctx context.Context, channel, ts string, c QuestionCard) error {
+	c.markdown = w.linkCard(ctx, c)
 	return w.call(ctx, "chat.update", func() error {
 		_, _, _, err := w.c.UpdateMessageContext(ctx, channel, ts, slackgo.MsgOptionText(questionText(c), false), slackgo.MsgOptionBlocks(questionBlocks(c)...))
 		return err
