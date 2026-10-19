@@ -1224,32 +1224,24 @@ func TestOpenThreadForRoute(t *testing.T) {
 		t.Fatalf("Slack got %d posts, want 2", posts.n)
 	}
 
-	// From a thread the caller owns, the hop goes on from that thread's;
-	// from one at the limit nothing is posted, and the hub alerts.
+	// From a thread the caller owns, the hop goes on from that thread's,
+	// however high it is.
 	s.Relays = route.Relays{"workstation": {"datamachine"}}
-	var alerts []string
-	s.Alert = func(_ context.Context, text string) error {
-		alerts = append(alerts, text)
-		return nil
-	}
 	if err := s.Store.Claim(ctx, "C9/1.0", "workstation", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop-1); err != nil {
+	if err := s.Store.SetHop(ctx, "C9/1.0", 30); err != nil {
 		t.Fatal(err)
 	}
 	got, err = answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/1.0", Text: "back to you"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ms := queued(t, s, "datamachine"); len(ms) != 2 || ms[1].Thread != got.Thread || ms[1].Hop != route.MaxHop {
-		t.Fatalf("queued for datamachine = %+v, want the handoff at hop %d", ms, route.MaxHop)
+	if ms := queued(t, s, "datamachine"); len(ms) != 2 || ms[1].Thread != got.Thread || ms[1].Hop != 31 {
+		t.Fatalf("queued for datamachine = %+v, want the handoff at hop 31", ms)
 	}
-	if hop, err := s.Store.Hop(ctx, got.Thread); err != nil || hop != route.MaxHop {
-		t.Fatalf("hop of the new thread = %d, %v; want %d", hop, err, route.MaxHop)
-	}
-	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop); err != nil {
-		t.Fatal(err)
+	if hop, err := s.Store.Hop(ctx, got.Thread); err != nil || hop != 31 {
+		t.Fatalf("hop of the new thread = %d, %v; want 31", hop, err)
 	}
 	if err := s.Store.Claim(ctx, "C9/2.0", "datamachine", "", ""); err != nil {
 		t.Fatal(err)
@@ -1258,7 +1250,6 @@ func TestOpenThreadForRoute(t *testing.T) {
 		name, from string
 		want       error
 	}{
-		{"from a thread at the limit", "C9/1.0", link.ErrDenied},
 		{"from a thread another client owns", "C9/2.0", link.ErrDenied},
 		{"from a thread with no owner", "C9/3.0", link.ErrNotFound},
 	} {
@@ -1269,16 +1260,10 @@ func TestOpenThreadForRoute(t *testing.T) {
 	if posts.n != 3 || len(queued(t, s, "datamachine")) != 2 {
 		t.Fatalf("Slack got %d posts and %d are queued, want 3 and 2", posts.n, len(queued(t, s, "datamachine")))
 	}
-	if len(alerts) != 1 || !strings.Contains(alerts[0], "out of thread C9/1.0 not delivered") {
-		t.Fatalf("alerts = %q, want one for C9/1.0", alerts)
-	}
 	// The route's machine opening a thread of its own delivers nothing,
-	// so the hop of the thread it names does not matter.
-	if err := s.Store.SetHop(ctx, "C9/2.0", route.MaxHop); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := answer(t, s, "datamachine", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/2.0", Text: "my own"}); err != nil || len(alerts) != 1 {
-		t.Fatalf("the route's machine's own thread from a thread at the limit: %v, %d alerts; want it opened, no alert", err, len(alerts))
+	// so it may name a thread it does not own.
+	if _, err := answer(t, s, "datamachine", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/1.0", Text: "my own"}); err != nil {
+		t.Fatalf("the route's machine's own thread from another's thread: %v; want it opened", err)
 	}
 }
 
