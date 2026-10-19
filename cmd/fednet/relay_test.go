@@ -15,6 +15,7 @@ import (
 	"github.com/Luolc/fednet/internal/auth"
 	"github.com/Luolc/fednet/internal/hook"
 	"github.com/Luolc/fednet/internal/inbound"
+	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
@@ -45,9 +46,8 @@ func (a *alerts) got() []string {
 // and a third it does not list: a thread one opens for the machine of the
 // channel's route reaches that machine's hook as a handoff, the two then
 // relay back and forth until route.MaxHop relays in a row, after which
-// the hub refuses the next post before it is queued, and a handoff out of
-// the thread is refused and alerted; a person posting in the thread lets
-// them relay again. The unlisted
+// the hub delivers nothing and alerts, though the post is in the thread; a
+// person posting in the thread lets them relay again. The unlisted
 // machine can do neither, and its refused open-thread posts nothing.
 func TestRelay(t *testing.T) {
 	ctx := t.Context()
@@ -56,7 +56,6 @@ func TestRelay(t *testing.T) {
 	t.Cleanup(func() { outboundInterval = 0 })
 	f := &slack.Fake{}
 	f.AddChannel("C1", "the workstation's channel")
-	f.RenameChannel("C1", "ws-jobs")
 	f.AddChannel("C2", "the data machine's channel")
 	f.RenameChannel("C2", "data-jobs")
 	slackFlags, runs := fakeSlack(t, dir, f, nil)
@@ -127,13 +126,27 @@ func TestRelay(t *testing.T) {
 			return err == nil && reg.Version != ""
 		})
 	}
+	// relayed returns the inbound messages id's hook got, the notices of
+	// relays refused left out; refusedTo returns those.
+	refusedTo := func(id string) []payload.Message {
+		b, _ := os.ReadFile(machines[id].events)
+		var ms []payload.Message
+		for line := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
+			var ev hook.Event
+			var m payload.Message
+			if json.Unmarshal([]byte(line), &ev) == nil && json.Unmarshal(ev.Payload, &m) == nil && m.Trigger == payload.Refused {
+				ms = append(ms, m)
+			}
+		}
+		return ms
+	}
 	relayed := func(id string) []payload.Message {
 		b, _ := os.ReadFile(machines[id].events)
 		var ms []payload.Message
 		for line := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 			var ev hook.Event
 			var m payload.Message
-			if json.Unmarshal([]byte(line), &ev) == nil && json.Unmarshal(ev.Payload, &m) == nil && m.Type == payload.Inbound {
+			if json.Unmarshal([]byte(line), &ev) == nil && json.Unmarshal(ev.Payload, &m) == nil && m.Type == payload.Inbound && m.Trigger != payload.Refused {
 				ms = append(ms, m)
 			}
 		}
@@ -198,8 +211,23 @@ func TestRelay(t *testing.T) {
 		m.Text != "job for the data machine" || m.TS != root || m.ChannelName != "data-jobs" {
 		t.Fatalf("handoff = %+v", m)
 	}
+	errStart := len(stderr.String())
 	if code, _ := cli("post", "-socket", machines["other"].socket, "-thread", thread, "-deliver", "not mine"); code != 3 {
 		t.Fatalf("post -deliver from an unlisted machine: exit %d, want 3", code)
+	}
+	if e := stderr.String()[errStart:]; !strings.Contains(e, "the hub's relay list does not let client other deliver to datamachine") {
+		t.Fatalf("stderr of the unlisted machine's post = %q, want the reason", e)
+	}
+	// A text too long to relay is refused before it is queued, saying why.
+	errStart = len(stderr.String())
+	if code, _ := cli("post", "-socket", machines["workstation"].socket, "-thread", thread, "-deliver", strings.Repeat("x", link.MaxPayload)); code != 3 {
+		t.Fatalf("post -deliver of a text too long to relay: exit %d, want 3", code)
+	}
+	if e := stderr.String()[errStart:]; !strings.Contains(e, "the message is too long to relay") {
+		t.Fatalf("stderr of the refused post = %q, want the reason", e)
+	}
+	if ms, _ := f.Replies(ctx, "C2", root); len(ms) != 1 {
+		t.Fatalf("the thread has %d messages after the refused post, want 1", len(ms))
 	}
 
 	// The data machine owns this thread: its own post there is delivered
@@ -225,10 +253,7 @@ func TestRelay(t *testing.T) {
 	for i := 1; i <= route.MaxHop; i++ {
 		steps = append(steps, step{"datamachine", home, homeRoot, i}, step{"workstation", thread, root, i + 1})
 	}
-	// The hub checks the count before the post is queued, so the one
-	// past the limit exits 3, says why and posts nothing.
-	last := steps[len(steps)-1]
-	for _, s := range steps[:len(steps)-1] {
+	for _, s := range steps {
 		if code, _ := cli("post", "-socket", machines[s.from].socket, "-thread", s.thread, "-deliver", "relay from "+s.from); code != 0 {
 			t.Fatalf("post -deliver from %s: exit %d", s.from, code)
 		}
@@ -238,15 +263,17 @@ func TestRelay(t *testing.T) {
 			return len(ms) == s.posts+1
 		})
 	}
-	errStart := len(stderr.String())
-	if code, _ := cli("post", "-socket", machines[last.from].socket, "-thread", last.thread, "-deliver", "one too many"); code != 3 {
-		t.Fatalf("post -deliver past the hop limit: exit %d, want 3", code)
+	waitFor(t, "the relay alerted", func() bool { return len(wh.got()) == 1 })
+	if a := wh.got()[0]; !strings.Contains(a, "relay from workstation to datamachine in #data-jobs (<https://") {
+		t.Fatalf("alert = %q", a)
 	}
-	if e := stderr.String()[errStart:]; !strings.Contains(e, "a person posting in the thread starts the count again") {
-		t.Fatalf("stderr of the refused post = %q, want the reason", e)
+	// The workstation's hook is told, and so is the thread.
+	waitFor(t, "the workstation told", func() bool { return len(refusedTo("workstation")) == 1 })
+	if m := refusedTo("workstation")[0]; m.Thread != thread || !strings.Contains(m.Text, "was not delivered to datamachine") {
+		t.Fatalf("notice = %+v", m)
 	}
-	if ms, _ := f.Replies(ctx, "C2", root); len(ms) != last.posts {
-		t.Fatalf("the thread has %d messages after the refused post, want %d", len(ms), last.posts)
+	if ms, _ := f.Replies(ctx, "C2", root); !strings.HasPrefix(ms[len(ms)-1].Text, "The post above from workstation was not delivered to datamachine") {
+		t.Fatalf("the thread ends with %q, want the line on the refused relay", ms[len(ms)-1].Text)
 	}
 	hops := func(id string) []int {
 		var hs []int
@@ -280,8 +307,8 @@ func TestRelay(t *testing.T) {
 	if code, _ := cli("open-thread", "-socket", machines["workstation"].socket, "-channel", "C2", "-owner", "route", "-from-thread", home, "back again"); code != 3 {
 		t.Fatalf("open-thread -from-thread a thread at the limit: exit %d, want 3", code)
 	}
-	waitFor(t, "the handoff alerted", func() bool { return len(wh.got()) == 1 })
-	if a := wh.got()[0]; !strings.Contains(a, "handoff from workstation to datamachine out of #ws-jobs (<https://") || !strings.Contains(a, "a person posting in the thread starts the count again") {
+	waitFor(t, "the handoff alerted", func() bool { return len(wh.got()) == 2 })
+	if a := wh.got()[1]; !strings.Contains(a, "handoff from workstation to datamachine out of thread "+home+" not delivered") {
 		t.Fatalf("alert = %q", a)
 	}
 	if ms, _ := f.History(ctx, "C2", "0"); len(ms) != 1 {
@@ -318,7 +345,7 @@ func TestRelay(t *testing.T) {
 	if m := relayed("workstation")[route.MaxHop]; m.Trigger != payload.Handoff || m.Thread != back || m.Hop != 2 || m.FromClient != "datamachine" {
 		t.Fatalf("handoff back = %+v, want hop 2 from datamachine", m)
 	}
-	if n := len(wh.got()); n != 1 {
-		t.Fatalf("%d alerts, want 1", n)
+	if n := len(wh.got()); n != 2 {
+		t.Fatalf("%d alerts, want 2", n)
 	}
 }

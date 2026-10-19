@@ -184,8 +184,6 @@ func (r *Router) prepare(ctx context.Context, relays Relays, from, thread string
 // or an agent to read: err is one of its refusals, or ErrNoOwner.
 func Reason(err error) string {
 	switch {
-	case errors.Is(err, ErrHopLimit):
-		return fmt.Sprintf("the thread has had %d relays in a row, the most the hub delivers; a person posting in the thread starts the count again", MaxHop)
 	case errors.Is(err, ErrTooLong):
 		return fmt.Sprintf("the message is too long to relay: with what the hub adds, it is over the %d KiB a message down the link may carry", link.MaxPayload>>10)
 	case errors.Is(err, ErrNoOwner):

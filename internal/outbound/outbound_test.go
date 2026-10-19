@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Luolc/fednet/internal/alert"
+	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
@@ -614,11 +614,12 @@ func TestDeliver(t *testing.T) {
 	}
 }
 
-// A relay past the hop limit, which the client could not see when it
-// queued the post, is in Slack all the same: the hub tells the machine
-// that posted it, says so in the thread and alerts with the channel's
-// name, a link and the reason; under the limit it is delivered.
-func TestDeliverAtHopLimit(t *testing.T) {
+// A relay the hub refuses once the post is in Slack, here one too long
+// to go down the link with what the hub adds, is in Slack all the same:
+// the hub tells the machine that posted it, says so in the thread and
+// alerts with the channel's name, a link and the reason; a short one
+// before it is delivered.
+func TestDeliverRefused(t *testing.T) {
 	f := newFixture(t)
 	ctx := t.Context()
 	var mu sync.Mutex
@@ -633,10 +634,9 @@ func TestDeliverAtHopLimit(t *testing.T) {
 	defer hook.Close()
 	f.p.Alert = &alert.Webhook{URL: hook.URL, From: "fednet-hub"}
 	f.p.Relays = route.Relays{"workstation": {"datamachine"}}
+	long := strings.Repeat("x", link.MaxPayload)
+	f.p.MaxChars = len(long)
 	if err := f.st.Claim(ctx, f.thread, "datamachine", "ops", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.st.SetHop(ctx, f.thread, route.MaxHop-1); err != nil {
 		t.Fatal(err)
 	}
 	put := func(text string) string {
@@ -646,18 +646,18 @@ func TestDeliverAtHopLimit(t *testing.T) {
 		}
 		return f.putRaw("workstation", b)
 	}
-	put("the last one")
-	over := put("one too many")
+	put("short")
+	over := put(long)
 	if err := f.p.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
 	replies := f.replies()
-	reason := fmt.Sprintf("the thread has had %d relays in a row, the most the hub delivers; a person posting in the thread starts the count again", route.MaxHop)
-	if got := texts(replies); !slices.Equal(got, []string{"the last one", "one too many", "The post above from workstation was not delivered to datamachine: " + reason + ". workstation has been told."}) {
-		t.Fatalf("thread = %q, want both posts and the line on the second", got)
+	reason := route.Reason(route.ErrTooLong)
+	if got := texts(replies); !slices.Equal(got, []string{"short", long, "The post above from workstation was not delivered to datamachine: " + reason + ". workstation has been told."}) {
+		t.Fatalf("thread has %d messages, want both posts and the line on the second", len(got))
 	}
-	if got := queuedFor(t, f.st, "datamachine"); len(got) != 1 || got[0].Text != "the last one" || got[0].Hop != route.MaxHop {
-		t.Fatalf("queued for datamachine = %+v, want the first at hop %d", got, route.MaxHop)
+	if got := queuedFor(t, f.st, "datamachine"); len(got) != 1 || got[0].Text != "short" {
+		t.Fatalf("queued for datamachine = %d messages, want the short one", len(got))
 	}
 	notice := payload.Message{Type: payload.Inbound, Thread: f.thread, TS: replies[1].TS, Trigger: payload.Refused,
 		Text: "Your post " + over + " in this thread was not delivered to datamachine: " + reason + "."}
