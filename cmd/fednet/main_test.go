@@ -60,6 +60,8 @@ func TestRun(t *testing.T) {
 		{"from-thread without -owner route", []string{"client", "open-thread", "-socket", "x", "-channel", "C1", "-from-thread", "C1/1.0", "hello"}, 2, "", "-from-thread takes -owner route"},
 		{"whoami without a socket", []string{"client", "whoami"}, 2, "", "-socket is required"},
 		{"threads without a socket", []string{"client", "threads"}, 2, "", "-socket is required"},
+		{"threads -limit without a channel", []string{"client", "threads", "-socket", "x", "-limit", "5"}, 2, "", "-limit takes -channel"},
+		{"threads with a zero limit", []string{"client", "threads", "-socket", "x", "-channel", "C1", "-limit", "0"}, 2, "", "-limit must be positive"},
 		{"client handoff without a socket", []string{"client", "handoff"}, 2, "", "-socket is required"},
 		{"hub handoff through a missing socket", []string{"hub", "handoff", "-socket", "/nonexistent/admin.sock"}, 4, "", "no such file"},
 		{"hub with a missing config", []string{"hub", "-listen", "127.0.0.1:0", "-db", "x", "-config", "/nonexistent/hub.json"}, 1, "", "no such file"},

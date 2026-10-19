@@ -68,6 +68,11 @@ const (
 	CheckRelay = "check-relay"
 	// Threads returns the threads the requesting client owns.
 	Threads = "threads"
+	// ChannelThreads returns the threads in Channel that have an owner,
+	// latest first by the ts of their first message, at most Limit of
+	// them, or DefaultChannelThreads when Limit is 0. Any client may list
+	// any channel, as it may read any thread.
+	ChannelThreads = "channel-threads"
 	// Adopt makes the requesting client the owner of Thread, which must
 	// already have an owner.
 	Adopt = "adopt"
@@ -164,7 +169,13 @@ type Request struct {
 	ID string `json:"id,omitempty"`
 	// Name is the argument of React and Unreact.
 	Name string `json:"name,omitempty"`
+	// Limit is the argument of ChannelThreads.
+	Limit int `json:"limit,omitempty"`
 }
+
+// DefaultChannelThreads is how many threads ChannelThreads returns when
+// the request gives no Limit.
+const DefaultChannelThreads = 20
 
 // RouteRequest is a change of one route that RequestRoute asks for: the
 // route of Channel becomes Machine, Scope and OpenThread, or, with Delete,
@@ -202,6 +213,21 @@ type Reply struct {
 	Routes     []store.Route   `json:"routes,omitempty"`
 	Question   *ask.Posted     `json:"question,omitempty"`
 	Card       *Card           `json:"card,omitempty"`
+	// ChannelThreads is the answer to ChannelThreads; absent for a
+	// channel with no thread that has an owner.
+	ChannelThreads []ChannelThread `json:"channel_threads,omitempty"`
+}
+
+// ChannelThread is one thread as ChannelThreads returns it, all from the
+// hub's database: the thread's key, the client that owns it, the name of
+// its channel as Slack gave it when the thread got its owner (absent when
+// the hub had none then, as for a direct message), and when the thread
+// started, which is the ts in its key.
+type ChannelThread struct {
+	Thread      string    `json:"thread"`
+	Owner       string    `json:"owner"`
+	ChannelName string    `json:"channel_name,omitempty"`
+	StartedAt   time.Time `json:"started_at"`
 }
 
 // Card is a question card as ReadAnswer returns it: where it is now, the
@@ -433,6 +459,8 @@ func (s *Server) Answer(ctx context.Context, client string, req []byte) ([]byte,
 		err = s.checkRelay(ctx, client, r)
 	case Threads:
 		reply.Threads, err = s.Store.Threads(ctx, client)
+	case ChannelThreads:
+		reply.ChannelThreads, err = s.channelThreads(ctx, r)
 	case Adopt:
 		err = s.adopt(ctx, client, r)
 	case GetChannelContext:
@@ -526,6 +554,31 @@ func thread(r Request) (channel, ts string, err error) {
 		return "", "", link.Refuse(link.ErrBadRequest, "%q is not a thread key (CHANNEL/TS)", r.Thread)
 	}
 	return channel, ts, nil
+}
+
+func (s *Server) channelThreads(ctx context.Context, r Request) ([]ChannelThread, error) {
+	switch {
+	case r.Channel == "" || strings.Contains(r.Channel, "/"):
+		return nil, link.Refuse(link.ErrBadRequest, "%q is not a channel id", r.Channel)
+	case r.Limit < 0:
+		return nil, link.Refuse(link.ErrBadRequest, "limit %d is negative", r.Limit)
+	}
+	limit := r.Limit
+	if limit == 0 {
+		limit = DefaultChannelThreads
+	}
+	owned, err := s.Store.OwnedIn(ctx, r.Channel)
+	if err != nil {
+		return nil, err
+	}
+	ts := func(o store.Owned) string { _, ts, _ := slack.ParseThreadKey(o.Thread); return ts }
+	slices.SortStableFunc(owned, func(a, b store.Owned) int { return slack.CompareTS(ts(b), ts(a)) })
+	var threads []ChannelThread
+	for _, o := range owned[:min(limit, len(owned))] {
+		started, _ := slack.TSTime(ts(o))
+		threads = append(threads, ChannelThread{Thread: o.Thread, Owner: o.Client, ChannelName: o.ChannelName, StartedAt: started})
+	}
+	return threads, nil
 }
 
 func (s *Server) readThread(ctx context.Context, r Request) (Reply, error) {

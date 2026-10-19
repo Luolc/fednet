@@ -168,6 +168,27 @@ func TestRelay(t *testing.T) {
 	if code, out := cli("threads", "-socket", machines["datamachine"].socket); code != 0 || out != thread {
 		t.Fatalf("the data machine's threads: exit %d, %q; want %s", code, out, thread)
 	}
+	// Any machine lists the threads of a channel, whoever owns them.
+	_, threadTS, _ := slack.ParseThreadKey(thread)
+	started, _ := slack.TSTime(threadTS)
+	if code, out := cli("threads", "-socket", machines["other"].socket, "-channel", "C2"); code != 0 ||
+		out != thread+" datamachine "+started.Format(time.RFC3339)+" data-jobs" {
+		t.Fatalf("threads -channel C2 from the other machine: exit %d, %q; want %s owned by datamachine", code, out, thread)
+	}
+	var listed struct {
+		ChannelThreads []struct {
+			Thread      string    `json:"thread"`
+			Owner       string    `json:"owner"`
+			ChannelName string    `json:"channel_name"`
+			StartedAt   time.Time `json:"started_at"`
+		} `json:"channel_threads"`
+	}
+	code, out := cli("threads", "-socket", machines["other"].socket, "-channel", "C2", "-json")
+	if err := json.Unmarshal([]byte(out), &listed); code != 0 || err != nil || len(listed.ChannelThreads) != 1 ||
+		listed.ChannelThreads[0].Thread != thread || listed.ChannelThreads[0].Owner != "datamachine" ||
+		listed.ChannelThreads[0].ChannelName != "data-jobs" || !listed.ChannelThreads[0].StartedAt.Equal(started) {
+		t.Fatalf("threads -channel C2 -json: exit %d, %s", code, out)
+	}
 	waitFor(t, "the handoff to reach the data machine", func() bool { return len(relayed("datamachine")) == 1 })
 	_, root, _ := slack.ParseThreadKey(thread)
 	if m := relayed("datamachine")[0]; m.Trigger != payload.Handoff || m.FromClient != "workstation" || m.Hop != 1 || m.Thread != thread ||

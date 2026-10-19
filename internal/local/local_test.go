@@ -522,7 +522,8 @@ func TestPostToDeliver(t *testing.T) {
 }
 
 // A hub older than the client does not know delete, mentions, posts to
-// deliver or threads opened for the route's machine: the client says so,
+// deliver, threads opened for the route's machine or the threads of a
+// channel: the client says so,
 // and queues nothing.
 func TestOlderHub(t *testing.T) {
 	st := openClientStore(t)
@@ -539,6 +540,7 @@ func TestOlderHub(t *testing.T) {
 		{Cmd: Post, Thread: "C1/1700000000.000100", Text: "x", Mentions: []string{"U1"}},
 		{Cmd: Post, Thread: "C1/1700000000.000100", Text: "x", Deliver: true},
 		{Cmd: hubapi.OpenThreadForRoute, Channel: "C1", Text: "x"},
+		{Cmd: hubapi.ChannelThreads, Channel: "C1", Limit: 20},
 	} {
 		res, err := Do(t.Context(), path, req)
 		if err != nil || res.Kind != BadRequest || !strings.Contains(res.Error, "older fednet") {
