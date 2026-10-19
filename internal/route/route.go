@@ -93,7 +93,7 @@ func (r *Router) RouteReply(ctx context.Context, thread string, m payload.Messag
 
 // MaxHop is how many relays in a row a thread may have since a person
 // last posted in it; the hub delivers no relay past it.
-const MaxHop = 3
+const MaxHop = 20
 
 // Why Deliver delivered nothing.
 var (

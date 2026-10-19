@@ -182,9 +182,10 @@ commands:
         in the thread, this one included); nothing when this machine owns
         the thread; the hub must be reachable to check, before the post is
         queued, that its relay list lets this machine deliver to the owner
-        (else exits 3; 1 when the thread has no owner); a relay past hop 3
-        is not delivered, and the hub alerts: a person posting in the
-        thread starts the count again; -deliver takes no -footer or -file
+        (else exits 3; 1 when the thread has no owner); a relay past the
+        hub's hop limit is not delivered, and the hub alerts: a person
+        posting in the thread starts the count again; -deliver takes no
+        -footer or -file
   client delete -socket PATH [-json] MSG-ID
         delete from Slack the post that client post queued under MSG-ID,
         every message it went out as; only a post from this machine; exits
@@ -222,10 +223,11 @@ commands:
         message of trigger handoff, hop 1, from_client this machine, unless
         it is this machine; with -from-thread, the thread this machine owns
         that the work comes from, the hop goes on from that thread's, and
-        a thread at hop 3 hands nothing over: the hub alerts; exits 3 when
-        the route has no machine, the hub's relay list does not let this
-        machine deliver to it, this machine does not own the -from-thread
-        thread or it is at hop 3, and 1 when that thread has no owner
+        a thread at the hop limit hands nothing over: the hub alerts; exits
+        3 when the route has no machine, the hub's relay list does not let
+        this machine deliver to it, this machine does not own the
+        -from-thread thread or it is at the hop limit, and 1 when that
+        thread has no owner
   client whoami -socket PATH [-json]
         print this machine's client id
   client threads -socket PATH [-json]

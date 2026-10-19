@@ -1235,18 +1235,18 @@ func TestOpenThreadForRoute(t *testing.T) {
 	if err := s.Store.Claim(ctx, "C9/1.0", "workstation", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Store.SetHop(ctx, "C9/1.0", 2); err != nil {
+	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop-1); err != nil {
 		t.Fatal(err)
 	}
 	got, err = answer(t, s, "workstation", Request{Cmd: OpenThreadForRoute, Channel: "C1", Thread: "C9/1.0", Text: "back to you"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ms := queued(t, s, "datamachine"); len(ms) != 2 || ms[1].Thread != got.Thread || ms[1].Hop != 3 {
-		t.Fatalf("queued for datamachine = %+v, want the handoff at hop 3", ms)
+	if ms := queued(t, s, "datamachine"); len(ms) != 2 || ms[1].Thread != got.Thread || ms[1].Hop != route.MaxHop {
+		t.Fatalf("queued for datamachine = %+v, want the handoff at hop %d", ms, route.MaxHop)
 	}
-	if hop, err := s.Store.Hop(ctx, got.Thread); err != nil || hop != 3 {
-		t.Fatalf("hop of the new thread = %d, %v; want 3", hop, err)
+	if hop, err := s.Store.Hop(ctx, got.Thread); err != nil || hop != route.MaxHop {
+		t.Fatalf("hop of the new thread = %d, %v; want %d", hop, err, route.MaxHop)
 	}
 	if err := s.Store.SetHop(ctx, "C9/1.0", route.MaxHop); err != nil {
 		t.Fatal(err)
