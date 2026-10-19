@@ -38,6 +38,10 @@ const maxMarkdownChars = 12000
 // when it is full.
 const maxCachedLinks = 4096
 
+// maxCachedCards bounds the question cards whose links a Web keeps; they
+// are all forgotten when it is full.
+const maxCachedCards = 4096
+
 // threadKeys returns where text has thread keys a person reads as text,
 // each as its start and end byte offset, in order. Keys in a fenced code
 // block, in a code span, in a link, its text or its URL, or in a bare URL
@@ -184,16 +188,90 @@ func (w *Web) linkThreadKeys(ctx context.Context, text string) string {
 	if len(spans) == 0 {
 		return text
 	}
+	linked := withLinks(text, spans, w.threadLinks(ctx, keysAt(text, spans)))
+	if utf8.RuneCountInString(linked) > maxMarkdownChars {
+		return text
+	}
+	return linked
+}
+
+// linkCard returns the markdown blocks of c, its context and each option
+// written out, with their thread keys linked as linkThreadKeys links
+// them, all of them as they are when the links would take the blocks
+// together over what a message's markdown blocks take. The links a card
+// was first drawn with, and the keys it had none for, are kept by its id,
+// so that each time it is drawn again it shows the same without asking
+// Slack.
+func (w *Web) linkCard(ctx context.Context, c QuestionCard) []string {
+	md := questionMarkdown(c.Question)
+	if c.State == QuestionMoved {
+		return md
+	}
+	spans := make([][][2]int, len(md))
+	var keys []string
+	for i, text := range md {
+		spans[i] = threadKeys(text)
+		keys = append(keys, keysAt(text, spans[i])...)
+	}
+	if len(keys) == 0 {
+		return md
+	}
+	w.links.mu.Lock()
+	found, ok := w.links.cards[c.ID]
+	w.links.mu.Unlock()
+	if !ok {
+		found = w.threadLinks(ctx, keys)
+		w.links.mu.Lock()
+		if w.links.cards == nil || len(w.links.cards) >= maxCachedCards {
+			w.links.cards = make(map[string]map[string]string)
+		}
+		if kept, ok := w.links.cards[c.ID]; ok {
+			found = kept
+		} else {
+			w.links.cards[c.ID] = found
+		}
+		w.links.mu.Unlock()
+	}
+	linked := make([]string, len(md))
+	n := 0
+	for i, text := range md {
+		linked[i] = withLinks(text, spans[i], found)
+		n += utf8.RuneCountInString(linked[i])
+	}
+	if n > maxMarkdownChars {
+		return md
+	}
+	return linked
+}
+
+// keysAt returns the thread keys at spans in text, in order.
+func keysAt(text string, spans [][2]int) []string {
+	keys := make([]string, len(spans))
+	for i, s := range spans {
+		keys[i] = text[s[0]:s[1]]
+	}
+	return keys
+}
+
+// threadLinks returns the permalink Slack gives for each of the first
+// maxLinks distinct keys, "" for each it gives none for in time, all
+// within linkWait.
+func (w *Web) threadLinks(ctx context.Context, keys []string) map[string]string {
 	ctx, cancel := context.WithTimeout(ctx, linkWait)
 	defer cancel()
 	found := make(map[string]string)
-	for _, s := range spans {
-		key := text[s[0]:s[1]]
+	for _, key := range keys {
 		if _, tried := found[key]; tried || len(found) == maxLinks {
 			continue
 		}
 		found[key] = w.threadLink(ctx, key)
 	}
+	return found
+}
+
+// withLinks returns text with the key at each of spans written as a
+// Markdown link to the permalink found has for it, when it has one.
+func withLinks(text string, spans [][2]int, found map[string]string) string {
 	var b strings.Builder
 	last := 0
 	for _, s := range spans {
@@ -206,16 +284,16 @@ func (w *Web) linkThreadKeys(ctx context.Context, text string) string {
 		last = s[1]
 	}
 	b.WriteString(text[last:])
-	if utf8.RuneCountInString(b.String()) > maxMarkdownChars {
-		return text
-	}
 	return b.String()
 }
 
-// linkCache keeps the permalinks Web has had from Slack, by thread key.
+// linkCache keeps the permalinks Web has had from Slack, by thread key,
+// and in cards the links each question card was first drawn with, by its
+// id.
 type linkCache struct {
-	mu sync.Mutex
-	m  map[string]string
+	mu    sync.Mutex
+	m     map[string]string
+	cards map[string]map[string]string
 }
 
 // threadLink returns the permalink of the thread key, from the cache or
