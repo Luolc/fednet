@@ -1,0 +1,29 @@
+id = 2
+slug = "design-current-state"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R232"
+default = "on"
+authority = ["evidence.facts"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''`docs/design.md` 只描述当前状态'''
+
+[text.statement]
+zh = '''`docs/design.md` 只描述 fednet 当前的样子，有变化就原地改成新的样子，不保留旧的写法或改动经过。'''
+
+[text.reason]
+zh = '''
+读者拿设计当现状的说明来用；混进过去的样子或改动经过，就分不清哪句话现在还成立。
+'''
+
+[text.verification]
+zh = '''
+已合入的变更之后，`docs/design.md` 里还有描述旧行为的句子，或者写了某处是怎么改过来的，即违反。
+'''

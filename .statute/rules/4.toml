@@ -1,0 +1,29 @@
+id = 4
+slug = "design-five-sections"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R232"
+default = "on"
+authority = ["simplicity"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''`docs/design.md` 固定五节'''
+
+[text.statement]
+zh = '''`docs/design.md` 固定为五节，依次是：是什么、不是什么；组成部分与连接方式 (一张图加一段话)；不变量；接口 (只放链接)；已知问题与下一步。'''
+
+[text.reason]
+zh = '''
+固定的结构让读者知道每类内容在哪一节，改动的人也知道该改哪一节。
+'''
+
+[text.verification]
+zh = '''
+`docs/design.md` 多了或少了一节、顺序变了，组成部分一节没有图，或者接口一节写了链接以外的内容，即违反。
+'''

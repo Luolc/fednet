@@ -1,4 +1,5 @@
-# Hooks: secret scan (gitleaks) and Chinese Markdown typography (limae).
+# Hooks: secret scan (gitleaks), Chinese Markdown typography (limae) and the
+# statute compile check.
 repos:
   # Runs first: a leaked secret must be stopped before other hooks rewrite
   # staged files. The upstream entry scans the staged diff only (it ends in
@@ -24,3 +25,12 @@ repos:
     rev: v0.13.4
     hooks:
       - id: limae
+  # AGENTS.md and the skills statute copies and links must match a fresh
+  # compile of statute.toml and statute.lock; the private output, which git
+  # ignores, is not compared. rev must name the statute version in
+  # statute.lock: statute refuses a lock another version wrote, so the hook
+  # fails until the two agree.
+  - repo: https://github.com/Luolc/statute-pre-commit
+    rev: v0.1.25
+    hooks:
+      - id: statute-compile

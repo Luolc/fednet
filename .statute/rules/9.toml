@@ -1,0 +1,29 @@
+id = 9
+slug = "pre-commit-install"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R276"
+default = "on"
+authority = ["guards"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''每个 clone 先装上 commit 钩子'''
+
+[text.statement]
+zh = '''在本仓的每个 clone 里，第一次 commit 之前跑一次 `uvx pre-commit install`。'''
+
+[text.reason]
+zh = '''
+`.pre-commit-config.yaml` 里的钩子要装上才会跑，其中的凭证扫描是凭证进入 commit 之前唯一的拦截。
+'''
+
+[text.verification]
+zh = '''
+在没装 pre-commit 钩子的 clone 里做了 commit，即违反。
+'''

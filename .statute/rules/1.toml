@@ -1,0 +1,31 @@
+id = 1
+slug = "design-one-file-cap"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R232"
+default = "on"
+authority = ["simplicity"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''设计只写在 `docs/design.md` 一个文件里，不超过 200 行'''
+
+[text.statement]
+zh = '''fednet 的设计只写在 `docs/design.md` 这一个文件里，全文不超过 200 行。'''
+
+[text.reason]
+zh = '''
+一个短文件改动之前能从头读完；行数上限让它只留读者需要的东西。
+'''
+
+[text.verification]
+zh = '''
+CI 的 `check` 跑 `.github/scripts/design-length.sh` 检查行数。
+
+变更新增了另一份设计文件，或者让 `docs/design.md` 超过 200 行，即违反。
+'''

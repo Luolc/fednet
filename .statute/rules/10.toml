@@ -1,0 +1,31 @@
+id = 10
+slug = "merge-does-not-wait-for-ci"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R274"
+default = "on"
+authority = ["decide-yourself.routine-changes"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions"]
+
+[title]
+zh = '''合并不等 CI'''
+
+[text.statement]
+zh = '''把已批准的 PR 合进 `main` 时，不等 `check` 跑完：`check` 不是 `main` 的 required status check。'''
+
+[text.reason]
+zh = '''
+{@rule:R211} 要仓库的说明写明合并等不等 CI；这条写明不等。
+'''
+
+[text.verification]
+zh = '''
+approved head 上 `check` 已经失败的 PR 仍然不合。
+
+一个已批准、其余条件都满足的 PR，只为等 `check` 跑完而被扣着不合，即违反。
+'''

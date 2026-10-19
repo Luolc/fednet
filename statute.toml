@@ -1,0 +1,44 @@
+# Written by `statute init`; `statute add` and `statute remove` change the rules.
+constitution = { source = "R", edition = "2026-10" }
+public = true
+
+domains = [
+  # Agents write and change this repository's own rules in .statute/rules/.
+  "R96",
+  # The repository keeps a design, docs/design.md.
+  "R232",
+]
+
+rules = [
+  # A pull request that changes how fednet works updates docs/design.md in the same change.
+  "R80",
+  # main is protected and takes changes only through reviewed pull requests.
+  "R57",
+  # The repository is public: a reviewer reads what is pushed before the push.
+  "R52",
+  # On a pull request, the run of check is what counts, not a full local run.
+  "R72",
+  # check is not a required status check: a merge does not wait for it (L10), but a
+  # pull request whose check already failed at the approved head is not merged.
+  "R211",
+  # CI runners are pinned to a fixed Ubuntu release.
+  "R212",
+]
+
+exclude = [
+  # The design is one file, docs/design.md, under a line cap (L1): not split by topic,
+  "R113",
+  # and so with no index.
+  "R114",
+]
+
+[compile]
+# The repository is in Chinese, and so is its compiled AGENTS.md.
+lang = "zh"
+
+[language]
+code-comments = "en"
+docs = "zh"
+commits = "en"
+pull-requests = "zh"
+communication = "zh"

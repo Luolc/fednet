@@ -1,0 +1,29 @@
+id = 11
+slug = "hook-rev-on-tag"
+revision = 1
+kind = "rule"
+status = "trial"
+lang = "zh"
+parent = "R77"
+default = "on"
+authority = ["discriminating-checks"]
+constitution = ">=1"
+level = "project"
+check = "none"
+uses = ["instructions", "review"]
+
+[title]
+zh = '''commit 钩子的 `rev` 钉在 tag 上'''
+
+[text.statement]
+zh = '''`.pre-commit-config.yaml` 里每个钩子仓库的 `rev` 都钉在一个 tag 上，不用分支名。'''
+
+[text.reason]
+zh = '''
+分支会移动，钩子会在仓库没改的时候换成另一份代码，同一次提交前后得出不同结论。
+'''
+
+[text.verification]
+zh = '''
+`.pre-commit-config.yaml` 里有 `rev` 不是 tag 的钩子仓库，即违反。
+'''
