@@ -13,6 +13,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/hubapi"
 	"github.com/Luolc/fednet/internal/inbound"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -61,7 +62,7 @@ func TestHubRequests(t *testing.T) {
 	// on the user list.
 	f.AddChannel("C2", "")
 	config := filepath.Join(dir, "hub.json")
-	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}, "files": {"upload_max_bytes": 20}}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}, "limited_users": {"U3": {"name": "collaborator", "machines": ["datamachine", "workstation"]}}, "files": {"upload_max_bytes": 20}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stopHub := start(t, append([]string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, slackFlags...), &stdout, &stderr)
@@ -173,22 +174,26 @@ func TestHubRequests(t *testing.T) {
 		t.Fatalf("threads -json: exit %d, stdout %q; want just %s", code, out, opened)
 	}
 
-	// users lists the user list; dm reaches a user on it, and no one else.
-	if code, out := fednet("client", "users", "-socket", socket); code != 0 || out != "U1 maintainer\nU2\n" {
-		t.Fatalf("users: exit %d, stdout %q; want U1 with its name, then U2", code, out)
+	// users lists the user list, then the limited users with their
+	// machines; dm reaches a user on the list, and no one else.
+	if code, out := fednet("client", "users", "-socket", socket); code != 0 || out != "U1 maintainer\nU2\nU3 collaborator (limited to datamachine, workstation)\n" {
+		t.Fatalf("users: exit %d, stdout %q; want U1 with its name, then U2, then U3 limited", code, out)
 	}
 	code, out = fednet("client", "users", "-socket", socket, "-json")
 	var users struct {
-		Users []struct{ ID, Name string } `json:"users"`
+		Users []hubapi.User `json:"users"`
 	}
-	if err := json.Unmarshal([]byte(out), &users); code != 0 || err != nil || len(users.Users) != 2 || users.Users[0].Name != "maintainer" {
-		t.Fatalf("users -json: exit %d, stdout %q", code, out)
+	want := []hubapi.User{{ID: "U1", Name: "maintainer"}, {ID: "U2"}, {ID: "U3", Name: "collaborator", Limited: true, Machines: []string{"datamachine", "workstation"}}}
+	if err := json.Unmarshal([]byte(out), &users); code != 0 || err != nil || !reflect.DeepEqual(users.Users, want) {
+		t.Fatalf("users -json: exit %d, stdout %q; want %+v", code, out, want)
 	}
 	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U1", "daily report"); code != 0 || !slices.Equal(f.DMs("U1"), []string{"daily report"}) {
 		t.Fatalf("dm: exit %d, DMs to U1 %q; want the report", code, f.DMs("U1"))
 	}
-	if code, _ := fednet("client", "dm", "-socket", socket, "-user", "U9", "hello"); code != 3 || len(f.DMs("U9")) != 0 {
-		t.Fatalf("dm to a user not on the list: exit %d, DMs %q; want 3 and none", code, f.DMs("U9"))
+	for _, u := range []string{"U9", "U3"} {
+		if code, _ := fednet("client", "dm", "-socket", socket, "-user", u, "hello"); code != 3 || len(f.DMs(u)) != 0 {
+			t.Fatalf("dm to %s, off the list: exit %d, DMs %q; want 3 and none", u, code, f.DMs(u))
+		}
 	}
 	if code, _ := fednet("client", "dm", "-socket", socket, "hello"); code != 2 {
 		t.Fatalf("dm without -user: exit %d, want 2", code)
@@ -405,6 +410,40 @@ func TestReadHubConfig(t *testing.T) {
 	}
 }
 
+// A limited user is read with their machines; one who is also on the user
+// list, has no machines, approves or upgrades stops the hub from
+// starting, with the reason.
+func TestReadHubConfigLimitedUsers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.json")
+	read := func(body string) (hubConfig, error) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return readHubConfig(path)
+	}
+	cfg, err := read(`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"name": "collaborator", "machines": ["datamachine"]}}}`)
+	if want := (route.Limited{"U3": {Name: "collaborator", Machines: []string{"datamachine"}}}); err != nil || !reflect.DeepEqual(cfg.LimitedUsers, want) {
+		t.Fatalf("readHubConfig = %+v, %v; want %+v", cfg.LimitedUsers, err, want)
+	}
+	if _, ok := cfg.Users["U3"]; ok {
+		t.Fatal("a limited user is on the user list")
+	}
+	for _, c := range []struct{ body, want string }{
+		{`{"users": {"U1": "maintainer", "U3": ""}, "limited_users": {"U3": {"machines": ["datamachine"]}}}`, "U3 is both on the user list and a limited user"},
+		{`{"limited_users": {"U3": {"name": "collaborator"}}}`, "limited user U3 needs machines"},
+		{`{"limited_users": {"U3": {"machines": []}}}`, "limited user U3 needs machines"},
+		{`{"limited_users": {"U3": {"machines": [""]}}}`, "limited user U3 needs machines"},
+		{`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"machines": ["datamachine"]}}, "approvals": {"channel": "C9", "approvers": ["U1", "U3"]}}`, "approver U3 is a limited user"},
+		{`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"machines": ["datamachine"]}}, "upgrade": {"admins": ["U3"]}}`, "upgrade admin U3 is a limited user"},
+		{`{"limited_users": {"U3": {"machines": ["datamachine"], "admin": true}}}`, "admin"},
+	} {
+		if _, err := read(c.body); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("readHubConfig(%s) = %v, want an error with %q", c.body, err, c.want)
+		}
+	}
+}
+
 func TestHubConfigAlerts(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, body string) string {
@@ -487,7 +526,7 @@ func TestExampleHubConfig(t *testing.T) {
 	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
-	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 || !cfg.Relay.Allow("workstation", "datamachine") {
+	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || len(cfg.LimitedUsers) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 || !cfg.Relay.Allow("workstation", "datamachine") {
 		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }

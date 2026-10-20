@@ -7,6 +7,7 @@
 package inbound
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -80,9 +81,13 @@ type Receiver struct {
 	// messages in.
 	Store *store.Hub
 	Slack slack.API
-	// Users is the user list: only messages from people on it are taken
-	// in.
+	// Users is the user list: only messages from people on it, or from
+	// limited users, are taken in.
 	Users map[string]string
+	// Limited is the limited users: their direct messages are not taken
+	// in, nor are their messages and reactions that would go to a machine
+	// not on their list (see route.Router.Limit).
+	Limited route.Limited
 	// Bot is the Slack user id of the hub's bot: a message in a channel
 	// hands its thread to a client only if it mentions the bot. Empty
 	// means no message does.
@@ -147,8 +152,9 @@ type Receiver struct {
 // in a channel no machine takes is recorded and logged, and nothing is
 // said in the thread; a new thread in a direct message conversation no
 // machine takes is recorded, with a post from the hub saying so put in
-// the hub's inbox for the outbound side to deliver. An error means
-// nothing was recorded, and the event must not be acked.
+// the hub's inbox for the outbound side to deliver. A message from a
+// limited user that the routing refuses is logged and not recorded. An
+// error means nothing was recorded, and the event must not be acked.
 func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	if !r.wanted(ev) {
 		return nil
@@ -193,7 +199,7 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		// A reply in a thread nobody handed over: not taken in.
 		return nil
 	}
-	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.Users[ev.User], TS: ev.TS, Files: r.Prefetch.mark(files(ev.Files))}
+	m := payload.Message{Type: payload.Inbound, Thread: thread, User: ev.User, UserName: r.name(ev.User), TS: ev.TS, Files: r.Prefetch.mark(files(ev.Files))}
 	m.Text = text(ev, r.History.messageChars())
 	// What a mention carries is read outside the transaction; whether the
 	// message is the one that hands the thread over is decided inside it,
@@ -204,7 +210,7 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		info, history = r.channelInfo(ctx, ev.Channel), r.history(ev, thread, before)
 	}
 	_, err = r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
-		rt := route.New(tx)
+		rt := route.New(tx).Limit(r.Limited)
 		name, err := tx.ChannelName(ctx, thread)
 		owned := err == nil
 		if errors.Is(err, store.ErrNotFound) {
@@ -245,6 +251,12 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 		// A person posted: the machines may relay in the thread again.
 		return tx.SetHop(ctx, thread, 0)
 	})
+	if errors.Is(err, route.ErrLimited) {
+		// Rolled back: as for someone not on the user list, nothing is
+		// recorded.
+		slog.Info("inbound: message from a limited user not taken in", "thread", thread, "reason", err)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("inbound: %s: %w", slack.ThreadKey(ev.Channel, ev.TS), err)
 	}
@@ -260,19 +272,24 @@ type Reaction struct {
 	Channel, TS, User, Name string
 }
 
-// React queues a, a reaction a person on the user list put on the first
-// message of a thread that has an owner, for that owner, as a message of
-// type reaction; any other reaction is not the agents' business. Nothing
-// records the event, so one Slack delivers again is queued again. An
-// error means nothing was queued, and the event must not be acked.
+// React queues a, a reaction a person on the user list, or a limited user
+// the routing lets through, put on the first message of a thread that has
+// an owner, for that owner, as a message of type reaction; any other
+// reaction is not the agents' business. Nothing records the event, so one
+// Slack delivers again is queued again. An error means nothing was
+// queued, and the event must not be acked.
 func (r *Receiver) React(ctx context.Context, a Reaction) error {
-	if _, ok := r.Users[a.User]; !ok {
+	if !r.listed(a.User) {
 		return nil
 	}
 	thread := slack.ThreadKey(a.Channel, a.TS)
-	m := payload.Message{Type: payload.Reaction, Thread: thread, User: a.User, UserName: r.Users[a.User], Reaction: a.Name}
-	_, err := route.New(r.Store).RouteReply(ctx, thread, m)
+	m := payload.Message{Type: payload.Reaction, Thread: thread, User: a.User, UserName: r.name(a.User), Reaction: a.Name}
+	_, err := route.New(r.Store).Limit(r.Limited).RouteReply(ctx, thread, m)
 	if errors.Is(err, route.ErrNoOwner) {
+		return nil
+	}
+	if errors.Is(err, route.ErrLimited) {
+		slog.Info("inbound: reaction from a limited user not taken in", "thread", thread, "reason", err)
 		return nil
 	}
 	if err != nil {
@@ -294,13 +311,33 @@ func (r *Receiver) Click(ctx context.Context, c slack.Click) error {
 	return r.Approvals.Click(ctx, c)
 }
 
-// wanted reports whether ev is a message a person on the user list said.
+// wanted reports whether ev is a message a person on the user list, or a
+// limited user outside a direct message, said.
 func (r *Receiver) wanted(ev Event) bool {
-	if ev.BotID != "" || !slices.Contains(subtypes, ev.SubType) {
+	if ev.BotID != "" || !slices.Contains(subtypes, ev.SubType) || !r.listed(ev.User) {
 		return false
 	}
-	_, ok := r.Users[ev.User]
-	return ok
+	if _, ok := r.Limited[ev.User]; ok && ev.IM {
+		slog.Info("inbound: message from a limited user not taken in", "thread", slack.ThreadKey(ev.Channel, cmp.Or(ev.ThreadTS, ev.TS)), "reason", "a direct message")
+		return false
+	}
+	return true
+}
+
+// listed reports whether user is on the user list or a limited user.
+func (r *Receiver) listed(user string) bool {
+	_, full := r.Users[user]
+	_, limited := r.Limited[user]
+	return full || limited
+}
+
+// name is user's name for the agents, from the user list or from their
+// limited user's entry.
+func (r *Receiver) name(user string) string {
+	if n, ok := r.Users[user]; ok {
+		return n
+	}
+	return r.Limited[user].Name
 }
 
 // text is the message's text, cut to max characters, with its files

@@ -163,13 +163,14 @@ func TestLongPostIsSplit(t *testing.T) {
 }
 
 // A post mentions, at the start of its first message only, the people
-// it names who are on the user list; the Slack ts of each of its
+// it names who are on the user list or limited users; the Slack ts of each of its
 // messages is recorded, footers' too, for a delete.
 func TestPostMentionsAndRecordsWhere(t *testing.T) {
 	f := newFixture(t)
 	f.p.MaxChars = 10
 	f.p.Users = map[string]string{"U1": "Ann", "U2": ""}
-	b, err := json.Marshal(payload.Message{Type: payload.Post, Thread: f.thread, Text: "abcdefghijklm", Mentions: []string{"U1", "U9", "U2"}})
+	f.p.Limited = route.Limited{"U3": {Name: "Bo", Machines: []string{"datamachine"}}}
+	b, err := json.Marshal(payload.Message{Type: payload.Post, Thread: f.thread, Text: "abcdefghijklm", Mentions: []string{"U1", "U9", "U2", "U3"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +184,7 @@ func TestPostMentionsAndRecordsWhere(t *testing.T) {
 		t.Fatal(err)
 	}
 	ms := f.replies()
-	if got, want := texts(ms[:2]), []string{"<@U1> <@U2> abcdefghij", "klm"}; !slices.Equal(got, want) {
+	if got, want := texts(ms[:2]), []string{"<@U1> <@U2> <@U3> abcdefghij", "klm"}; !slices.Equal(got, want) {
 		t.Fatalf("thread = %q, want %q", got, want)
 	}
 	if slack.Mentions(ms[2].Text, "U1") {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
 
@@ -22,12 +23,37 @@ var ErrNoMachine = errors.New("route: no machine takes this channel")
 // one started before fednet. The message is not queued anywhere.
 var ErrNoOwner = errors.New("route: thread has no owner")
 
+// ErrLimited is returned for a message from a limited user that would go
+// to a machine not on their list; the error says which. The message is
+// not queued anywhere.
+var ErrLimited = errors.New("route: the sender is a limited user")
+
+// Limited is the hub's limited users, by Slack user id: people fednet
+// serves only on the machines their entry lists. A limited user is not on
+// the user list.
+type Limited map[string]LimitedUser
+
+// LimitedUser is one limited user: a name for the agents, which may be
+// empty, and the clients they may hand work to.
+type LimitedUser struct {
+	Name     string   `json:"name"`
+	Machines []string `json:"machines"`
+}
+
+// Allow reports whether user is a limited user who may hand work to
+// machine.
+func (l Limited) Allow(user, machine string) bool {
+	u, ok := l[user]
+	return ok && machine != "" && slices.Contains(u.Machines, machine)
+}
+
 // Router queues the messages people post in threads, by the routes in the
 // hub's database as they are when each message comes. A message is queued
 // whether or not its client is connected; it waits in the outbox until the
 // client takes it.
 type Router struct {
-	hub *store.Hub
+	hub     *store.Hub
+	limited Limited
 }
 
 // New returns a Router that reads the routes from hub and queues into its
@@ -37,12 +63,53 @@ func New(hub *store.Hub) *Router {
 	return &Router{hub: hub}
 }
 
+// Limit makes r refuse, with ErrLimited, what RouteNew, RouteNewDM and
+// RouteReply would queue for a limited user of l in a thread whose
+// channel's machine, or whose owner when it has one, is not on the user's
+// list. It returns r. The caller keeps a limited user's direct messages
+// out itself.
+func (r *Router) Limit(l Limited) *Router {
+	r.limited = l
+	return r
+}
+
+// limit returns ErrLimited when r refuses m, in thread of channel, as
+// Limit says.
+func (r *Router) limit(ctx context.Context, channel, thread string, m payload.Message) error {
+	if _, ok := r.limited[m.User]; !ok {
+		return nil
+	}
+	rt, err := r.hub.Route(ctx, channel)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if rt.Machine == "" {
+		return fmt.Errorf("%w: no machine takes the channel", ErrLimited)
+	}
+	if !r.limited.Allow(m.User, rt.Machine) {
+		return fmt.Errorf("%w: the channel's machine %q is not on their list", ErrLimited, rt.Machine)
+	}
+	owner, err := r.hub.Owner(ctx, thread)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil
+	case err != nil:
+		return err
+	case !r.limited.Allow(m.User, owner):
+		return fmt.Errorf("%w: the thread's owner %q is not on their list", ErrLimited, owner)
+	}
+	return nil
+}
+
 // RouteNew queues m, the message that starts thread in channel, for the
 // machine of the channel's route, which becomes the thread's owner, with
 // channelName, the channel's name, and the route's scope recorded along;
 // m carries that scope. If thread already has an owner, m goes to that
 // owner instead. It returns the client the message was queued for.
 func (r *Router) RouteNew(ctx context.Context, channel, channelName, thread string, m payload.Message) (string, error) {
+	if err := r.limit(ctx, channel, thread, m); err != nil {
+		return "", err
+	}
 	rt, err := r.hub.Route(ctx, channel)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return "", err
@@ -72,6 +139,10 @@ func (r *Router) RouteNewDM(ctx context.Context, thread string, m payload.Messag
 // RouteReply queues m, a reply in thread, for the thread's owner, with the
 // scope recorded with the owner, and returns the owner.
 func (r *Router) RouteReply(ctx context.Context, thread string, m payload.Message) (string, error) {
+	channel, _, _ := slack.ParseThreadKey(thread)
+	if err := r.limit(ctx, channel, thread, m); err != nil {
+		return "", err
+	}
 	client, err := r.hub.Owner(ctx, thread)
 	if errors.Is(err, store.ErrNotFound) {
 		return "", ErrNoOwner

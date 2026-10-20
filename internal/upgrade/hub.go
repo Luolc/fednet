@@ -15,6 +15,7 @@ import (
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/release"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -85,10 +86,12 @@ type Hub struct {
 	// successor; it is handoff.Process.Exit. Run returns then, after the
 	// summary of an upgrade waiting for just that.
 	HandedOff <-chan struct{}
-	// Users is the user list; only people on it get an answer. Admins are
-	// the Slack user ids of those who may upgrade, each on Users.
-	Users  map[string]string
-	Admins []string
+	// Users is the user list; only people on it, and limited users, get
+	// an answer. Admins are the Slack user ids of those who may upgrade,
+	// each on Users.
+	Users   map[string]string
+	Limited route.Limited
+	Admins  []string
 	// Ops maps each operation, OpVersion or OpUpgrade, to the clients
 	// that may ask for it; any other client is refused.
 	Ops map[string][]string
@@ -164,10 +167,11 @@ func (h *Hub) startCh() chan rollout {
 }
 
 // Command answers c: `version` says what runs where, `upgrade` shows the
-// card that starts an upgrade. Only people on the user list are answered
-// in kind, and only admins can upgrade.
+// card that starts an upgrade. Only people on the user list, and limited
+// users, are answered in kind, and only admins can upgrade.
 func (h *Hub) Command(ctx context.Context, c slack.Command) (slack.CommandReply, error) {
-	if _, ok := h.Users[c.User]; !ok {
+	_, full := h.Users[c.User]
+	if _, limited := h.Limited[c.User]; !full && !limited {
 		return slack.CommandReply{Text: "你不在 fednet 的用户名单上"}, nil
 	}
 	switch strings.TrimSpace(c.Text) {

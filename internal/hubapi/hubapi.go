@@ -83,10 +83,10 @@ const (
 	GetChannelContext = "channel-context-get"
 	// SetChannelContext replaces the description of Channel with Text.
 	SetChannelContext = "channel-context-set"
-	// Users returns the user list.
+	// Users returns the user list, then the limited users.
 	Users = "users"
 	// DM sends Text to User, who must be on the user list, as a direct
-	// message.
+	// message; a limited user gets none.
 	DM = "dm"
 	// RequestApproval asks the people on the approver list to approve an
 	// action: Text says what it does, Action is its parameters, Agent is
@@ -202,6 +202,10 @@ type User struct {
 	ID string `json:"id"`
 	// Name is what the agents call them; it may be empty.
 	Name string `json:"name,omitempty"`
+	// Limited is set for a limited user, whose messages go only to
+	// Machines, the clients on their list.
+	Limited  bool     `json:"limited,omitempty"`
+	Machines []string `json:"machines,omitempty"`
 }
 
 // Reply is the hub's answer. Which fields are set depends on the command.
@@ -261,6 +265,9 @@ type Server struct {
 	// serves, mapped to a name for the agents, which may be empty. Only
 	// people on it get direct messages.
 	Users map[string]string
+	// Limited is the limited users, listed after the user list and
+	// mentioned as the people on it are.
+	Limited route.Limited
 	// Questions runs the question cards; nil means the hub runs none,
 	// and Ask and AskClose are refused.
 	Questions *ask.Flow
@@ -761,13 +768,26 @@ func (s *Server) setChannelContext(ctx context.Context, r Request) error {
 	return err
 }
 
-// users returns the user list, ordered by id.
+// users returns the user list, then the limited users, each ordered by
+// id.
 func (s *Server) users() []User {
 	var us []User
 	for _, id := range slices.Sorted(maps.Keys(s.Users)) {
 		us = append(us, User{ID: id, Name: s.Users[id]})
 	}
+	for _, id := range slices.Sorted(maps.Keys(s.Limited)) {
+		u := s.Limited[id]
+		us = append(us, User{ID: id, Name: u.Name, Limited: true, Machines: u.Machines})
+	}
 	return us
+}
+
+// mentionable reports whether u may be mentioned: one on the user list,
+// or a limited user.
+func (s *Server) mentionable(u string) bool {
+	_, full := s.Users[u]
+	_, limited := s.Limited[u]
+	return full || limited
 }
 
 func (s *Server) dm(ctx context.Context, r Request) error {
@@ -776,6 +796,9 @@ func (s *Server) dm(ctx context.Context, r Request) error {
 	}
 	if err := checkLength(r.Text); err != nil {
 		return err
+	}
+	if _, ok := s.Limited[r.User]; ok {
+		return link.Refuse(link.ErrDenied, "user %s is a limited user, who gets no direct messages", r.User)
 	}
 	if _, ok := s.Users[r.User]; !ok {
 		return link.Refuse(link.ErrDenied, "user %s is not on the user list", r.User)
@@ -791,7 +814,7 @@ func (s *Server) checkMentions(r Request) error {
 		return link.Refuse(link.ErrBadRequest, "no users to mention")
 	}
 	for _, u := range r.Mentions {
-		if _, ok := s.Users[u]; !ok {
+		if !s.mentionable(u) {
 			return link.Refuse(link.ErrDenied, "user %s is not on the user list", u)
 		}
 	}
@@ -968,7 +991,7 @@ func (s *Server) requestChannel(ctx context.Context, client string, r Request) (
 		return "", link.Refuse(link.ErrDenied, "%v", approval.ErrOff)
 	}
 	for _, u := range q.Create.Invite {
-		if _, ok := s.Users[u]; !ok {
+		if !s.mentionable(u) {
 			return "", link.Refuse(link.ErrBadRequest, "%s is not on the user list", u)
 		}
 	}

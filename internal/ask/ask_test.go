@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/question"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -366,5 +368,75 @@ func TestWithdraw(t *testing.T) {
 	}
 	if as := tf.answers(t); len(as) != 1 || as[0].Outcome != question.Snoozed {
 		t.Fatalf("answers = %+v, want only the snooze", as)
+	}
+}
+
+// limited makes U3 a limited user of tf on the workstation and returns a
+// new thread in C1 that owner owns, or no one when owner is empty.
+func (tf *testFlow) limited(t *testing.T, owner string) string {
+	t.Helper()
+	tf.Limited = route.Limited{"U3": {Name: "collaborator", Machines: []string{"workstation"}}}
+	root, err := tf.f.Start("C1", "U1", "另一件事")
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread := slack.ThreadKey("C1", root)
+	if owner != "" {
+		if err := tf.Store.Claim(t.Context(), thread, owner, "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return thread
+}
+
+// A limited user may be mentioned on a card, and their press counts, by
+// them, only on a card in a thread whose owner is on their list; on any
+// other card it changes nothing and gets a hint.
+func TestLimitedUserAnswers(t *testing.T) {
+	tf := newFlow(t)
+	ctx := t.Context()
+	var ps []Posted
+	for i, owner := range []string{"", "datamachine", "workstation"} {
+		p, err := tf.Ask(ctx, "workstation", tf.limited(t, owner), "q-"+strconv.Itoa(i), []byte(card), []string{"U3"})
+		if err != nil {
+			t.Fatalf("Ask in a thread owned by %q, mentioning a limited user: %v", owner, err)
+		}
+		tf.click(t, p, "U3", slack.QuestionSubmitAction, "1", "")
+		ps = append(ps, p)
+	}
+	want := question.Answer{QuestionID: "q-2", CardID: ps[2].ID, Outcome: question.Answered, Choice: &question.Choice{Index: 1, Short: "放宽"}, By: "U3", At: "2026-10-16T09:00:20Z"}
+	if as := tf.answers(t); len(as) != 1 || !same(as[0], want) {
+		t.Fatalf("answers = %+v, want only %+v", as, want)
+	}
+	tf.pass(t)
+	for _, p := range ps[:2] {
+		if c, _ := tf.f.Question("C1", p.TS); c.State != "" {
+			t.Fatalf("card %s = %+v, want it still waiting", p.ID, c)
+		}
+	}
+	if w := tf.f.Whispers("U3"); len(w) != 2 || w[0] != notOpenText || w[1] != notOpenText {
+		t.Fatalf("hints to U3 = %q, want two that the card is not theirs to answer", w)
+	}
+}
+
+// A limited user's press does not count on a card a client off their list
+// asked, even in a thread whose owner is on it.
+func TestLimitedUserAnswersOnlyTheirClients(t *testing.T) {
+	tf := newFlow(t)
+	ctx := t.Context()
+	p, err := tf.Ask(ctx, "datamachine", tf.limited(t, "workstation"), "q-1", []byte(card), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tf.click(t, p, "U3", slack.QuestionSubmitAction, "1", "")
+	if ds, err := tf.Store.Outbox.After(ctx, "datamachine", 0); err != nil || len(ds) != 0 {
+		t.Fatalf("queued for datamachine = %d, %v; want nothing", len(ds), err)
+	}
+	tf.pass(t)
+	if c, _ := tf.f.Question("C1", p.TS); c.State != "" {
+		t.Fatalf("card = %+v, want it still waiting", c)
+	}
+	if w := tf.f.Whispers("U3"); len(w) != 1 || w[0] != notOpenText {
+		t.Fatalf("hints to U3 = %q, want one that the card is not theirs to answer", w)
 	}
 }

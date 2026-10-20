@@ -18,6 +18,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/question"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -56,9 +57,13 @@ var (
 type Flow struct {
 	Store *store.Hub
 	Slack slack.API
-	// Users is the user list: only the people on it may act on a card or
-	// be mentioned.
+	// Users is the user list: only the people on it, and limited users,
+	// may act on a card or be mentioned.
 	Users map[string]string
+	// Limited is the limited users: a click of one counts only on a card
+	// whose thread's owner and whose asking client are both on their
+	// list.
+	Limited route.Limited
 	// Interval is how often Run sweeps; zero means DefaultInterval.
 	Interval time.Duration
 	// SlackTimeout bounds each Slack call a sweep makes; zero means
@@ -105,7 +110,7 @@ func (f *Flow) Ask(ctx context.Context, client, thread, ref string, card []byte,
 		return Posted{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	for _, u := range mentions {
-		if _, ok := f.Users[u]; !ok {
+		if !f.listed(u) {
 			return Posted{}, fmt.Errorf("%w: %s", ErrNotListed, u)
 		}
 	}
@@ -171,17 +176,17 @@ func (f *Flow) Withdraw(ctx context.Context, client, id, note string) error {
 	return err
 }
 
-// Click applies c. A click counts only if the clicker is on the user list
-// and not a bot, c names the card where it is now, and the card waits,
-// all judged again under the database's write lock; a submit of "other"
-// needs a note. A click that does not count changes nothing, and the
-// clicker is told why in a hint the next Pass delivers; a submit with no
-// option and no note gets it on the card, above submit. A click that
-// counts records the answer and queues it for the client in the same
-// transaction; the card is brought up to date by the next Pass. Click
-// calls Slack itself only to open the time picker, which must be within
-// seconds of the click. An error means nothing was recorded and the click
-// should not be acked.
+// Click applies c. A click counts only if the clicker is on the user list,
+// or a limited user the card is open to (see Flow.Limited), and not a bot,
+// c names the card where it is now, and the card waits, all judged again
+// under the database's write lock; a submit of "other" needs a note. A
+// click that does not count changes nothing, and the clicker is told why
+// in a hint the next Pass delivers; a submit with no option and no note
+// gets it on the card, above submit. A click that counts records the
+// answer and queues it for the client in the same transaction; the card
+// is brought up to date by the next Pass. Click calls Slack itself only to
+// open the time picker, which must be within seconds of the click. An
+// error means nothing was recorded and the click should not be acked.
 func (f *Flow) Click(ctx context.Context, c slack.QuestionClick) error {
 	h, err := f.click(ctx, c)
 	if err != nil {
@@ -227,6 +232,10 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 	case c.Channel != channel || c.TS != q.TS:
 		h.text = "这个按钮不在编号 " + c.ID + " 的问题卡上"
 		return h, nil
+	}
+	if open, err := f.openTo(ctx, f.Store, c.User, q); err != nil || !open {
+		h.text = notOpenText
+		return h, err
 	}
 	if q.Status != store.QuestionOpen {
 		h.text = "这个问题已经处理过了"
@@ -275,9 +284,14 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 			return hint{}, nil
 		}
 	}
+	closed := false
 	queued, err := f.Store.ChangeQuestion(ctx, q.ID, func(tx *store.Hub, cur *store.Question) (bool, error) {
 		if cur.Status != store.QuestionOpen || cur.TS != q.TS {
 			return false, nil
+		}
+		if open, err := f.openTo(ctx, tx, c.User, *cur); err != nil || !open {
+			closed = true
+			return false, err
 		}
 		b, err := f.queue(ctx, tx, cur.Client, a)
 		if err != nil {
@@ -289,10 +303,13 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 		}
 		return true, nil
 	})
-	if err != nil {
+	switch {
+	case err != nil:
 		return h, err
-	}
-	if !queued {
+	case closed:
+		h.text = notOpenText
+		return h, nil
+	case !queued:
 		h.text = "这个问题已经处理过了"
 		return h, nil
 	}
@@ -314,9 +331,31 @@ func (f *Flow) queue(ctx context.Context, tx *store.Hub, client string, a questi
 	return b, err
 }
 
+// notOpenText is the hint for a limited user's click on a card not open
+// to them.
+const notOpenText = "这张问题卡不在你能回答的机器范围内，按了不算数"
+
 func (f *Flow) listed(user string) bool {
-	_, ok := f.Users[user]
-	return ok
+	_, full := f.Users[user]
+	_, limited := f.Limited[user]
+	return full || limited
+}
+
+// openTo reports whether user, who is listed, may answer q as h has it:
+// anyone on the user list may; a limited user only if q's thread's owner
+// and the client that asked are both on their list.
+func (f *Flow) openTo(ctx context.Context, h *store.Hub, user string, q store.Question) (bool, error) {
+	if _, ok := f.Limited[user]; !ok {
+		return true, nil
+	}
+	owner, err := h.Owner(ctx, q.Thread)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return f.Limited.Allow(user, owner) && f.Limited.Allow(user, q.Client), nil
 }
 
 // Nudge tells Run that there is a card to bring up to date or a hint to

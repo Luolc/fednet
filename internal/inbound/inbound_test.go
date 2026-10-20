@@ -23,6 +23,7 @@ import (
 	"github.com/Luolc/fednet/internal/ask"
 	"github.com/Luolc/fednet/internal/outbound"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 	"github.com/Luolc/fednet/internal/watch"
@@ -1738,5 +1739,77 @@ func TestRunReaction(t *testing.T) {
 	send("env2", onRoot)
 	if id := tr.ack(200 * time.Millisecond); id != "" {
 		t.Fatalf("acked %q although the reaction was not queued", id)
+	}
+}
+
+// A limited user's messages and reactions are taken in only in a channel
+// whose machine is on their list, and in a thread with an owner only if
+// the owner is on it too; a direct message never is. What is not taken
+// in is not recorded either.
+func TestHandleLimitedUser(t *testing.T) {
+	ctx := t.Context()
+	r, _ := newReceiver(t)
+	h := r.Store
+	r.Limited = route.Limited{"U3": {Name: "collaborator", Machines: []string{"datamachine"}}}
+	// Direct messages go to the data machine, so that only the rule for
+	// direct messages keeps them out.
+	setRoute(t, h, store.Route{Channel: store.DMRoute, Machine: "datamachine"})
+	if err := h.Claim(ctx, "C2/5.0", "workstation", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Claim(ctx, "C1/6.0", "datamachine", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	from := func(ev Event) Event {
+		ev.User = "U3"
+		return ev
+	}
+
+	handle(t, r, from(message("Ev1", "C2", "1.1", "", hey+"on the data machine")))
+	handle(t, r, from(message("Ev2", "C2", "1.2", "1.1", "reply there")))
+	if err := r.React(ctx, Reaction{Channel: "C2", TS: "1.1", User: "U3", Name: "package"}); err != nil {
+		t.Fatal(err)
+	}
+	seen, err := h.SlackState(ctx, store.LastSeen)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dm := from(message("Ev3", "D1", "2.1", "", "psst"))
+	dm.IM = true
+	for _, ev := range []Event{
+		from(message("Ev4", "C1", "3.1", "", hey+"on the workstation")),
+		from(message("Ev5", "C3", "3.2", "", hey+"on no machine")),
+		dm,
+		from(message("Ev6", "C2", "5.1", "5.0", hey+"in the workstation's thread")),
+		from(message("Ev7", "C1", "6.1", "6.0", hey+"in a workstation channel")),
+	} {
+		handle(t, r, ev)
+	}
+	for _, a := range []Reaction{{Channel: "C2", TS: "5.0", User: "U3", Name: "package"}, {Channel: "C1", TS: "6.0", User: "U3", Name: "package"}} {
+		if err := r.React(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := queued(t, h, "datamachine")
+	want := []payload.Message{
+		{Type: payload.Inbound, Thread: "C2/1.1", Text: hey + "on the data machine", User: "U3", UserName: "collaborator", TS: "1.1", Context: "the data channel", Trigger: payload.Mention},
+		{Type: payload.Inbound, Thread: "C2/1.1", Text: "reply there", User: "U3", UserName: "collaborator", TS: "1.2", Trigger: payload.Reply},
+		{Type: payload.Reaction, Thread: "C2/1.1", User: "U3", UserName: "collaborator", Reaction: "package"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("queued for datamachine = %+v, want %+v", got, want)
+	}
+	if got := queued(t, h, "workstation"); len(got) != 0 {
+		t.Fatalf("queued for workstation = %+v, want none", got)
+	}
+	for _, thread := range []string{"C1/3.1", "C3/3.2", "D1/2.1"} {
+		if _, err := h.Owner(ctx, thread); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Owner(%s) = %v, want ErrNotFound", thread, err)
+		}
+	}
+	if after, err := h.SlackState(ctx, store.LastSeen); err != nil || after != seen {
+		t.Fatalf("last seen = %q, %v; want %q, nothing refused recorded", after, err, seen)
 	}
 }

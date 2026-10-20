@@ -378,7 +378,7 @@ func TestAsk(t *testing.T) {
 		t.Fatalf("Do(channel-context-get) = %+v, %v; want the purpose", res, err)
 	}
 	res, err = Do(ctx, path, Request{Cmd: hubapi.Users})
-	if users := []hubapi.User{{ID: "U1", Name: "maintainer"}}; err != nil || res.Error != "" || !slices.Equal(res.Users, users) {
+	if users := []hubapi.User{{ID: "U1", Name: "maintainer"}}; err != nil || res.Error != "" || !reflect.DeepEqual(res.Users, users) {
 		t.Fatalf("Do(users) = %+v, %v; want %+v", res, err, users)
 	}
 	res, err = Do(ctx, path, Request{Cmd: hubapi.DM, User: "U1", Text: "daily report"})

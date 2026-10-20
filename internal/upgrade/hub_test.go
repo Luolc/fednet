@@ -15,6 +15,7 @@ import (
 
 	"github.com/Luolc/fednet/internal/link"
 	"github.com/Luolc/fednet/internal/payload"
+	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
 )
@@ -171,8 +172,8 @@ func (b *bench) click(t *testing.T, user, id string, confirm bool) string {
 	return rs[n]
 }
 
-// `version` tells anyone on the user list what runs where; `upgrade` is
-// for admins alone, and shows the card only when there is a newer
+// `version` tells anyone on the user list, and limited users, what runs
+// where; `upgrade` is for admins alone, and shows the card only when there is a newer
 // release to go to.
 func TestCommand(t *testing.T) {
 	b := newBench(t)
@@ -196,6 +197,13 @@ func TestCommand(t *testing.T) {
 	}
 	if r := b.cmd(t, "U2", "upgrade"); r.Card != nil || !strings.Contains(r.Text, "管理员") {
 		t.Fatalf("someone who is not an admin got %+v", r)
+	}
+	b.h.Limited = route.Limited{"U4": {Name: "collaborator", Machines: []string{"datamachine"}}}
+	if r := b.cmd(t, "U4", "version"); !strings.Contains(r.Text, "hub：v0.1.0") {
+		t.Fatalf("version for a limited user = %q, want what runs where", r.Text)
+	}
+	if r := b.cmd(t, "U4", "upgrade"); r.Card != nil || !strings.Contains(r.Text, "管理员") {
+		t.Fatalf("a limited user got %+v", r)
 	}
 	r = b.cmd(t, "U1", "upgrade")
 	if r.Card == nil || r.Card.From != "v0.1.0" || r.Card.To != "v0.2.0" || len(r.Card.Clients) != 2 {
