@@ -76,8 +76,11 @@ type Poster struct {
 	// Interval is how often Run looks at the inbox when not nudged, and
 	// how long it waits after a failure. Zero means DefaultInterval.
 	Interval time.Duration
-	// Users is the user list: a post mentions only the people on it.
+	// Users is the user list: a post mentions only the people on it, and
+	// limited users.
 	Users map[string]string
+	// Limited is the limited users.
+	Limited route.Limited
 	// Relays is the relay list: which clients each client may deliver
 	// its posts to.
 	Relays route.Relays
@@ -415,7 +418,8 @@ func (p *Poster) post(ctx context.Context, u store.Uplink) error {
 	return nil
 }
 
-// mentions returns the people m mentions who are on the user list. The
+// mentions returns the people m mentions who are on the user list or
+// limited users. The
 // client checked them with the hub before it queued m; one who has left
 // the list since is not mentioned, and m goes out all the same.
 func (p *Poster) mentions(msgID string, m payload.Message) []string {
@@ -424,7 +428,8 @@ func (p *Poster) mentions(msgID string, m payload.Message) []string {
 	}
 	var users []string
 	for _, u := range m.Mentions {
-		if _, ok := p.Users[u]; !ok {
+		_, full := p.Users[u]
+		if _, limited := p.Limited[u]; !full && !limited {
 			slog.Warn("outbound: not mentioning a user who is not on the user list", "msg_id", msgID, "user", u)
 			continue
 		}

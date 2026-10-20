@@ -84,7 +84,11 @@ commands:
         channels and dm are read only once, into a database with no
         routes, and ignored after that, with a warning; the config file
         lists the Slack users fednet serves, each with a name for the
-        agents, which may be empty, names the channel approval cards and
+        agents, which may be empty, and the limited users, each with a
+        name and the clients their messages, reactions and answers to
+        question cards may go to (they get no direct messages, and their
+        own are not taken in; none may be on the user list, approve or
+        upgrade), names the channel approval cards and
         route requests go to and the users, from that list, who may
         approve, bounds the thread history a message that mentions the bot
         carries (how many messages, how many characters in all, how many
@@ -104,6 +108,7 @@ commands:
         -owner route and post -deliver (none unless listed):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
+         "limited_users": {"U789": {"name": "NAME", "machines": ["CLIENT-ID"]}},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
          "approvals": {"channel": "C456", "approvers": ["U123"]},
          "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
@@ -246,7 +251,8 @@ commands:
   client channel-context set -socket PATH -body-file FILE [-json] CHANNEL
         replace a channel's description with the contents of FILE
   client users -socket PATH [-json]
-        print the user list: each user's Slack id and name
+        print the user list, then the limited users: each user's Slack id
+        and name, and for a limited user the clients on their list
   client dm -socket PATH -user USER-ID [-json] [--] TEXT
         send TEXT as a direct message to a user on the user list; TEXT is
         standard Markdown, as with post, at most 4000 characters, in one
@@ -507,6 +513,10 @@ type hubConfig struct {
 	// Users maps the Slack user id of each person fednet serves to a name
 	// for the agents, which may be empty.
 	Users map[string]string `json:"users"`
+	// LimitedUsers maps the Slack user id of each limited user to their
+	// name and the clients their messages may go to; none is on Users,
+	// so that a hub that does not know the key serves them nothing.
+	LimitedUsers route.Limited `json:"limited_users"`
 	// Alerts sets the thresholds of the hub's alerts; a field left out
 	// keeps the watch package's default.
 	Alerts struct {
@@ -619,6 +629,19 @@ func readHubConfig(path string) (hubConfig, error) {
 	}
 	if cfg.Files.UploadComment != nil {
 		slog.Info("hub: ignoring files.upload_comment, which is no longer used", "config", path)
+	}
+	for id, u := range cfg.LimitedUsers {
+		_, full := cfg.Users[id]
+		switch {
+		case full:
+			return hubConfig{}, fmt.Errorf("%s: %s is both on the user list and a limited user", path, id)
+		case len(u.Machines) == 0 || slices.Contains(u.Machines, ""):
+			return hubConfig{}, fmt.Errorf("%s: limited user %s needs machines, each a client id", path, id)
+		case slices.Contains(cfg.Approvals.Approvers, id):
+			return hubConfig{}, fmt.Errorf("%s: approver %s is a limited user, who may not approve", path, id)
+		case slices.Contains(cfg.Upgrade.Admins, id):
+			return hubConfig{}, fmt.Errorf("%s: upgrade admin %s is a limited user, who may not upgrade", path, id)
+		}
 	}
 	for _, u := range cfg.Approvals.Approvers {
 		if _, ok := cfg.Users[u]; !ok {
@@ -809,7 +832,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 			slog.Warn("hub: ignoring the config's channels and dm: the routes are in the database", "config", *configPath)
 		}
 	}
-	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval, Users: cfg.Users, Relays: cfg.Relay}
+	poster := &outbound.Poster{Store: st, Slack: sl, Alert: webhook, Interval: outboundInterval, Users: cfg.Users, Limited: cfg.LimitedUsers, Relays: cfg.Relay}
 	hub := &link.Hub{
 		Store:         st,
 		Identify:      (&auth.Authenticator{Store: st}).Identify,
@@ -823,20 +846,20 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	var approvals *approval.Flow
 	var questions *ask.Flow
 	if sl != nil {
-		questions = &ask.Flow{Store: st, Slack: sl, Users: cfg.Users, Stored: hub.WakeAll}
+		questions = &ask.Flow{Store: st, Slack: sl, Users: cfg.Users, Limited: cfg.LimitedUsers, Stored: hub.WakeAll}
 		approvals = &approval.Flow{
 			Store: st, Slack: sl, Key: key, Channel: cfg.Approvals.Channel, Approvers: cfg.Approvals.Approvers,
 			TTL: approvalTTL, Interval: approvalInterval, Stored: hub.WakeAll,
 		}
 	}
-	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Approvals: approvals, Questions: questions,
+	api := &hubapi.Server{Store: st, Slack: sl, Users: cfg.Users, Limited: cfg.LimitedUsers, Approvals: approvals, Questions: questions,
 		MaxFetchBytes: cfg.Files.FetchMaxBytes, MaxUploadBytes: cfg.Files.UploadMaxBytes, MaxUploadFiles: cfg.Files.UploadMaxFiles,
 		CatchUp: poster.CatchUp, Relays: cfg.Relay, Stored: hub.WakeAll}
 	poster.Stored = hub.WakeAll
 	hub.Answer, hub.Fetch, hub.Upload = api.Answer, api.Fetch, api.Upload
 	upgrades := &upgrade.Hub{
 		Store: st, Version: version, Releases: releases, Online: hub.Online, Slack: sl, Scopes: scopes, Request: *upgradeRequest, HandedOff: proc.Exit(),
-		Users: cfg.Users, Admins: cfg.Upgrade.Admins, Ops: cfg.ops(), Auto: cfg.auto(),
+		Users: cfg.Users, Limited: cfg.LimitedUsers, Admins: cfg.Upgrade.Admins, Ops: cfg.ops(), Auto: cfg.auto(),
 		Interval: upgradeTimings.interval, Wait: upgradeTimings.wait, Poll: upgradeTimings.poll, Fetch: upgradeTimings.fetch,
 		Send: func(ctx context.Context, client string, payload []byte) error {
 			_, err := hub.Send(ctx, client, payload)
@@ -878,7 +901,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	if sl == nil {
 		slog.Info("hub: Slack not configured, serving the clients only")
 	} else {
-		r = &inbound.Receiver{Store: st, Slack: sl, Users: cfg.Users, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Questions: questions, Commands: upgrades, Stored: func() {
+		r = &inbound.Receiver{Store: st, Slack: sl, Users: cfg.Users, Limited: cfg.LimitedUsers, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Questions: questions, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
 		}}
@@ -1766,8 +1789,9 @@ func clientChannelContext(ctx context.Context, args []string, stdout io.Writer) 
 	return err
 }
 
-// clientUsers prints the user list, one user a line: the id, then the name
-// if there is one.
+// clientUsers prints the user list, then the limited users, one user a
+// line: the id, then the name if there is one, then for a limited user
+// the clients on their list.
 func clientUsers(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet client users", flag.ContinueOnError)
 	socket, asJSON := socketFlags(fs)
@@ -1785,7 +1809,11 @@ func clientUsers(ctx context.Context, args []string, stdout io.Writer) error {
 		return json.NewEncoder(stdout).Encode(res)
 	}
 	for _, u := range res.Users {
-		if _, err := fmt.Fprintln(stdout, strings.TrimSpace(u.ID+" "+u.Name)); err != nil {
+		line := strings.TrimSpace(u.ID + " " + u.Name)
+		if u.Limited {
+			line += " (limited to " + strings.Join(u.Machines, ", ") + ")"
+		}
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
 			return err
 		}
 	}

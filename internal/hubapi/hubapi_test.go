@@ -474,12 +474,17 @@ func TestChannelThreads(t *testing.T) {
 	}
 }
 
+// users lists the user list, then the limited users, each marked
+// limited with the clients on their list.
 func TestUsers(t *testing.T) {
 	s, _ := testServer(t)
 	s.Users = map[string]string{"U2": "", "U1": "maintainer"}
+	s.Limited = route.Limited{"U4": {Machines: []string{"datamachine"}}, "U3": {Name: "collaborator", Machines: []string{"datamachine", "workstation"}}}
 	got, err := answer(t, s, "workstation", Request{Cmd: Users})
-	want := []User{{ID: "U1", Name: "maintainer"}, {ID: "U2"}}
-	if err != nil || !slices.Equal(got.Users, want) {
+	want := []User{{ID: "U1", Name: "maintainer"}, {ID: "U2"},
+		{ID: "U3", Name: "collaborator", Limited: true, Machines: []string{"datamachine", "workstation"}},
+		{ID: "U4", Limited: true, Machines: []string{"datamachine"}}}
+	if err != nil || !reflect.DeepEqual(got.Users, want) {
 		t.Fatalf("users = %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -487,6 +492,7 @@ func TestUsers(t *testing.T) {
 func TestDM(t *testing.T) {
 	s, f := testServer(t)
 	s.Users = map[string]string{"U1": "maintainer", "U2": ""}
+	s.Limited = route.Limited{"U3": {Name: "collaborator", Machines: []string{"workstation"}}}
 	if _, err := answer(t, s, "workstation", Request{Cmd: DM, User: "U1", Text: "daily report"}); err != nil {
 		t.Fatal(err)
 	}
@@ -505,6 +511,7 @@ func TestDM(t *testing.T) {
 		want error
 	}{
 		{"a user not on the list", Request{Cmd: DM, User: "U9", Text: "x"}, link.ErrDenied},
+		{"a limited user", Request{Cmd: DM, User: "U3", Text: "x"}, link.ErrDenied},
 		{"no user", Request{Cmd: DM, Text: "x"}, link.ErrBadRequest},
 		{"no text", Request{Cmd: DM, User: "U1"}, link.ErrBadRequest},
 		{"a text over MaxTextChars", Request{Cmd: DM, User: "U1", Text: full + "字"}, link.ErrBadRequest},
@@ -514,19 +521,25 @@ func TestDM(t *testing.T) {
 			t.Errorf("%s: dm = %v, want %v", tt.name, err, tt.want)
 		}
 	}
-	if got := f.DMs("U9"); len(got) != 0 {
-		t.Fatalf("DMs to the user not on the list = %q, want none", got)
+	for _, u := range []string{"U9", "U3"} {
+		if got := f.DMs(u); len(got) != 0 {
+			t.Fatalf("DMs to %s = %q, want none", u, got)
+		}
 	}
 	if got := f.DMs("U1"); len(got) != 1 {
 		t.Fatalf("DMs to U1 = %q, want only the report", got)
+	}
+	if _, err := answer(t, s, "workstation", Request{Cmd: DM, User: "U3", Text: "x"}); err == nil || !strings.Contains(err.Error(), "limited user") {
+		t.Fatalf("dm to a limited user = %v, want it refused as one", err)
 	}
 }
 
 func TestCheckMentions(t *testing.T) {
 	s, _ := testServer(t)
 	s.Users = map[string]string{"U1": "maintainer", "U2": ""}
-	if _, err := answer(t, s, "workstation", Request{Cmd: CheckMentions, Mentions: []string{"U1", "U2"}}); err != nil {
-		t.Fatalf("check-mentions of users on the list = %v", err)
+	s.Limited = route.Limited{"U3": {Name: "collaborator", Machines: []string{"datamachine"}}}
+	if _, err := answer(t, s, "workstation", Request{Cmd: CheckMentions, Mentions: []string{"U1", "U2", "U3"}}); err != nil {
+		t.Fatalf("check-mentions of users on the list and a limited user = %v", err)
 	}
 	if _, err := answer(t, s, "workstation", Request{Cmd: CheckMentions, Mentions: []string{"U1", "U9"}}); !errors.Is(err, link.ErrDenied) {
 		t.Fatalf("check-mentions of a user not on the list = %v, want ErrDenied", err)
@@ -799,6 +812,7 @@ func TestRequestChannel(t *testing.T) {
 	f.AddChannel("C9", "approvals")
 	ctx := t.Context()
 	s.Users = map[string]string{"U1": "maintainer", "U2": "colleague"}
+	s.Limited = route.Limited{"U3": {Name: "collaborator", Machines: []string{"datamachine"}}}
 	for _, c := range []string{"workstation", "datamachine"} {
 		if err := s.Store.Register(ctx, c, []byte("h")); err != nil {
 			t.Fatal(err)
@@ -807,7 +821,7 @@ func TestRequestChannel(t *testing.T) {
 	req := func(q RouteRequest) Request {
 		return Request{Cmd: RequestChannel, Agent: "lead", Text: "new repo", Route: &q}
 	}
-	good := req(RouteRequest{Machine: "workstation", Scope: "data", Create: &approval.NewChannel{Name: "repo-example", Purpose: "the example repo", Invite: []string{"U2"}}})
+	good := req(RouteRequest{Machine: "workstation", Scope: "data", Create: &approval.NewChannel{Name: "repo-example", Purpose: "the example repo", Invite: []string{"U2", "U3"}}})
 	if _, err := answer(t, s, "workstation", good); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), "not set up") {
 		t.Fatalf("request-channel without approvals = %v, want denied as not set up", err)
 	}
@@ -841,7 +855,7 @@ func TestRequestChannel(t *testing.T) {
 	if len(cards) != 1 || json.Compact(&params, []byte(cards[0].Params)) != nil {
 		t.Fatalf("cards = %+v, want one", cards)
 	}
-	want := `{"machine":"workstation","scope":"data","open_thread":["workstation"],"create":{"name":"repo-example","purpose":"the example repo","invite":["U2"]}}`
+	want := `{"machine":"workstation","scope":"data","open_thread":["workstation"],"create":{"name":"repo-example","purpose":"the example repo","invite":["U2","U3"]}}`
 	if cards[0].ID != reply.ApprovalID || params.String() != want || cards[0].Summary != "建 channel 并写路由：new repo" {
 		t.Fatalf("card = %+v, want %s with %s", cards[0], reply.ApprovalID, want)
 	}
