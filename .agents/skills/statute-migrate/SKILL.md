@@ -49,9 +49,9 @@ files changes, this table is the one place to change.
 | the private links | `CLAUDE.local.md` and `AGENTS.override.md`, both leading to the private output | no, ignored through the exclude file |
 | the exclude file | `.git/info/exclude`, shared by the worktrees of a clone | no, in git's own directory |
 | the checkout hook | the file `git rev-parse --git-path hooks/post-checkout` prints, shared by the worktrees of a clone | no, in git's own directory |
-| the hook line | `[ "$3" = 1 ] && statute compile --private-only; exit 0` | in the checkout hook |
+| the hook line | `[ "$3" = 1 ] && statute compile --private-only \|\| true` | in the checkout hook |
 | the merge hook | the file `git rev-parse --git-path hooks/post-merge` prints, shared by the worktrees of a clone | no, in git's own directory |
-| the merge hook line | `statute compile --private-only; exit 0` | in the merge hook |
+| the merge hook line | `statute compile --private-only \|\| true` | in the merge hook |
 | a legacy copy | `<name>.legacy.md` beside the hand-written `<name>.md` it replaces, as `AGENTS.legacy.md` | yes, until the person says to delete it |
 | the constitution for agents | `constitution/<edition>/generated/constitution.<lang>.agent.md` in the first-party source | in the source |
 | the rules of a source | `rules/<id>.toml` at the top of that source, or in the directory its `rules-dir` names | in the source |
@@ -59,7 +59,10 @@ files changes, this table is the one place to change.
 ## 0. Before you start
 
 1. statute runs: `statute --version` prints 0.1.18 or later, the first
-   version that records its version in the lock file (step g). Run every
+   version that records its version in the lock file (step g). In a
+   public repository with a private output, it prints 0.1.32 or later,
+   the first version that adds the private links to the exclude file
+   itself (step g.2) and installs the hooks (step g.4). Run every
    `statute` command from the directory of the rule set.
 2. The global configuration exists. Without it, `statute init` takes
    the built-in first-party source, which is enough for a public
@@ -68,9 +71,8 @@ files changes, this table is the one place to change.
    ([Questions](#questions), Q1). In a public repository, a
    `personal` parameter whose value in the global configuration differs
    from the committed one (such as the language an agent writes to the
-   person in) makes a private output by itself, so even with no
-   private rules `statute compile` asks for the two private links in
-   the exclude file first (step g).
+   person in) makes a private output by itself, even with no private
+   rules.
 3. The repository has no rule set yet. One that has a rule set
    written before default switches is redone from step b: its `rules`
    and `packs` are where the three lists of step f start.
@@ -282,36 +284,37 @@ default, and turned off", since the rule was never on by default;
 2. `statute compile`. It writes the compiled file, the installed
    skills, and with a private layer the private output
    and the private links, and the statute ignore file before the files
-   it lists. When it names lines to add to the exclude file or a file
-   git does not ignore, fix that and run it again; it writes nothing
-   until everything is in place.
+   it lists. With a private output, it adds the lines for the private
+   links that the exclude file lacks. When it fails on a private link
+   (a `.gitignore` decides it, git still does not ignore it, or a file
+   that is not statute's link is in its place), fix what it names and
+   run it again; it writes no private output until everything is in
+   place.
 3. `statute check`, which exits 0 when no rule a script checks is
    violated, and lists the rules for review.
 4. In a public repository with a private output (private rules, or a
-   `personal` value that differs from the committed one), install the
-   checkout hook, so that each new worktree and each switch of branch
-   writes the private output and the private links
+   `personal` value that differs from the committed one), run
+   `statute hooks install`, once per clone, at the top of the work
+   tree. It writes the checkout hook with the hook line, so that each
+   new worktree and each switch of branch writes the private output and
+   the private links
    ([Private rules in a public repository](https://github.com/Luolc/agent-constitution/blob/main/docs/design/rule-sources.md#private-rules-in-a-public-repository),
-   A new worktree).
-   statute does not install it. First see which hooks are really
-   there, under `git rev-parse --git-path hooks`, and then decide
-   whether to write the hook directly or go through a hook manager.
-   With no checkout hook, write one with
-   `#!/bin/sh` and the hook line, and make it executable; when there is
-   one, append the hook line and change nothing else in it. When a hook
-   manager owns the checkout hook, add the line that manager's way;
-   pre-commit runs a hook of stage `post-checkout` once installed with
-   `pre-commit install --hook-type post-checkout`, and gives the
-   checkout type in `PRE_COMMIT_CHECKOUT_TYPE` instead of `$3`. The
-   hook does not reach the worktrees that exist already: run `statute
-   compile --private-only` once in each of them.
-   Install the merge hook the same way, with the merge hook line, so
+   A new worktree), and the merge hook with the merge hook line, so
    that a merge, a fast-forward of the main branch included, writes the
    private output anew: git runs no checkout hook then, and a checkout
    that only ever moves forward by merging, as a main checkout does,
-   would keep the private output of its first checkout, or none. With
-   pre-commit, the stage is `post-merge`, installed with `pre-commit
-   install --hook-type post-merge`. The private lock
+   would keep the private output of its first checkout, or none. It
+   rewrites the hooks it wrote, so a line added to one is lost. A hook
+   it did not write, one a hook manager or a person wrote, it leaves as
+   it is: it prints that hook's line to add and exits 1. Add the line
+   where the hook runs before it exits, and change nothing else in it;
+   when pre-commit owns the hook, run `statute compile --private-only`
+   from a local hook of stage `post-checkout` or `post-merge` instead,
+   installed with `pre-commit install --hook-type post-checkout` or
+   `post-merge`. pre-commit gives the checkout type in
+   `PRE_COMMIT_CHECKOUT_TYPE` instead of `$3`. The hooks do not reach
+   the worktrees that exist already: run `statute compile
+   --private-only` once in each of them. The private lock
    file lists only sources; to see which rules the private layer
    enables, read the rule ID lines of the private output.
 5. Add `statute compile --check` to the repository's commit hooks, so
@@ -414,28 +417,28 @@ machine or one rebuilt, holds only what git tracks: none of the files
 the table marks "no, in git's own directory" or "no, ignored through
 the exclude file" are there, and statute's cache holds no private
 source. Check statute and the global configuration first (step 0.1
-and 0.2; `statute upgrade --private` needs statute 0.1.23 or later),
+and 0.2),
 then put the rest back in this order, from the directory of the rule
 set in the main worktree: a linked worktree writes a private lock file
 of its own, which the main worktree and the worktrees added later do
 not read (the table):
 
-1. Add `/CLAUDE.local.md` and `/AGENTS.override.md`, the lines for the
-   private links, to the exclude file (step g.2).
-2. Put the private rule set in place: copy it from another clone of
+1. Put the private rule set in place: copy it from another clone of
    the repository, or, with none left, write it again, reviewed as the
    note at the top says: `statute source add --private <name>
    <address>` for each private source, then `statute add --private
    <rule>` for each rule it enabled.
-3. `statute upgrade --private`, which fetches the private sources at
+2. `statute upgrade --private`, which fetches the private sources at
    their newest commits and writes the main worktree's private lock
    file. To keep the commits another clone follows, copy its private
    lock file as well and run `statute compile` in place of this step
-   and step 5: `statute compile --private-only` fetches nothing, and
+   and step 4: `statute compile --private-only` fetches nothing, and
    fails on a commit that statute's cache lacks.
-4. Install the checkout hook and the merge hook (step g.4).
-5. `statute compile --private-only`, which writes the private output
-   and the private links.
+3. `statute hooks install`, which writes the checkout hook and the
+   merge hook (step g.4).
+4. `statute compile --private-only`, which adds the lines for the
+   private links to the exclude file and writes the private output and
+   the private links.
 
 Acceptance:
 
@@ -444,13 +447,9 @@ Acceptance:
   0 for a private source `<name>` of the private rule set. Only this
   check shows it: neither the exit status of `statute compile
   --private-only` nor a private output being there does. Without the
-  private rule set, once the exclude file has the two lines, it exits
-  0, writing no private output when nothing
+  private rule set, it exits 0, writing no private output when nothing
   else is private, or one without the private layer when the global
   configuration makes a private output by itself (step 0.2).
-- `statute compile --private-only` fails without the two lines: take
-  them out of the exclude file and run it, and it exits 1, naming the
-  lines to add; put them back and run it again, and it exits 0.
 
 ## Upgrading statute
 
