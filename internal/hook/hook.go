@@ -3,7 +3,8 @@
 // with the message written to an event file passed as the last argument.
 // Exit 0 marks the message delivered; anything else, or a timeout, is
 // retried with growing delays, and after the last allowed attempt the
-// message is moved to the dead letters. Messages run one at a time, oldest
+// message is moved to the dead letters and the command runs once more with
+// a dead letter notice (see DeadLetter). Messages run one at a time, oldest
 // first, so no message runs twice at once and the inbox stays in order.
 //
 // The contract with the hook: it runs in its own process group, which is
@@ -12,7 +13,9 @@
 // message runs; while the client lives, no message runs again once it has
 // exited 0. If the client dies between the hook's exit and the record, the
 // next start runs the hook again for that message, so the hook must be
-// idempotent by msg_id.
+// idempotent by msg_id. A notice is not a run of the message: its exit
+// status is logged and nothing else, it is not retried and not counted as
+// an attempt, and it is lost if the client dies before it has run.
 package hook
 
 import (
@@ -37,6 +40,23 @@ import (
 type Event struct {
 	MsgID   string          `json:"msg_id"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+// DeadLetterType is the payload type of a dead letter notice. The hub
+// never sends a message of this type; only the client makes it.
+const DeadLetterType = "dead_letter"
+
+// DeadLetter is the payload of the event the hook gets once more for a
+// message moved to the dead letters, with the message's msg_id: the hub
+// will not deliver the message again and the hook will not run for it
+// again. Type is DeadLetterType; Attempts is how many times the hook ran
+// for the message, Reason why the last run failed, and Message the
+// message's payload as the hub sent it, before Prepare.
+type DeadLetter struct {
+	Type     string          `json:"type"`
+	Attempts int             `json:"attempts"`
+	Reason   string          `json:"reason"`
+	Message  json.RawMessage `json:"message"`
 }
 
 // errNotRun means the hook was not started: the event file could not be
@@ -287,10 +307,12 @@ func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
 	return wait, nil
 }
 
-// record writes o to the store: delivered, or a retry, or a dead letter.
-// It writes even once ctx is done: an outcome lost to the shutdown would
-// make the next Run run the hook again.
+// record writes o to the store: delivered, or a retry, or a dead letter,
+// which is then alerted and noticed to the hook. It writes even once ctx is
+// done: an outcome lost to the shutdown would make the next Run run the
+// hook again. The notice, a run of the hook, stops with ctx.
 func (r *Runner) record(ctx context.Context, o outcome) error {
+	hookCtx := ctx
 	ctx = context.WithoutCancel(ctx)
 	q := o.q
 	if o.err == nil {
@@ -317,6 +339,7 @@ func (r *Runner) record(ctx context.Context, o outcome) error {
 				slog.Warn("hook: alert", "msg_id", q.MsgID, "err", err)
 			}
 		}
+		r.notifyDead(hookCtx, q.Message, attempts, o.err)
 		return nil
 	}
 	delay := retry.delay(attempts)
@@ -330,11 +353,8 @@ func (r *Runner) record(ctx context.Context, o outcome) error {
 // stderrTail is how much of the hook's stderr goes into the error.
 const stderrTail = 4 << 10
 
-// exec writes m to an event file, runs the hook on it and returns nil if
-// the hook exited 0 and left nothing behind. The error says why it did
-// not, with the end of the hook's stderr; it wraps errNotRun when the hook
-// never started. Whatever the outcome, the hook's process group is killed
-// once the hook itself has exited.
+// exec runs the hook for m, as run does, with m's payload put through
+// Prepare.
 func (r *Runner) exec(ctx context.Context, m store.Message) error {
 	// A payload that is not JSON cannot be put in the event; that is the
 	// hub's fault, and the error, counted as an attempt, says so.
@@ -346,6 +366,34 @@ func (r *Runner) exec(ctx context.Context, m store.Message) error {
 	if err != nil {
 		return fmt.Errorf("payload is not JSON: %v", err)
 	}
+	return r.run(ctx, event)
+}
+
+// notifyDead runs the hook once with the dead letter notice for m, whose
+// attempts-th run failed with cause. The outcome is only logged.
+func (r *Runner) notifyDead(ctx context.Context, m store.Message, attempts int, cause error) {
+	err := func() error {
+		p, err := json.Marshal(DeadLetter{Type: DeadLetterType, Attempts: attempts, Reason: cause.Error(), Message: m.Payload})
+		if err != nil {
+			return fmt.Errorf("payload is not JSON: %v", err)
+		}
+		event, err := json.Marshal(Event{MsgID: m.MsgID, Payload: p})
+		if err != nil {
+			return err
+		}
+		return r.run(ctx, event)
+	}()
+	if err != nil {
+		slog.Warn("hook: dead letter notice", "msg_id", m.MsgID, "err", err)
+	}
+}
+
+// run writes event to an event file, runs the hook on it and returns nil if
+// the hook exited 0 and left nothing behind. The error says why it did
+// not, with the end of the hook's stderr; it wraps errNotRun when the hook
+// never started. Whatever the outcome, the hook's process group is killed
+// once the hook itself has exited.
+func (r *Runner) run(ctx context.Context, event []byte) error {
 	name, err := r.writeEvent(append(event, '\n'))
 	if err != nil {
 		return err

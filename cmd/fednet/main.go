@@ -147,6 +147,10 @@ commands:
         "reaction": EMOJI-NAME}, with "user_name" and "scope" as a message
         of the thread has them, sent again when Slack delivers the event
         again; one taken off, or on any other message, does not come;
+        a message the hook still fails after its last attempt is given up,
+        and comes once more, its msg_id unchanged, as {"type":
+        "dead_letter", "attempts": N, "reason": TEXT, "message": PAYLOAD},
+        run once, not retried;
         the upgrade request is the file the client writes when the hub tells
         it to upgrade, for the machine's upgrader (fednet upgrade, run by
         root); without it the hub's notices are dropped; the files people
