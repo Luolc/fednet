@@ -246,7 +246,7 @@ func TestRetriesUntilSuccess(t *testing.T) {
 // After the last allowed attempt the message is a dead letter: not run
 // again, not even when the hub delivers it again, and logged.
 func TestDeadLetterAtLimit(t *testing.T) {
-	f := newFixture(t, `echo "$1" >> "$DIR/runs"; echo "no agent here" >&2; exit 1`)
+	f := newFixture(t, notice+` && exit 0; echo "$1" >> "$DIR/runs"; echo "no agent here" >&2; exit 1`)
 	f.run()
 	f.put("m1", `{"t":"x"}`)
 	waitFor(t, "m1 among the dead letters", func() bool { return len(f.deadLetters()) == 1 })
@@ -274,6 +274,61 @@ func TestDeadLetterAtLimit(t *testing.T) {
 	waitFor(t, "m2 among the dead letters", func() bool { return len(f.deadLetters()) == 2 })
 	if runs := len(f.lines("runs")); runs != 2*testRetry.Attempts {
 		t.Fatalf("hook ran %d times, want %d", runs, 2*testRetry.Attempts)
+	}
+}
+
+// notice is a test in the hook script: is the event a dead letter notice?
+const notice = `grep -q '"type":"dead_letter"' "$1"`
+
+// The hook hears of a dead letter once, after its last failed run, in a
+// notice with the message's msg_id, how many runs failed, the last reason
+// and the payload as it came; a message that failed fewer times, or that
+// went through, gets none. A notice that fails is logged, not retried.
+func TestDeadLetterNotice(t *testing.T) {
+	f := newFixture(t, `cat "$1" >> "$DIR/seen"; `+notice+` && { echo "notice failed" >&2; exit 4; }; grep -q '"t":"ok"' "$1" && exit 0; echo "no agent here" >&2; exit 1`)
+	f.r.Prepare = func(_ context.Context, payload []byte) []byte {
+		return []byte(strings.Replace(string(payload), "}", `,"prepared":true}`, 1))
+	}
+	f.run()
+	f.put("m1", `{"t":"bad"}`)
+	waitFor(t, "m1 among the dead letters", func() bool { return len(f.deadLetters()) == 1 })
+	f.put("m2", `{"t":"ok"}`)
+	// The loop takes m2 only after m1's notice has run.
+	waitFor(t, "m2 delivered", func() bool { return f.delivered("m2") })
+
+	var got []string
+	for _, line := range f.lines("seen") {
+		var e struct {
+			MsgID   string `json:"msg_id"`
+			Payload struct {
+				Type     string          `json:"type"`
+				Attempts int             `json:"attempts"`
+				Reason   string          `json:"reason"`
+				Message  json.RawMessage `json:"message"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("event %q: %v", line, err)
+		}
+		if e.Payload.Type != DeadLetterType {
+			got = append(got, e.MsgID)
+			continue
+		}
+		got = append(got, e.MsgID+" notice")
+		if e.Payload.Attempts != testRetry.Attempts || string(e.Payload.Message) != `{"t":"bad"}` ||
+			!strings.Contains(e.Payload.Reason, "exit status 1") || !strings.Contains(e.Payload.Reason, "no agent here") {
+			t.Fatalf("notice = %s, want %d attempts, the reason with the stderr and the payload as it came", line, testRetry.Attempts)
+		}
+	}
+	want := []string{"m1", "m1", "m1", "m1 notice", "m2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("hook saw %q, want %q", got, want)
+	}
+	if logs := f.logs.String(); !strings.Contains(logs, `msg="hook: dead letter notice" msg_id=m1`) || !strings.Contains(logs, "notice failed") {
+		t.Fatalf("log does not report the failed notice with its msg_id and stderr:\n%s", logs)
+	}
+	if d := f.deadLetters(); len(d) != 1 || d[0].Attempts != testRetry.Attempts {
+		t.Fatalf("dead letters = %+v, want m1 alone after %d attempts", d, testRetry.Attempts)
 	}
 }
 
@@ -469,6 +524,40 @@ func TestShutdownDoesNotCountAsAttempt(t *testing.T) {
 	qs := f.queued()
 	if len(qs) != 1 || qs[0].Attempts != 0 || qs[0].NextAttempt.After(time.Now()) {
 		t.Fatalf("queued after shutdown = %+v, want m1 with 0 attempts, due now", qs)
+	}
+}
+
+// A dead letter notice stops with the shutdown, as any run of the hook
+// does: Run does not wait for it, and the dead letter stays recorded.
+func TestShutdownStopsTheNotice(t *testing.T) {
+	f := newFixture(t, notice+` && { echo $$ > "$DIR/self"; sleep 60; }; exit 1`)
+	f.r.Timeout = time.Minute
+	f.r.Retry.Attempts = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(ctx)
+	}()
+	f.put("m1", `{"t":"x"}`)
+	var self int
+	waitFor(t, "the notice to start", func() bool {
+		var ok bool
+		self, ok = f.pid("self")
+		return ok
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return while the notice ran")
+	}
+	if left(self) {
+		t.Fatalf("notice %d is left (state %q) after Run returned", self, state(t, self))
+	}
+	if d := f.deadLetters(); len(d) != 1 || d[0].MsgID != "m1" {
+		t.Fatalf("dead letters = %+v, want m1", d)
 	}
 }
 
@@ -668,21 +757,21 @@ func TestLeftoverProcessesAreKilled(t *testing.T) {
 func TestOutcomeKeptWhenStoreFails(t *testing.T) {
 	for _, tt := range []struct {
 		name, script, trigger string
-		limit                 int
+		limit, notices        int
 		recorded              func(f *fixture) bool
 	}{
 		{"delivered", "exit 0",
-			"CREATE TRIGGER fail BEFORE UPDATE OF delivered ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END", 5,
+			"CREATE TRIGGER fail BEFORE UPDATE OF delivered ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END", 5, 0,
 			func(f *fixture) bool { return f.delivered("m1") }},
 		{"retry", "exit 1",
-			"CREATE TRIGGER fail BEFORE UPDATE OF attempts ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END", 5,
+			"CREATE TRIGGER fail BEFORE UPDATE OF attempts ON inbox BEGIN SELECT RAISE(ABORT, 'disk full'); END", 5, 0,
 			func(f *fixture) bool { qs := f.queued(); return len(qs) == 1 && qs[0].Attempts == 1 }},
 		{"dead letter", "exit 1",
-			"CREATE TRIGGER fail BEFORE INSERT ON dead_letter BEGIN SELECT RAISE(ABORT, 'disk full'); END", 1,
+			"CREATE TRIGGER fail BEFORE INSERT ON dead_letter BEGIN SELECT RAISE(ABORT, 'disk full'); END", 1, 1,
 			func(f *fixture) bool { return len(f.deadLetters()) == 1 }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFixture(t, `echo run >> "$DIR/runs"; `+tt.script)
+			f := newFixture(t, notice+` && { echo notice >> "$DIR/notices"; exit 0; }; echo run >> "$DIR/runs"; `+tt.script)
 			f.r.Retry = Retry{Min: time.Hour, Max: time.Hour, Attempts: tt.limit}
 			db, err := sql.Open("sqlite", filepath.Join(f.dir, "client.db"))
 			if err != nil {
@@ -698,8 +787,8 @@ func TestOutcomeKeptWhenStoreFails(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), "disk full") || !strings.Contains(err.Error(), "m1") {
 					t.Fatalf("pass %d with the store failing: err = %v, want the store's error naming m1", i, err)
 				}
-				if wait != 0 || len(f.lines("runs")) != 1 {
-					t.Fatalf("pass %d: wait %v, hook ran %d times; want 0, 1", i, wait, len(f.lines("runs")))
+				if wait != 0 || len(f.lines("runs")) != 1 || f.lines("notices") != nil {
+					t.Fatalf("pass %d: wait %v, hook ran %d times, %d notices; want 0, 1, 0", i, wait, len(f.lines("runs")), len(f.lines("notices")))
 				}
 			}
 			// The store recovers: the kept outcome is recorded, the hook
@@ -715,6 +804,10 @@ func TestOutcomeKeptWhenStoreFails(t *testing.T) {
 			}
 			if n := len(f.lines("runs")); n != 1 {
 				t.Fatalf("hook ran %d times, want 1", n)
+			}
+			// A dead letter is noticed once it is recorded, not before.
+			if n := len(f.lines("notices")); n != tt.notices {
+				t.Fatalf("%d notices, want %d", n, tt.notices)
 			}
 		})
 	}

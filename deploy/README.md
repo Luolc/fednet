@@ -72,7 +72,7 @@ agent 用 `fednet client react` 在线程的第一条消息上加或去掉 bot �
 sudo -u fednet fednet hub register -db /var/lib/fednet-hub/hub.db CLIENT-ID HASH
 ```
 
-client 那边不需要 webhook：钩子放弃的消息由 client 经上行告诉 hub，由 hub 报警。
+client 那边不需要 webhook：钩子放弃的消息由 client 经上行告诉 hub，由 hub 报警；client 还会用类型为 `dead_letter` 的事件再调一次钩子，格式见 [`internal/hook/hook.go`](../internal/hook/hook.go) 的 `DeadLetter`。
 
 ## 升级
 
