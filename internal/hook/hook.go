@@ -308,9 +308,9 @@ func (r *Runner) pass(ctx context.Context) (time.Duration, error) {
 }
 
 // record writes o to the store: delivered, or a retry, or a dead letter,
-// which is then alerted and noticed to the hook. It writes even once ctx is
-// done: an outcome lost to the shutdown would make the next Run run the
-// hook again. The notice, a run of the hook, stops with ctx.
+// which is then alerted and sent to the hook as a notice. It writes even
+// once ctx is done: an outcome lost to the shutdown would make the next Run
+// run the hook again. The notice, a run of the hook, stops with ctx.
 func (r *Runner) record(ctx context.Context, o outcome) error {
 	hookCtx := ctx
 	ctx = context.WithoutCancel(ctx)

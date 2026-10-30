@@ -527,6 +527,40 @@ func TestShutdownDoesNotCountAsAttempt(t *testing.T) {
 	}
 }
 
+// A dead letter notice stops with the shutdown, as any run of the hook
+// does: Run does not wait for it, and the dead letter stays recorded.
+func TestShutdownStopsTheNotice(t *testing.T) {
+	f := newFixture(t, notice+` && { echo $$ > "$DIR/self"; sleep 60; }; exit 1`)
+	f.r.Timeout = time.Minute
+	f.r.Retry.Attempts = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.r.Run(ctx)
+	}()
+	f.put("m1", `{"t":"x"}`)
+	var self int
+	waitFor(t, "the notice to start", func() bool {
+		var ok bool
+		self, ok = f.pid("self")
+		return ok
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return while the notice ran")
+	}
+	if left(self) {
+		t.Fatalf("notice %d is left (state %q) after Run returned", self, state(t, self))
+	}
+	if d := f.deadLetters(); len(d) != 1 || d[0].MsgID != "m1" {
+		t.Fatalf("dead letters = %+v, want m1", d)
+	}
+}
+
 // Stop lets the run of the hook in hand end and records it, and takes no
 // further message: the next Run, in another process, runs only that one.
 func TestStopWaitsForTheHook(t *testing.T) {
