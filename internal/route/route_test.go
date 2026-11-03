@@ -324,3 +324,22 @@ func TestDeliver(t *testing.T) {
 		t.Fatalf("%d queued, want %d", n, many)
 	}
 }
+
+// A limited user's entry that lists neither machines nor channels allows
+// nothing, though the hub's config never takes one.
+func TestLimitEmptyEntry(t *testing.T) {
+	h := openHub(t)
+	setRoute(t, h, "data", "datamachine", "")
+	l := Limited{"U3": {}}
+	if l.Allow("U3", "data", "datamachine") {
+		t.Fatal("Allow for an empty entry = true, want false")
+	}
+	m := msg("x")
+	m.User = "U3"
+	if _, err := New(h).Limit(l).RouteNew(t.Context(), "data", "", "t1", m); !errors.Is(err, ErrLimited) {
+		t.Fatalf("RouteNew for an empty entry: err = %v, want ErrLimited", err)
+	}
+	if got := queued(t, h, "datamachine"); len(got) != 0 {
+		t.Fatalf("queued for datamachine = %v, want nothing", got)
+	}
+}

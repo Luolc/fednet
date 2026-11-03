@@ -62,7 +62,7 @@ func TestHubRequests(t *testing.T) {
 	// on the user list.
 	f.AddChannel("C2", "")
 	config := filepath.Join(dir, "hub.json")
-	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}, "limited_users": {"U3": {"name": "collaborator", "machines": ["datamachine", "workstation"]}}, "files": {"upload_max_bytes": 20}}`), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"open_thread": ["workstation"]}, "C2": {}}, "users": {"U1": "maintainer", "U2": ""}, "limited_users": {"U3": {"name": "collaborator", "machines": ["datamachine", "workstation"]}, "U4": {"channels": ["C2"]}, "U5": {"machines": ["workstation"], "channels": ["C1", "C2"]}}, "files": {"upload_max_bytes": 20}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stopHub := start(t, append([]string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, slackFlags...), &stdout, &stderr)
@@ -175,15 +175,17 @@ func TestHubRequests(t *testing.T) {
 	}
 
 	// users lists the user list, then the limited users with their
-	// machines; dm reaches a user on the list, and no one else.
-	if code, out := fednet("client", "users", "-socket", socket); code != 0 || out != "U1 maintainer\nU2\nU3 collaborator (limited to datamachine, workstation)\n" {
-		t.Fatalf("users: exit %d, stdout %q; want U1 with its name, then U2, then U3 limited", code, out)
+	// machines and channels; dm reaches a user on the list, and no one
+	// else.
+	if code, out := fednet("client", "users", "-socket", socket); code != 0 || out != "U1 maintainer\nU2\nU3 collaborator (limited to datamachine, workstation)\nU4 (limited to channels C2)\nU5 (limited to workstation; channels C1, C2)\n" {
+		t.Fatalf("users: exit %d, stdout %q; want U1 with its name, then U2, then U3, U4 and U5 limited", code, out)
 	}
 	code, out = fednet("client", "users", "-socket", socket, "-json")
 	var users struct {
 		Users []hubapi.User `json:"users"`
 	}
-	want := []hubapi.User{{ID: "U1", Name: "maintainer"}, {ID: "U2"}, {ID: "U3", Name: "collaborator", Limited: true, Machines: []string{"datamachine", "workstation"}}}
+	want := []hubapi.User{{ID: "U1", Name: "maintainer"}, {ID: "U2"}, {ID: "U3", Name: "collaborator", Limited: true, Machines: []string{"datamachine", "workstation"}},
+		{ID: "U4", Limited: true, Channels: []string{"C2"}}, {ID: "U5", Limited: true, Machines: []string{"workstation"}, Channels: []string{"C1", "C2"}}}
 	if err := json.Unmarshal([]byte(out), &users); code != 0 || err != nil || !reflect.DeepEqual(users.Users, want) {
 		t.Fatalf("users -json: exit %d, stdout %q; want %+v", code, out, want)
 	}
@@ -410,9 +412,9 @@ func TestReadHubConfig(t *testing.T) {
 	}
 }
 
-// A limited user is read with their machines; one who is also on the user
-// list, has no machines, approves or upgrades stops the hub from
-// starting, with the reason.
+// A limited user is read with their machines, their channels or both;
+// one who is also on the user list, has neither, lists an empty one,
+// approves or upgrades stops the hub from starting, with the reason.
 func TestReadHubConfigLimitedUsers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.json")
 	read := func(body string) (hubConfig, error) {
@@ -422,8 +424,13 @@ func TestReadHubConfigLimitedUsers(t *testing.T) {
 		}
 		return readHubConfig(path)
 	}
-	cfg, err := read(`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"name": "collaborator", "machines": ["datamachine"]}}}`)
-	if want := (route.Limited{"U3": {Name: "collaborator", Machines: []string{"datamachine"}}}); err != nil || !reflect.DeepEqual(cfg.LimitedUsers, want) {
+	cfg, err := read(`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"name": "collaborator", "machines": ["datamachine"]}, "U4": {"channels": ["C2"]}, "U5": {"machines": ["datamachine"], "channels": ["C2"]}}}`)
+	want := route.Limited{
+		"U3": {Name: "collaborator", Machines: []string{"datamachine"}},
+		"U4": {Channels: []string{"C2"}},
+		"U5": {Machines: []string{"datamachine"}, Channels: []string{"C2"}},
+	}
+	if err != nil || !reflect.DeepEqual(cfg.LimitedUsers, want) {
 		t.Fatalf("readHubConfig = %+v, %v; want %+v", cfg.LimitedUsers, err, want)
 	}
 	if _, ok := cfg.Users["U3"]; ok {
@@ -431,9 +438,10 @@ func TestReadHubConfigLimitedUsers(t *testing.T) {
 	}
 	for _, c := range []struct{ body, want string }{
 		{`{"users": {"U1": "maintainer", "U3": ""}, "limited_users": {"U3": {"machines": ["datamachine"]}}}`, "U3 is both on the user list and a limited user"},
-		{`{"limited_users": {"U3": {"name": "collaborator"}}}`, "limited user U3 needs machines"},
-		{`{"limited_users": {"U3": {"machines": []}}}`, "limited user U3 needs machines"},
-		{`{"limited_users": {"U3": {"machines": [""]}}}`, "limited user U3 needs machines"},
+		{`{"limited_users": {"U3": {"name": "collaborator"}}}`, "limited user U3 needs machines, channels or both"},
+		{`{"limited_users": {"U3": {"machines": [], "channels": []}}}`, "limited user U3 needs machines, channels or both"},
+		{`{"limited_users": {"U3": {"machines": [""]}}}`, "limited user U3 has an empty machine"},
+		{`{"limited_users": {"U3": {"channels": ["C2", ""]}}}`, "limited user U3 has an empty channel"},
 		{`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"machines": ["datamachine"]}}, "approvals": {"channel": "C9", "approvers": ["U1", "U3"]}}`, "approver U3 is a limited user"},
 		{`{"users": {"U1": "maintainer"}, "limited_users": {"U3": {"machines": ["datamachine"]}}, "upgrade": {"admins": ["U3"]}}`, "upgrade admin U3 is a limited user"},
 		{`{"limited_users": {"U3": {"machines": ["datamachine"], "admin": true}}}`, "admin"},

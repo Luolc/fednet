@@ -1813,3 +1813,73 @@ func TestHandleLimitedUser(t *testing.T) {
 		t.Fatalf("last seen = %q, %v; want %q, nothing refused recorded", after, err, seen)
 	}
 }
+
+// A limited user whose entry lists channels has messages and reactions
+// taken in only in those channels: with no machines listed, on whatever
+// machine the channel and thread go to; with machines listed too, only
+// where the channel, its machine and the thread's owner are all on their
+// list.
+func TestHandleLimitedUserChannels(t *testing.T) {
+	tests := []struct {
+		name    string
+		limited route.LimitedUser
+		// want is what is queued for each client, as type and thread.
+		want map[string][]string
+	}{
+		{"channels only", route.LimitedUser{Channels: []string{"C1", "C2"}}, map[string][]string{
+			"workstation": {"message C1/1.1", "message C1/5.0", "message C2/8.0", "reaction C1/5.0", "reaction C2/8.0"},
+			"datamachine": {"message C2/2.1", "message C2/7.0", "reaction C2/7.0"},
+		}},
+		{"channels and machines", route.LimitedUser{Machines: []string{"datamachine"}, Channels: []string{"C1", "C2"}}, map[string][]string{
+			"datamachine": {"message C2/2.1", "message C2/7.0", "reaction C2/7.0"},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			r, f := newReceiver(t)
+			h := r.Store
+			r.Limited = route.Limited{"U3": tt.limited}
+			// C4 goes to the data machine too, but is on no list.
+			f.AddChannel("C4", "another data channel")
+			setRoute(t, h, store.Route{Channel: "C4", Machine: "datamachine"})
+			// C2/8.0 was handed to the workstation, off the machines of the
+			// second entry.
+			for thread, owner := range map[string]string{"C1/5.0": "workstation", "C4/6.0": "datamachine", "C2/7.0": "datamachine", "C2/8.0": "workstation"} {
+				if err := h.Claim(ctx, thread, owner, "", ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, ev := range []Event{
+				message("Ev1", "C1", "1.1", "", hey+"on the workstation"),
+				message("Ev2", "C2", "2.1", "", hey+"on the data machine"),
+				message("Ev3", "C4", "3.1", "", hey+"in a channel off the list"),
+				message("Ev4", "C1", "5.1", "5.0", "reply on the workstation"),
+				message("Ev5", "C4", "6.1", "6.0", "reply in a channel off the list"),
+				message("Ev6", "C2", "7.1", "7.0", "reply on the data machine"),
+				message("Ev7", "C2", "8.1", "8.0", "reply in a thread the workstation owns"),
+			} {
+				ev.User = "U3"
+				handle(t, r, ev)
+			}
+			for _, a := range []Reaction{{Channel: "C1", TS: "5.0"}, {Channel: "C4", TS: "6.0"}, {Channel: "C2", TS: "7.0"}, {Channel: "C2", TS: "8.0"}} {
+				a.User, a.Name = "U3", "package"
+				if err := r.React(ctx, a); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, client := range []string{"workstation", "datamachine"} {
+				var got []string
+				for _, m := range queued(t, h, client) {
+					got = append(got, string(m.Type)+" "+m.Thread)
+				}
+				if !slices.Equal(got, tt.want[client]) {
+					t.Errorf("queued for %s = %q, want %q", client, got, tt.want[client])
+				}
+			}
+			if _, err := h.Owner(ctx, "C4/3.1"); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("Owner(C4/3.1) = %v, want ErrNotFound", err)
+			}
+		})
+	}
+}

@@ -475,15 +475,16 @@ func TestChannelThreads(t *testing.T) {
 }
 
 // users lists the user list, then the limited users, each marked
-// limited with the clients on their list.
+// limited with the clients and the channels on their list.
 func TestUsers(t *testing.T) {
 	s, _ := testServer(t)
 	s.Users = map[string]string{"U2": "", "U1": "maintainer"}
-	s.Limited = route.Limited{"U4": {Machines: []string{"datamachine"}}, "U3": {Name: "collaborator", Machines: []string{"datamachine", "workstation"}}}
+	s.Limited = route.Limited{"U4": {Machines: []string{"datamachine"}}, "U3": {Name: "collaborator", Machines: []string{"datamachine", "workstation"}}, "U5": {Machines: []string{"datamachine"}, Channels: []string{"C1", "C2"}}}
 	got, err := answer(t, s, "workstation", Request{Cmd: Users})
 	want := []User{{ID: "U1", Name: "maintainer"}, {ID: "U2"},
 		{ID: "U3", Name: "collaborator", Limited: true, Machines: []string{"datamachine", "workstation"}},
-		{ID: "U4", Limited: true, Machines: []string{"datamachine"}}}
+		{ID: "U4", Limited: true, Machines: []string{"datamachine"}},
+		{ID: "U5", Limited: true, Machines: []string{"datamachine"}, Channels: []string{"C1", "C2"}}}
 	if err != nil || !reflect.DeepEqual(got.Users, want) {
 		t.Fatalf("users = %+v, %v; want %+v", got, err, want)
 	}
@@ -806,13 +807,18 @@ func TestRequestRoute(t *testing.T) {
 
 // request-channel checks the channel to create and its route, and posts
 // a card that shows both; while one waits, another for the same name is
-// refused.
+// refused. A limited user whose entry lists only machines may be invited;
+// one whose entry lists channels may not.
 func TestRequestChannel(t *testing.T) {
 	s, f := testServer(t)
 	f.AddChannel("C9", "approvals")
 	ctx := t.Context()
 	s.Users = map[string]string{"U1": "maintainer", "U2": "colleague"}
-	s.Limited = route.Limited{"U3": {Name: "collaborator", Machines: []string{"datamachine"}}}
+	s.Limited = route.Limited{
+		"U3": {Name: "collaborator", Machines: []string{"datamachine"}},
+		"U4": {Channels: []string{"C1"}},
+		"U5": {Machines: []string{"workstation"}, Channels: []string{"C1"}},
+	}
 	for _, c := range []string{"workstation", "datamachine"} {
 		if err := s.Store.Register(ctx, c, []byte("h")); err != nil {
 			t.Fatal(err)
@@ -845,6 +851,15 @@ func TestRequestChannel(t *testing.T) {
 		if _, err := answer(t, s, "workstation", tt.req); !errors.Is(err, link.ErrBadRequest) {
 			t.Errorf("%s: %v, want a bad request", tt.name, err)
 		}
+	}
+	for _, u := range []string{"U4", "U5"} {
+		r := req(RouteRequest{Machine: "workstation", Create: &approval.NewChannel{Name: "repo-example", Invite: []string{"U2", u}}})
+		if _, err := answer(t, s, "workstation", r); !errors.Is(err, link.ErrDenied) || !strings.Contains(err.Error(), u+" is a limited user served only in the channels on their list") {
+			t.Errorf("inviting %s, limited to channels: %v, want denied as such", u, err)
+		}
+	}
+	if _, cards := f.Cards("C9"); len(cards) != 0 {
+		t.Fatalf("cards = %+v, want none for a refused request", cards)
 	}
 	reply, err := answer(t, s, "workstation", good)
 	if err != nil {
