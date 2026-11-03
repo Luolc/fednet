@@ -35,8 +35,8 @@ type Limited map[string]LimitedUser
 
 // LimitedUser is one limited user: a name for the agents, which may be
 // empty, the clients they may hand work to and the channels, by Slack
-// channel id, they may hand it over in. An empty list does not limit; the
-// hub's config lists at least one.
+// channel id, they may hand it over in. An empty list does not limit,
+// unless both are: an entry that lists neither allows nothing.
 type LimitedUser struct {
 	Name     string   `json:"name"`
 	Machines []string `json:"machines"`
@@ -46,13 +46,15 @@ type LimitedUser struct {
 // OnMachine reports whether u may hand work to machine, which is never
 // so for no machine.
 func (u LimitedUser) OnMachine(machine string) bool {
-	return machine != "" && (len(u.Machines) == 0 || slices.Contains(u.Machines, machine))
+	return machine != "" && !u.listsNothing() && (len(u.Machines) == 0 || slices.Contains(u.Machines, machine))
 }
 
 // InChannel reports whether u may hand work over in channel.
 func (u LimitedUser) InChannel(channel string) bool {
-	return len(u.Channels) == 0 || slices.Contains(u.Channels, channel)
+	return !u.listsNothing() && (len(u.Channels) == 0 || slices.Contains(u.Channels, channel))
 }
+
+func (u LimitedUser) listsNothing() bool { return len(u.Machines) == 0 && len(u.Channels) == 0 }
 
 // Allow reports whether user is a limited user who may hand work to
 // machine in channel.

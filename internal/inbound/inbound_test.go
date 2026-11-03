@@ -1817,7 +1817,8 @@ func TestHandleLimitedUser(t *testing.T) {
 // A limited user whose entry lists channels has messages and reactions
 // taken in only in those channels: with no machines listed, on whatever
 // machine the channel and thread go to; with machines listed too, only
-// where both the channel and the machines are on their list.
+// where the channel, its machine and the thread's owner are all on their
+// list.
 func TestHandleLimitedUserChannels(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1826,7 +1827,7 @@ func TestHandleLimitedUserChannels(t *testing.T) {
 		want map[string][]string
 	}{
 		{"channels only", route.LimitedUser{Channels: []string{"C1", "C2"}}, map[string][]string{
-			"workstation": {"message C1/1.1", "message C1/5.0", "reaction C1/5.0"},
+			"workstation": {"message C1/1.1", "message C1/5.0", "message C2/8.0", "reaction C1/5.0", "reaction C2/8.0"},
 			"datamachine": {"message C2/2.1", "message C2/7.0", "reaction C2/7.0"},
 		}},
 		{"channels and machines", route.LimitedUser{Machines: []string{"datamachine"}, Channels: []string{"C1", "C2"}}, map[string][]string{
@@ -1842,7 +1843,9 @@ func TestHandleLimitedUserChannels(t *testing.T) {
 			// C4 goes to the data machine too, but is on no list.
 			f.AddChannel("C4", "another data channel")
 			setRoute(t, h, store.Route{Channel: "C4", Machine: "datamachine"})
-			for thread, owner := range map[string]string{"C1/5.0": "workstation", "C4/6.0": "datamachine", "C2/7.0": "datamachine"} {
+			// C2/8.0 was handed to the workstation, off the machines of the
+			// second entry.
+			for thread, owner := range map[string]string{"C1/5.0": "workstation", "C4/6.0": "datamachine", "C2/7.0": "datamachine", "C2/8.0": "workstation"} {
 				if err := h.Claim(ctx, thread, owner, "", ""); err != nil {
 					t.Fatal(err)
 				}
@@ -1854,11 +1857,12 @@ func TestHandleLimitedUserChannels(t *testing.T) {
 				message("Ev4", "C1", "5.1", "5.0", "reply on the workstation"),
 				message("Ev5", "C4", "6.1", "6.0", "reply in a channel off the list"),
 				message("Ev6", "C2", "7.1", "7.0", "reply on the data machine"),
+				message("Ev7", "C2", "8.1", "8.0", "reply in a thread the workstation owns"),
 			} {
 				ev.User = "U3"
 				handle(t, r, ev)
 			}
-			for _, a := range []Reaction{{Channel: "C1", TS: "5.0"}, {Channel: "C4", TS: "6.0"}, {Channel: "C2", TS: "7.0"}} {
+			for _, a := range []Reaction{{Channel: "C1", TS: "5.0"}, {Channel: "C4", TS: "6.0"}, {Channel: "C2", TS: "7.0"}, {Channel: "C2", TS: "8.0"}} {
 				a.User, a.Name = "U3", "package"
 				if err := r.React(ctx, a); err != nil {
 					t.Fatal(err)
