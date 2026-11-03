@@ -86,9 +86,11 @@ commands:
         lists the Slack users fednet serves, each with a name for the
         agents, which may be empty, and the limited users, each with a
         name and the clients their messages, reactions and answers to
-        question cards may go to (they get no direct messages, and their
-        own are not taken in; none may be on the user list, approve or
-        upgrade), names the channel approval cards and
+        question cards may go to, the channels they may be in, or both
+        (an empty list does not limit; they get no direct messages, and
+        their own are not taken in; one with channels may not be invited
+        to a channel request-channel creates; none may be on the user
+        list, approve or upgrade), names the channel approval cards and
         route requests go to and the users, from that list, who may
         approve, bounds the thread history a message that mentions the bot
         carries (how many messages, how many characters in all, how many
@@ -108,7 +110,7 @@ commands:
         -owner route and post -deliver (none unless listed):
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
-         "limited_users": {"U789": {"name": "NAME", "machines": ["CLIENT-ID"]}},
+         "limited_users": {"U789": {"name": "NAME", "machines": ["CLIENT-ID"], "channels": ["C123"]}},
          "alerts": {"slack_down": "5m", "offline_queued": "10m"},
          "approvals": {"channel": "C456", "approvers": ["U123"]},
          "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
@@ -256,7 +258,8 @@ commands:
         replace a channel's description with the contents of FILE
   client users -socket PATH [-json]
         print the user list, then the limited users: each user's Slack id
-        and name, and for a limited user the clients on their list
+        and name, and for a limited user the clients and channels on their
+        list
   client dm -socket PATH -user USER-ID [-json] [--] TEXT
         send TEXT as a direct message to a user on the user list; TEXT is
         standard Markdown, as with post, at most 4000 characters, in one
@@ -518,8 +521,9 @@ type hubConfig struct {
 	// for the agents, which may be empty.
 	Users map[string]string `json:"users"`
 	// LimitedUsers maps the Slack user id of each limited user to their
-	// name and the clients their messages may go to; none is on Users,
-	// so that a hub that does not know the key serves them nothing.
+	// name, the clients their messages may go to and the channels they
+	// may be in; none is on Users, so that a hub that does not know the
+	// key serves them nothing.
 	LimitedUsers route.Limited `json:"limited_users"`
 	// Alerts sets the thresholds of the hub's alerts; a field left out
 	// keeps the watch package's default.
@@ -639,8 +643,12 @@ func readHubConfig(path string) (hubConfig, error) {
 		switch {
 		case full:
 			return hubConfig{}, fmt.Errorf("%s: %s is both on the user list and a limited user", path, id)
-		case len(u.Machines) == 0 || slices.Contains(u.Machines, ""):
-			return hubConfig{}, fmt.Errorf("%s: limited user %s needs machines, each a client id", path, id)
+		case len(u.Machines) == 0 && len(u.Channels) == 0:
+			return hubConfig{}, fmt.Errorf("%s: limited user %s needs machines, channels or both", path, id)
+		case slices.Contains(u.Machines, ""):
+			return hubConfig{}, fmt.Errorf("%s: limited user %s has an empty machine; each is a client id", path, id)
+		case slices.Contains(u.Channels, ""):
+			return hubConfig{}, fmt.Errorf("%s: limited user %s has an empty channel; each is a channel id", path, id)
 		case slices.Contains(cfg.Approvals.Approvers, id):
 			return hubConfig{}, fmt.Errorf("%s: approver %s is a limited user, who may not approve", path, id)
 		case slices.Contains(cfg.Upgrade.Admins, id):
@@ -1795,7 +1803,7 @@ func clientChannelContext(ctx context.Context, args []string, stdout io.Writer) 
 
 // clientUsers prints the user list, then the limited users, one user a
 // line: the id, then the name if there is one, then for a limited user
-// the clients on their list.
+// the clients and the channels on their list.
 func clientUsers(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("fednet client users", flag.ContinueOnError)
 	socket, asJSON := socketFlags(fs)
@@ -1815,7 +1823,14 @@ func clientUsers(ctx context.Context, args []string, stdout io.Writer) error {
 	for _, u := range res.Users {
 		line := strings.TrimSpace(u.ID + " " + u.Name)
 		if u.Limited {
-			line += " (limited to " + strings.Join(u.Machines, ", ") + ")"
+			var to []string
+			if len(u.Machines) > 0 {
+				to = append(to, strings.Join(u.Machines, ", "))
+			}
+			if len(u.Channels) > 0 {
+				to = append(to, "channels "+strings.Join(u.Channels, ", "))
+			}
+			line += " (limited to " + strings.Join(to, "; ") + ")"
 		}
 		if _, err := fmt.Fprintln(stdout, line); err != nil {
 			return err

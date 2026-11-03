@@ -234,7 +234,7 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 		return h, nil
 	}
 	if open, err := f.openTo(ctx, f.Store, c.User, q); err != nil || !open {
-		h.text = notOpenText
+		h.text = f.notOpen(c.User)
 		return h, err
 	}
 	if q.Status != store.QuestionOpen {
@@ -307,7 +307,7 @@ func (f *Flow) click(ctx context.Context, c slack.QuestionClick) (hint, error) {
 	case err != nil:
 		return h, err
 	case closed:
-		h.text = notOpenText
+		h.text = f.notOpen(c.User)
 		return h, nil
 	case !queued:
 		h.text = "这个问题已经处理过了"
@@ -332,8 +332,19 @@ func (f *Flow) queue(ctx context.Context, tx *store.Hub, client string, a questi
 }
 
 // notOpenText is the hint for a limited user's click on a card not open
-// to them.
-const notOpenText = "这张问题卡不在你能回答的机器范围内，按了不算数"
+// to them; notOpenInChannelsText for one whose entry lists channels.
+const (
+	notOpenText           = "这张问题卡不在你能回答的机器范围内，按了不算数"
+	notOpenInChannelsText = "这张问题卡不在你能回答的机器或频道范围内，按了不算数"
+)
+
+// notOpen returns the hint for user's click on a card not open to them.
+func (f *Flow) notOpen(user string) string {
+	if len(f.Limited[user].Channels) > 0 {
+		return notOpenInChannelsText
+	}
+	return notOpenText
+}
 
 func (f *Flow) listed(user string) bool {
 	_, full := f.Users[user]
@@ -342,8 +353,8 @@ func (f *Flow) listed(user string) bool {
 }
 
 // openTo reports whether user, who is listed, may answer q as h has it:
-// anyone on the user list may; a limited user only if q's thread's owner
-// and the client that asked are both on their list.
+// anyone on the user list may; a limited user only if q's thread's
+// channel, its owner and the client that asked are all on their list.
 func (f *Flow) openTo(ctx context.Context, h *store.Hub, user string, q store.Question) (bool, error) {
 	if _, ok := f.Limited[user]; !ok {
 		return true, nil
@@ -355,7 +366,8 @@ func (f *Flow) openTo(ctx context.Context, h *store.Hub, user string, q store.Qu
 	if err != nil {
 		return false, err
 	}
-	return f.Limited.Allow(user, owner) && f.Limited.Allow(user, q.Client), nil
+	channel, _, _ := slack.ParseThreadKey(q.Thread)
+	return f.Limited.Allow(user, channel, owner) && f.Limited.Allow(user, channel, q.Client), nil
 }
 
 // Nudge tells Run that there is a card to bring up to date or a hint to

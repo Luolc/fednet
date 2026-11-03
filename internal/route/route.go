@@ -23,28 +23,42 @@ var ErrNoMachine = errors.New("route: no machine takes this channel")
 // one started before fednet. The message is not queued anywhere.
 var ErrNoOwner = errors.New("route: thread has no owner")
 
-// ErrLimited is returned for a message from a limited user that would go
-// to a machine not on their list; the error says which. The message is
-// not queued anywhere.
+// ErrLimited is returned for a message from a limited user in a channel,
+// or that would go to a machine, not on their list; the error says which.
+// The message is not queued anywhere.
 var ErrLimited = errors.New("route: the sender is a limited user")
 
 // Limited is the hub's limited users, by Slack user id: people fednet
-// serves only on the machines their entry lists. A limited user is not on
-// the user list.
+// serves only on the machines and in the channels their entry lists. A
+// limited user is not on the user list.
 type Limited map[string]LimitedUser
 
 // LimitedUser is one limited user: a name for the agents, which may be
-// empty, and the clients they may hand work to.
+// empty, the clients they may hand work to and the channels, by Slack
+// channel id, they may hand it over in. An empty list does not limit; the
+// hub's config lists at least one.
 type LimitedUser struct {
 	Name     string   `json:"name"`
 	Machines []string `json:"machines"`
+	Channels []string `json:"channels"`
+}
+
+// OnMachine reports whether u may hand work to machine, which is never
+// so for no machine.
+func (u LimitedUser) OnMachine(machine string) bool {
+	return machine != "" && (len(u.Machines) == 0 || slices.Contains(u.Machines, machine))
+}
+
+// InChannel reports whether u may hand work over in channel.
+func (u LimitedUser) InChannel(channel string) bool {
+	return len(u.Channels) == 0 || slices.Contains(u.Channels, channel)
 }
 
 // Allow reports whether user is a limited user who may hand work to
-// machine.
-func (l Limited) Allow(user, machine string) bool {
+// machine in channel.
+func (l Limited) Allow(user, channel, machine string) bool {
 	u, ok := l[user]
-	return ok && machine != "" && slices.Contains(u.Machines, machine)
+	return ok && u.InChannel(channel) && u.OnMachine(machine)
 }
 
 // Router queues the messages people post in threads, by the routes in the
@@ -65,9 +79,9 @@ func New(hub *store.Hub) *Router {
 
 // Limit makes r refuse, with ErrLimited, what RouteNew, RouteNewDM and
 // RouteReply would queue for a limited user of l in a thread whose
-// channel's machine, or whose owner when it has one, is not on the user's
-// list. It returns r. The caller keeps a limited user's direct messages
-// out itself.
+// channel, channel's machine, or owner when it has one, is not on the
+// user's list. It returns r. The caller keeps a limited user's direct
+// messages out itself.
 func (r *Router) Limit(l Limited) *Router {
 	r.limited = l
 	return r
@@ -76,8 +90,12 @@ func (r *Router) Limit(l Limited) *Router {
 // limit returns ErrLimited when r refuses m, in thread of channel, as
 // Limit says.
 func (r *Router) limit(ctx context.Context, channel, thread string, m payload.Message) error {
-	if _, ok := r.limited[m.User]; !ok {
+	u, ok := r.limited[m.User]
+	if !ok {
 		return nil
+	}
+	if !u.InChannel(channel) {
+		return fmt.Errorf("%w: the channel %q is not on their list", ErrLimited, channel)
 	}
 	rt, err := r.hub.Route(ctx, channel)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -86,7 +104,7 @@ func (r *Router) limit(ctx context.Context, channel, thread string, m payload.Me
 	if rt.Machine == "" {
 		return fmt.Errorf("%w: no machine takes the channel", ErrLimited)
 	}
-	if !r.limited.Allow(m.User, rt.Machine) {
+	if !u.OnMachine(rt.Machine) {
 		return fmt.Errorf("%w: the channel's machine %q is not on their list", ErrLimited, rt.Machine)
 	}
 	owner, err := r.hub.Owner(ctx, thread)
@@ -95,7 +113,7 @@ func (r *Router) limit(ctx context.Context, channel, thread string, m payload.Me
 		return nil
 	case err != nil:
 		return err
-	case !r.limited.Allow(m.User, owner):
+	case !u.OnMachine(owner):
 		return fmt.Errorf("%w: the thread's owner %q is not on their list", ErrLimited, owner)
 	}
 	return nil

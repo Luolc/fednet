@@ -203,9 +203,11 @@ type User struct {
 	// Name is what the agents call them; it may be empty.
 	Name string `json:"name,omitempty"`
 	// Limited is set for a limited user, whose messages go only to
-	// Machines, the clients on their list.
+	// Machines, the clients on their list, and are taken in only in
+	// Channels, the channels on it; an empty list does not limit.
 	Limited  bool     `json:"limited,omitempty"`
 	Machines []string `json:"machines,omitempty"`
+	Channels []string `json:"channels,omitempty"`
 }
 
 // Reply is the hub's answer. Which fields are set depends on the command.
@@ -777,7 +779,7 @@ func (s *Server) users() []User {
 	}
 	for _, id := range slices.Sorted(maps.Keys(s.Limited)) {
 		u := s.Limited[id]
-		us = append(us, User{ID: id, Name: u.Name, Limited: true, Machines: u.Machines})
+		us = append(us, User{ID: id, Name: u.Name, Limited: true, Machines: u.Machines, Channels: u.Channels})
 	}
 	return us
 }
@@ -993,6 +995,9 @@ func (s *Server) requestChannel(ctx context.Context, client string, r Request) (
 	for _, u := range q.Create.Invite {
 		if !s.mentionable(u) {
 			return "", link.Refuse(link.ErrBadRequest, "%s is not on the user list", u)
+		}
+		if len(s.Limited[u].Channels) > 0 {
+			return "", link.Refuse(link.ErrDenied, "%s is a limited user served only in the channels on their list, which a channel not yet created is not on", u)
 		}
 	}
 	if err := s.noneWaiting(ctx, "#"+q.Create.Name, func(c approval.RouteChange) bool { return c.Create != nil && c.Create.Name == q.Create.Name }); err != nil {

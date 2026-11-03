@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -438,5 +439,65 @@ func TestLimitedUserAnswersOnlyTheirClients(t *testing.T) {
 	}
 	if w := tf.f.Whispers("U3"); len(w) != 1 || w[0] != notOpenText {
 		t.Fatalf("hints to U3 = %q, want one that the card is not theirs to answer", w)
+	}
+}
+
+// A limited user whose entry lists channels may answer only a card in a
+// thread of one of those channels: with no machines listed, whichever
+// client owns the thread; with machines listed too, only one whose owner
+// is on their list as well.
+func TestLimitedUserAnswersOnlyInTheirChannels(t *testing.T) {
+	tests := []struct {
+		name    string
+		limited route.LimitedUser
+		// counts says, for each card, whether U3's press counts.
+		counts [3]bool
+	}{
+		{"channels only", route.LimitedUser{Channels: []string{"C1"}}, [3]bool{true, true, false}},
+		{"channels and machines", route.LimitedUser{Machines: []string{"workstation"}, Channels: []string{"C1"}}, [3]bool{true, false, false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := newFlow(t)
+			ctx := t.Context()
+			tf.f.AddChannel("C2", "")
+			tf.Limited = route.Limited{"U3": tt.limited}
+			// The workstation asks each card: in C1 in a thread it owns, in
+			// C1 in one the data machine owns, and in C2 in one it owns.
+			var ps []Posted
+			for i, at := range []struct{ channel, owner string }{{"C1", "workstation"}, {"C1", "datamachine"}, {"C2", "workstation"}} {
+				root, err := tf.f.Start(at.channel, "U1", "另一件事")
+				if err != nil {
+					t.Fatal(err)
+				}
+				thread := slack.ThreadKey(at.channel, root)
+				if err := tf.Store.Claim(ctx, thread, at.owner, "", ""); err != nil {
+					t.Fatal(err)
+				}
+				p, err := tf.Ask(ctx, "workstation", thread, "q-"+strconv.Itoa(i), []byte(card), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tf.click(t, p, "U3", slack.QuestionSubmitAction, "1", "")
+				ps = append(ps, p)
+			}
+			var want []string
+			for i, ok := range tt.counts {
+				if ok {
+					want = append(want, ps[i].ID)
+				}
+			}
+			var got []string
+			for _, a := range tf.answers(t) {
+				got = append(got, a.CardID)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("answered cards = %q, want %q", got, want)
+			}
+			tf.pass(t)
+			if w := tf.f.Whispers("U3"); len(w) != len(ps)-len(want) || slices.ContainsFunc(w, func(s string) bool { return s != notOpenInChannelsText }) {
+				t.Fatalf("hints to U3 = %q, want one for each card not theirs to answer", w)
+			}
+		})
 	}
 }
