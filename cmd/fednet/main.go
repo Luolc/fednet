@@ -938,7 +938,8 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		}
 	}
 	fmt.Fprintf(stdout, "listening on %s\n", ln.Addr())
-	srv := &http.Server{Handler: hub.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	fresh := &freshConns{}
+	srv := &http.Server{Handler: hub.Handler(), ReadHeaderTimeout: 10 * time.Second, ConnState: fresh.track}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
 
@@ -1069,7 +1070,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 	hub.Close()
 	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer scancel()
-	if serr := srv.Shutdown(sctx); err == nil {
+	if serr := fresh.shutdown(sctx, srv); err == nil {
 		err = serr
 	}
 	if !stopped {
@@ -2370,4 +2371,56 @@ func clientInit(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "%s %x\n", cred.ClientID, cred.Hash())
 	return nil
+}
+
+// freshConns tracks the connections that have not sent a request yet.
+// Shutdown waits for such a connection until it is five seconds old, and a
+// client may leave one open: its transport dials ahead when requests
+// overlap, and keeps the connection it did not need. Nothing is in flight on
+// one, so closing it loses nothing.
+type freshConns struct {
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+}
+
+func (f *freshConns) track(c net.Conn, state http.ConnState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if state == http.StateNew {
+		if f.conns == nil {
+			f.conns = make(map[net.Conn]struct{})
+		}
+		f.conns[c] = struct{}{}
+		return
+	}
+	delete(f.conns, c)
+}
+
+// shutdown shuts srv down, closing the fresh connections until it returns:
+// one the server has accepted, but not yet reported, is closed on a later
+// pass.
+func (f *freshConns) shutdown(ctx context.Context, srv *http.Server) error {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(10 * time.Millisecond)
+		defer t.Stop()
+		for {
+			f.closeAll()
+			select {
+			case <-t.C:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return srv.Shutdown(ctx)
+}
+
+func (f *freshConns) closeAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for c := range f.conns {
+		c.Close()
+	}
 }
