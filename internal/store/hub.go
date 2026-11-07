@@ -122,7 +122,8 @@ type Hub struct {
 	db dbtx
 	// conn is the database itself, which opens transactions and closes.
 	conn *sql.DB
-	// Outbox holds the downlink messages for each client until it acks them.
+	// Outbox holds the downlink messages for each client until it acks them
+	// or they are dropped for having waited too long.
 	Outbox HubOutbox
 	// Inbox holds the uplink messages received from clients.
 	Inbox HubInbox
@@ -141,7 +142,7 @@ func OpenHub(ctx context.Context, path string) (*Hub, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, routeSchema+questionSchema+relaySchema); err != nil {
+	if _, err := db.ExecContext(ctx, routeSchema+questionSchema+relaySchema+dropSchema); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -400,10 +401,13 @@ func (o HubOutbox) After(ctx context.Context, client string, seq int64) ([]Downl
 	return ds, rows.Err()
 }
 
-// Ack removes client's queued messages up to and including seq.
-func (o HubOutbox) Ack(ctx context.Context, client string, seq int64) error {
-	_, err := o.db.ExecContext(ctx, "DELETE FROM outbox WHERE client_id = ? AND seq <= ?", client, seq)
-	return err
+// Ack removes client's queued messages up to and including seq, and
+// returns the marks of the messages no longer queued, forgetting them.
+func (o HubOutbox) Ack(ctx context.Context, client string, seq int64) ([]string, error) {
+	if _, err := o.db.ExecContext(ctx, "DELETE FROM outbox WHERE client_id = ? AND seq <= ?", client, seq); err != nil {
+		return nil, err
+	}
+	return o.sweepMarks(ctx)
 }
 
 // QueuedFor reports whether client has a message that has waited in the

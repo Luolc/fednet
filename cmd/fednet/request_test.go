@@ -16,6 +16,7 @@ import (
 	"github.com/Luolc/fednet/internal/route"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	"github.com/Luolc/fednet/internal/watch"
 )
 
 // The commands that ask the hub, from an agent through the client's socket
@@ -461,11 +462,14 @@ func TestHubConfigAlerts(t *testing.T) {
 		}
 		return p
 	}
-	cfg, err := readHubConfig(write("set.json", `{"alerts": {"slack_down": "90s", "offline_queued": "1h"}}`))
-	if err != nil || time.Duration(cfg.Alerts.SlackDown) != 90*time.Second || time.Duration(cfg.Alerts.OfflineQueued) != time.Hour {
-		t.Fatalf("readHubConfig = %+v, %v; want 90s and 1h", cfg.Alerts, err)
+	cfg, err := readHubConfig(write("set.json", `{"alerts": {"slack_down": "90s", "offline_queued": "1h", "drop_queued": "72h",
+		"clients": {"laptop": {"offline_queued": "2m", "no_offline_alert": true}, "workstation": {"offline_queued": "5m"}}}}`))
+	wantClients := map[string]watch.Client{"laptop": {Offline: 2 * time.Minute, NoAlert: true}, "workstation": {Offline: 5 * time.Minute}}
+	if err != nil || time.Duration(cfg.Alerts.SlackDown) != 90*time.Second || time.Duration(cfg.Alerts.OfflineQueued) != time.Hour ||
+		time.Duration(cfg.Alerts.DropQueued) != 72*time.Hour || !reflect.DeepEqual(cfg.watchClients(), wantClients) {
+		t.Fatalf("readHubConfig = %+v, %v; want 90s, 1h, 72h and the two clients", cfg.Alerts, err)
 	}
-	if cfg, err := readHubConfig(write("unset.json", `{}`)); err != nil || cfg.Alerts.SlackDown != 0 || cfg.Alerts.OfflineQueued != 0 {
+	if cfg, err := readHubConfig(write("unset.json", `{}`)); err != nil || cfg.Alerts.SlackDown != 0 || cfg.Alerts.OfflineQueued != 0 || cfg.Alerts.DropQueued != 0 || len(cfg.watchClients()) != 0 {
 		t.Fatalf("readHubConfig without alerts = %+v, %v; want zero, the defaults", cfg.Alerts, err)
 	}
 	for _, bad := range []string{`"5"`, `"-5m"`, `300`} {
@@ -534,7 +538,10 @@ func TestExampleHubConfig(t *testing.T) {
 	if p := cfg.prefetch(); !reflect.DeepEqual(p.Types, inbound.DefaultPrefetchTypes) || p.MaxBytes != inbound.DefaultPrefetchMaxBytes || p.MaxTotal != inbound.DefaultPrefetchMaxTotal || cfg.Files.FetchMaxBytes != hubapi.DefaultMaxFetchBytes || cfg.Files.UploadMaxBytes != hubapi.DefaultMaxUploadBytes || cfg.Files.UploadMaxFiles != hubapi.DefaultMaxUploadFiles {
 		t.Fatalf("the example's files limits are %+v, want the defaults", cfg.Files)
 	}
-	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || len(cfg.LimitedUsers) == 0 || cfg.Alerts.SlackDown == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 || !cfg.Relay.Allow("workstation", "datamachine") {
+	if time.Duration(cfg.Alerts.DropQueued) != watch.DefaultDrop {
+		t.Fatalf("the example's drop_queued is %v, want the default", time.Duration(cfg.Alerts.DropQueued))
+	}
+	if len(cfg.routes()) == 0 || len(cfg.Users) == 0 || len(cfg.LimitedUsers) == 0 || cfg.Alerts.SlackDown == 0 || len(cfg.Alerts.Clients) == 0 || cfg.Approvals.Channel == "" || len(cfg.Approvals.Approvers) == 0 || len(cfg.Ops.Upgrade) == 0 || len(cfg.Ops.Version) == 0 || !cfg.Relay.Allow("workstation", "datamachine") {
 		t.Fatalf("example config = %+v, want every part set", cfg)
 	}
 }

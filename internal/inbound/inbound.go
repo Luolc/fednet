@@ -106,6 +106,11 @@ type Receiver struct {
 	// it may have queued one for a client, or put a post from the hub in
 	// the hub's inbox. It must not block.
 	Stored func()
+	// Queued, if set, is called each time Handle has committed a message
+	// it queued for a client: that client, the msg_id it is queued under,
+	// and the channel and ts of the person's message in Slack. It must
+	// not block.
+	Queued func(client, msgID, channel, ts string)
 	// Approvals takes the clicks on approval cards; nil means they are
 	// acked and dropped.
 	Approvals *approval.Flow
@@ -209,8 +214,11 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	if !ev.IM && !owned {
 		info, history = r.channelInfo(ctx, ev.Channel), r.history(ev, thread, before)
 	}
+	var queuedFor, queuedID string
 	_, err = r.Store.ReceiveSlack(ctx, store.SlackMessage{Channel: ev.Channel, TS: ev.TS, EventID: ev.ID}, func(tx *store.Hub) error {
-		rt := route.New(tx).Limit(r.Limited)
+		rt := route.New(tx).Limit(r.Limited).OnQueue(func(client string, d store.Downlink) {
+			queuedFor, queuedID = client, d.MsgID
+		})
 		name, err := tx.ChannelName(ctx, thread)
 		owned := err == nil
 		if errors.Is(err, store.ErrNotFound) {
@@ -262,6 +270,9 @@ func (r *Receiver) Handle(ctx context.Context, ev Event) error {
 	}
 	if r.Stored != nil {
 		r.Stored()
+	}
+	if r.Queued != nil && queuedID != "" {
+		r.Queued(queuedFor, queuedID, ev.Channel, ev.TS)
 	}
 	return nil
 }

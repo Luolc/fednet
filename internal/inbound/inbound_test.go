@@ -1883,3 +1883,26 @@ func TestHandleLimitedUserChannels(t *testing.T) {
 		})
 	}
 }
+
+// Each message Handle queues is told to Queued once committed: the
+// client, the msg_id it is queued under, and where the person's message
+// is; a message not queued, or queued before, is not.
+func TestHandleTellsQueued(t *testing.T) {
+	r, _ := newReceiver(t)
+	type call struct{ client, msgID, channel, ts string }
+	var calls []call
+	r.Queued = func(client, msgID, channel, ts string) { calls = append(calls, call{client, msgID, channel, ts}) }
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
+	handle(t, r, message("Ev1", "C1", "1.1", "", hey+"first"))
+	handle(t, r, message("Ev2", "C1", "1.2", "1.1", "reply"))
+	handle(t, r, message("Ev3", "C3", "3.1", "", hey+"nobody takes this"))
+	handle(t, r, message("Ev4", "C1", "4.1", "", "chatter"))
+	ds, err := r.Store.Outbox.After(t.Context(), "workstation", 0)
+	if err != nil || len(ds) != 2 {
+		t.Fatalf("queued = %d, %v; want 2", len(ds), err)
+	}
+	want := []call{{"workstation", ds[0].MsgID, "C1", "1.1"}, {"workstation", ds[1].MsgID, "C1", "1.2"}}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("Queued got %+v, want %+v", calls, want)
+	}
+}
