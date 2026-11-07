@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent for `fednet client` on darwin, the counterpart of the
+  systemd units for linux; a reference, not installed by anything here.
+  Copy it to ~/Library/LaunchAgents/io.github.luolc.fednet-client.plist,
+  replace each line marked "replace" (launchd expands neither ~ nor $HOME,
+  so USER stands for the login user's name throughout), and load it with
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.luolc.fednet-client.plist
+  It runs as the login user and expects:
+    - the binary at ~/.local/bin/fednet, which `fednet upgrade` replaces;
+    - the database, the credential and the socket in
+      ~/.local/state/fednet-client (mkdir -m 700 it first), the credential
+      written there by `fednet client init`;
+    - io.github.luolc.fednet-client-upgrade.plist loaded alongside, which
+      carries out the upgrade requests the client writes.
+
+  The client runs under a shell loop that never exits on its own: it
+  starts the client again 5 seconds after any exit. launchd may stop
+  starting a job that has exited, KeepAlive or not, so the loop, not
+  launchd, is what brings the client back after an upgrade stops it. A stop
+  of the job (logout, launchctl bootout) reaches the loop, which passes the
+  SIGTERM on to the client and waits for it. Should the loop itself be
+  gone, launchctl kickstart -k gui/$(id -u)/io.github.luolc.fednet-client
+  starts the job again.
+
+  Do not use `fednet client handoff` here: its new process would be a
+  child of the old one, which launchd takes for the job's end.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.luolc.fednet-client</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 0' TERM INT; while :; do "$@" &amp; pid=$!; wait "$pid"; sleep 5; done</string>
+		<string>fednet-client</string>
+		<!-- replace: USER, here and below. -->
+		<string>/Users/USER/.local/bin/fednet</string>
+		<string>client</string>
+		<!-- replace: the address the hub listens on. -->
+		<string>-hub</string>
+		<string>http://hub.example.test:8080</string>
+		<string>-db</string>
+		<string>/Users/USER/.local/state/fednet-client/client.db</string>
+		<string>-credential</string>
+		<string>/Users/USER/.local/state/fednet-client/credential</string>
+		<!-- The file io.github.luolc.fednet-client-upgrade.plist watches. -->
+		<string>-upgrade-request</string>
+		<string>/Users/USER/.local/state/fednet-client/upgrade</string>
+		<!-- replace: the hook, here the echo hook of this directory. -->
+		<string>-hook-env</string>
+		<string>FEDNET_SOCKET</string>
+		<string>/Users/USER/.local/bin/echo-hook.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- The default socket on darwin, spelled out for the hook. -->
+		<key>FEDNET_SOCKET</key>
+		<string>/Users/USER/.local/state/fednet-client/fednet.sock</string>
+		<!-- replace: where the hook finds fednet and jq. -->
+		<key>PATH</key>
+		<string>/Users/USER/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/USER/Library/Logs/fednet-client.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/USER/Library/Logs/fednet-client.log</string>
+</dict>
+</plist>

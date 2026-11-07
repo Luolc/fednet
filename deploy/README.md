@@ -5,6 +5,7 @@
 - [`fednet-hub.service`](fednet-hub.service)：systemd 单元模板，标了 `replace` 的几行按自己的机器改。
 - [`echo-hook.sh`](echo-hook.sh)：client 的示例钩子，把收到的每条消息的概要回到同一个线程，见下面「回声钩子」一节。
 - `fednet-hub-upgrade.path`、`fednet-hub-upgrade.service`、`fednet-client-upgrade.path`、`fednet-client-upgrade.service`：让 hub 和 client 自己升级的 root 单元，见下面「升级」一节。
+- [`io.github.luolc.fednet-client.plist`](io.github.luolc.fednet-client.plist)、[`io.github.luolc.fednet-client-upgrade.plist`](io.github.luolc.fednet-client-upgrade.plist)：darwin 上跑 client 和让它自己升级的 launchd LaunchAgent，只是参考，见下面「darwin 上的 client」一节。
 - [`hub.example.json`](hub.example.json)：hub 配置的示例，channel id、机器名、用户 id 都是示例值。字段的含义以 `fednet` 不带参数时打印的用法为准。
 
 机器本身怎么建、文件怎么装上去，不在这个仓里。
@@ -29,7 +30,7 @@ sha256sum -c --ignore-missing SHA256SUMS
 sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 ```
 
-`sha256sum -c` 要打出 `fednet_vX.Y.Z_linux_<arch>: OK` 并退出 0；不是这样就不装。darwin/arm64 的二进制按 `fednet_vX.Y.Z_darwin_arm64` 下载，用 `shasum -a 256 -c --ignore-missing SHA256SUMS` 校验；这里的 systemd 单元只适用于 linux，darwin 上的服务单元不在这个目录里。
+`sha256sum -c` 要打出 `fednet_vX.Y.Z_linux_<arch>: OK` 并退出 0；不是这样就不装。darwin/arm64 的二进制按 `fednet_vX.Y.Z_darwin_arm64` 下载，用 `shasum -a 256 -c --ignore-missing SHA256SUMS` 校验；这里的 systemd 单元只适用于 linux，darwin 上用 LaunchAgent，见「darwin 上的 client」一节。
 
 ## hub 要的文件
 
@@ -97,6 +98,15 @@ hub 和 client 都不改自己的二进制。要升级时它们只写一个升�
 - agent 机器上的 `fednet client ops -socket <client 的 socket> upgrade`，例如用户在 Slack 里让 workstation 上的 agent 把 fednet 升级一下。hub 配置里 `ops.upgrade` 列出的 client 才能用 (`ops.version` 管同一条命令的 `version`，读数和 `/fednet version` 一样)，没列的一律拒绝，认的是 client 连 hub 用的凭证，不是请求里写的名字。它和点「升级」走同一条路、只能升到最新的 release，hub 开始升级就返回，不等做完，进度看报警 channel；已是最新就只回一句。每次请求，不论成功、失败还是被拒，hub 都在执行之前先写一行日志、执行完再写一行结果，再在报警 channel 发一条，写明哪台 client、什么操作、结果；报警 channel 积压太多条没发出去时，hub 不执行新的请求，回「hub 忙」(退 5)，过一会儿再试。按规则发了版之后，agent 可以自己用这条命令升到这一版，不必等人要求，也不必等定时检查。
 
 一次升级的顺序：hub 先给每台在线、版本不是目标版本的 client 发升级通知，client 程序自己写请求文件 (不经过 agent)；hub 等它们都重连并报上新版本 (默认最多等十分钟)，全部到齐才写自己的请求文件、换成新进程。有一台失败或超时，hub 不升，汇总里列出是哪台，处理好了再发一次 `/fednet upgrade`；hub 自己到时没换成新进程，汇总里带上升级器写的结局 (回退到了哪个版本)。离线的 client 不等，它每次连 hub 时 hub 发现版本比自己旧，就在握手的回应里再告诉它一次，hub 因版本过旧拒绝的 client 也一样能收到。开始、hub 开始升级、最后的汇总都作为普通消息发到报警 webhook 对应的 channel，没配 webhook 就只进日志。
+
+### darwin 上的 client
+
+darwin 上没有 systemd，client 由登录用户的 launchd LaunchAgent 跑，升级也以登录用户的身份做，不要 root：二进制放在用户自己能写的 `~/.local/bin/fednet`，数据库、凭证、socket 和升级请求都在 `~/.local/state/fednet-client` 下 (先 `mkdir -m 700` 建好)。两个 plist 是参考写法，这个仓不往任何机器上装；标了 `replace` 的几行按本机改，`USER` 是登录用户名 (launchd 不展开 `~` 和 `$HOME`)，复制到 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u) <plist>` 加载。
+
+- [`io.github.luolc.fednet-client.plist`](io.github.luolc.fednet-client.plist)：`RunAtLoad`、`KeepAlive`，日志在 `~/Library/Logs/fednet-client.log`。client 外面包了一个自己不退出的 shell 循环，client 退出 5 秒后再起它：launchd 在任务退出之后可能不再拉起，`KeepAlive` 也不管用，所以升级时停掉的 client 靠这个循环起来。停任务 (注销、`launchctl bootout`) 时循环把 SIGTERM 转给 client，等它退出再退出。循环本身也没了时，用 `launchctl kickstart -k gui/$(id -u)/io.github.luolc.fednet-client` 拉起。
+- [`io.github.luolc.fednet-client-upgrade.plist`](io.github.luolc.fednet-client-upgrade.plist)：用 `WatchPaths` 盯 client 的 `-upgrade-request`，文件一变就跑一次 `fednet upgrade`，加载时也跑一次，接上没加载期间写下的请求。日志在 `~/Library/Logs/fednet-client-upgrade.log`。
+
+darwin 上不交接：tableflip 起的新进程是旧进程的子进程，旧进程一退出，launchd 就当这个任务结束了。`fednet upgrade` 在 darwin 上默认带 `-restart`：下载、校验、换二进制 (旧的留作 `~/.local/bin/fednet.prev`) 都和 linux 一样，然后给 client 发 SIGTERM，由循环起新二进制，等至多 `-restart-timeout` (默认一分钟) 有新进程在 socket 上答出目标版本，成功才删 `.prev`。没等到、或者答出的不是目标版本时，把 `.prev` 换回去，停掉答出别的版本的进程，再等旧版本的进程起来答话；结局写在日志和请求旁边的 `.result` 里。升级时 client 断一次线，hub 发来的消息留在 hub 的 outbox 里，client 重连后补投；正在跑的钩子按停机处理，新进程会再跑一次这条消息，`msg_id` 不变。darwin 上也不要用 `fednet client handoff`。
 
 ### 手工升级
 

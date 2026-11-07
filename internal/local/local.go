@@ -262,7 +262,6 @@ func (s *Socket) Close() error {
 	return err
 }
 
-// listen creates the socket at path; the caller holds the lock.
 const (
 	tmpDirPrefix  = ".fednet-socket-"
 	tmpSocketName = "socket"
@@ -278,6 +277,7 @@ func BindPathLen(path string) int {
 	return len(filepath.Join(filepath.Dir(path), tmpDirPrefix+strings.Repeat("0", maxTmpDirSuffix), tmpSocketName))
 }
 
+// listen creates the socket at path; the caller holds the lock.
 func listen(path string, mode os.FileMode, gid int) (net.Listener, error) {
 	if fi, err := os.Lstat(path); err == nil && fi.Mode().Type() != os.ModeSocket {
 		return nil, fmt.Errorf("local: %s exists and is not a socket", path)
