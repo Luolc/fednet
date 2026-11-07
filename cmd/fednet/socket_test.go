@@ -6,7 +6,11 @@ import (
 )
 
 func TestSocketFor(t *testing.T) {
-	long := "/Users/" + strings.Repeat("x", 90)
+	// The socket is bound at <dir>/.fednet-socket-<10 digits>/socket, 104
+	// bytes with the NUL at most: a home directory of 43 bytes is the
+	// longest that fits.
+	fits := "/Users/" + strings.Repeat("x", 36)
+	tooLong := fits + "x"
 	for _, c := range []struct {
 		name, goos, env, home, want string
 	}{
@@ -15,19 +19,13 @@ func TestSocketFor(t *testing.T) {
 		{"the variable wins on linux", "linux", "/x/a.sock", "/home/u", "/x/a.sock"},
 		{"the variable wins on darwin", "darwin", "/x/a.sock", "/Users/u", "/x/a.sock"},
 		{"darwin without a home", "darwin", "", "", ""},
-		{"darwin with a home too long for sun_path", "darwin", "", long, ""},
+		{"darwin with the longest home that fits", "darwin", "", fits, fits + "/.local/state/fednet-client/fednet.sock"},
+		{"darwin with a home one byte too long", "darwin", "", tooLong, ""},
 		{"another system", "plan9", "", "/home/u", ""},
 	} {
 		if got := socketFor(c.goos, c.env, c.home); got != c.want {
 			t.Errorf("%s: socketFor(%q, %q, %q) = %q, want %q", c.name, c.goos, c.env, c.home, got, c.want)
 		}
-	}
-}
-
-// The default path on darwin fits sun_path for a typical home directory.
-func TestDarwinSocketFits(t *testing.T) {
-	if got := socketFor("darwin", "", "/Users/"+strings.Repeat("x", 30)); got == "" || len(got) >= 104 {
-		t.Fatalf("socketFor = %q", got)
 	}
 }
 

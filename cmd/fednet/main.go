@@ -501,7 +501,7 @@ func hubCommand(ctx context.Context, args []string, stdout io.Writer) error {
 		case "reassign":
 			return hubReassign(ctx, args[1:], stdout)
 		case "handoff":
-			return handoffCommand(ctx, hubHandoff, args[1:], stdout)
+			return handoffCommand(ctx, "fednet hub handoff", "", args[1:], stdout)
 		}
 	}
 	return hubServe(ctx, args, stdout)
@@ -1137,7 +1137,7 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 		case "dm":
 			return clientDM(ctx, args[1:], stdout)
 		case "handoff":
-			return handoffCommand(ctx, "fednet client handoff", args[1:], stdout)
+			return handoffCommand(ctx, "fednet client handoff", defaultSocket(), args[1:], stdout)
 		case "request-approval":
 			return clientRequestApproval(ctx, args[1:], stdout)
 		case "request-route":
@@ -1196,10 +1196,10 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	if *hubURL == "" || *dbPath == "" || *credPath == "" || *socket == "" {
 		return usageError("fednet client: -hub, -db, -credential and -socket are required (or $" + socketEnv + " or a default socket for this system)")
 	}
-	explicit := false
+	explicit := os.Getenv(socketEnv) != ""
 	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "socket" })
 	if !explicit {
-		// Nothing creates the directory of a default socket on darwin.
+		// Nothing creates the directory of the default socket on darwin.
 		if err := os.MkdirAll(filepath.Dir(*socket), 0o700); err != nil {
 			return err
 		}
@@ -1327,14 +1327,9 @@ func clientServe(ctx context.Context, args []string) (err error) {
 // process, waits for the new process to answer on the socket, and prints
 // the versions handed off from and to. A handoff that failed is an error:
 // the old process is still serving.
-func handoffCommand(ctx context.Context, name string, args []string, stdout io.Writer) error {
+func handoffCommand(ctx context.Context, name, defaultSocket string, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	socket, asJSON := socketFlags(fs)
-	if name == hubHandoff {
-		// The default is the client's socket; the hub's is its admin socket.
-		*socket = ""
-		fs.Lookup("socket").DefValue = ""
-	}
+	socket, asJSON := socketFlagsDefault(fs, defaultSocket)
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
@@ -1610,8 +1605,17 @@ func do(ctx context.Context, socket string, req local.Request, files ...io.Reade
 // socketFlags declares the flags every command that talks to the client
 // daemon takes.
 func socketFlags(fs *flag.FlagSet) (socket *string, asJSON *bool) {
-	return fs.String("socket", defaultSocket(), "the client daemon's socket; default: $"+socketEnv+", else "+socketDefaultsDoc),
-		fs.Bool("json", false, "print the reply as JSON")
+	return socketFlagsDefault(fs, defaultSocket())
+}
+
+// socketFlagsDefault is socketFlags with def as the socket when -socket
+// is not given; without one, "" has -socket required.
+func socketFlagsDefault(fs *flag.FlagSet, def string) (socket *string, asJSON *bool) {
+	usage := "the daemon's socket (required)"
+	if def != "" {
+		usage = "the client daemon's socket; default: $" + socketEnv + ", else " + socketDefaultsDoc
+	}
+	return fs.String("socket", def, usage), fs.Bool("json", false, "print the reply as JSON")
 }
 
 // clientReadThread prints the messages of a thread, which the hub reads

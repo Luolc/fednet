@@ -4,7 +4,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/Luolc/fednet/internal/local"
 )
+
+// darwinSunPath is the size of sun_path on darwin, in bytes.
+const darwinSunPath = 104
 
 // socketEnv names the environment variable that gives the client's socket
 // when -socket is not.
@@ -21,9 +26,10 @@ func defaultSocket() string {
 // socketFor is defaultSocket for the given system, value of the variable
 // and home directory. On linux the client runs as a service with a
 // runtime directory of its own. On darwin there is no such directory, so
-// the socket is in the user's state directory; the path has no space and
-// must fit sun_path, 104 bytes there including the terminating NUL, so a
-// home directory too long for it gives no default.
+// the socket is in the user's state directory; the path has no space, and
+// the path the socket is bound at (local.BindPathLen) must fit sun_path,
+// 104 bytes there including the terminating NUL, so a home directory too
+// long for it gives no default.
 func socketFor(goos, env, home string) string {
 	if env != "" {
 		return env
@@ -36,7 +42,7 @@ func socketFor(goos, env, home string) string {
 			return ""
 		}
 		path := filepath.Join(home, ".local", "state", "fednet-client", "fednet.sock")
-		if len(path) >= 104 {
+		if local.BindPathLen(path) >= darwinSunPath {
 			return ""
 		}
 		return path
@@ -46,7 +52,3 @@ func socketFor(goos, env, home string) string {
 
 // socketDefaultsDoc says what defaultSocket falls back to, for the usage.
 const socketDefaultsDoc = "/run/fednet-client/fednet.sock on linux, ~/.local/state/fednet-client/fednet.sock on darwin"
-
-// hubHandoff names the command that hands the hub off, which takes the
-// hub's admin socket and has no default.
-const hubHandoff = "fednet hub handoff"
