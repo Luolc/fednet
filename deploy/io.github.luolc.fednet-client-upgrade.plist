@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent that upgrades the client of
+  io.github.luolc.fednet-client.plist on darwin, the counterpart of
+  fednet-client-upgrade.path and fednet-client-upgrade.service; a
+  reference, not installed by anything here. Install it the same way, with
+  the same USER. It runs as the login user, no root: the binary is the
+  user's own.
+
+  launchd starts it when the request file changes, and once at load for a
+  request written while it was not loaded. `fednet upgrade` deletes the
+  request (which starts it once more, to find none), downloads and checks
+  the release, puts it at the binary's path, and, -restart being the
+  default on darwin, stops the client with SIGTERM instead of handing off;
+  the client's loop starts the new binary. A new process that does not
+  answer on the socket with the release within -restart-timeout has the
+  old binary put back and started again. The outcome goes to the log and
+  to the .result file next to the request.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.luolc.fednet-client-upgrade</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- replace: USER, here and below. -->
+		<string>/Users/USER/.local/bin/fednet</string>
+		<string>upgrade</string>
+		<string>-request</string>
+		<string>/Users/USER/.local/state/fednet-client/upgrade</string>
+		<string>-binary</string>
+		<string>/Users/USER/.local/bin/fednet</string>
+		<string>-socket</string>
+		<string>/Users/USER/.local/state/fednet-client/fednet.sock</string>
+	</array>
+	<key>WatchPaths</key>
+	<array>
+		<string>/Users/USER/.local/state/fednet-client/upgrade</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/USER/Library/Logs/fednet-client-upgrade.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/USER/Library/Logs/fednet-client-upgrade.log</string>
+</dict>
+</plist>

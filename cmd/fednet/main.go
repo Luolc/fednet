@@ -392,13 +392,19 @@ commands:
         it as used; exit 0 to act, 5 bad signature, 6 expired, 7 the target or
         the action differs, 8 already used, 1 a file cannot be read or the
         public key is not an ssh-ed25519 line, 2 the approval is not well formed
-  upgrade -request PATH -binary PATH [-socket PATH]
+  upgrade -request PATH -binary PATH [-socket PATH] [-restart] [-restart-timeout D]
         carry out the upgrade request at PATH, then delete it: download the
         release it names for this machine from fednet's releases, check it
         against the release's SHA256SUMS, put it at the binary's PATH in one
         rename, and hand the hub or client answering on the socket off to
         it; refuses a release that is not newer than what runs; for the root
-        unit that watches the request file
+        unit that watches the request file; with -restart, the default on
+        darwin, it does not hand off but stops the process with SIGTERM, for
+        what supervises it (launchd) to start the new binary, and waits at
+        most -restart-timeout (default 1m) for a new process to answer on the
+        socket with the release; when none does, it puts the old binary back
+        and stops whatever process of another version answers, so that the
+        next start runs the old binary
   version
         print the version
 `
@@ -1419,20 +1425,28 @@ func handOff(ctx context.Context, socket string) (old, now local.Response, err e
 // the daemon on -socket what it runs and refuses a release that is not
 // newer; downloads and checks the release's binary for this machine and
 // puts it at -binary in one rename, keeping the old one; then hands the
-// daemon off to it and prints the versions handed off from and to. A
-// handoff that fails puts the old binary back, so that the next start of
-// the service runs what is known to work. What became of the request is
-// written next to it, for the hub to read.
+// daemon off to it, or with -restart has the daemon's supervisor start it
+// (restartInto), and prints the versions upgraded from and to. A handoff
+// that fails puts the old binary back, so that the next start of the
+// service runs what is known to work; so does a restart that does not
+// come up on the release, which then has the old binary started again
+// (rollBack). What became of the request is written next to it, for the
+// hub to read.
 func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	fs := flag.NewFlagSet("fednet upgrade", flag.ContinueOnError)
 	request := fs.String("request", "", "the upgrade request file (required)")
 	binary := fs.String("binary", "", "the binary to replace, which the daemon runs (required)")
 	socket := fs.String("socket", defaultSocket(), "the socket the daemon hands off on: the hub's admin socket, or the client's, which is the default: $"+socketEnv+", else "+socketDefaultsDoc)
+	restart := fs.Bool("restart", runtime.GOOS == "darwin", "stop the daemon for its supervisor to start the new binary, instead of handing off; the default on darwin")
+	restartTimeout := fs.Duration("restart-timeout", time.Minute, "with -restart, how long the new process, and after a rollback the old binary's, may take to answer on the socket")
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
 	if *request == "" || *binary == "" || *socket == "" {
 		return usageError("fednet upgrade: -request, -binary and -socket are required")
+	}
+	if *restartTimeout <= 0 {
+		return usageError("fednet upgrade: -restart-timeout must be positive")
 	}
 	target, err := upgrade.ReadRequest(*request)
 	if errors.Is(err, upgrade.ErrNoRequest) {
@@ -1465,8 +1479,19 @@ func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) (err e
 		return err
 	}
 	slog.Info("upgrade: installed", "version", target, "binary", *binary)
-	old, now, err := handOff(ctx, *socket)
-	if err != nil {
+	old, now := running, local.Response{}
+	if *restart {
+		if now, err = restartInto(ctx, *socket, running, target, *restartTimeout); err != nil {
+			if rerr := upgrade.Restore(*binary); rerr != nil {
+				return fmt.Errorf("the restart into %s failed: %w; and %v, so %s is at %s", target, err, rerr, target, *binary)
+			}
+			back, berr := rollBack(ctx, *socket, running.Version, *restartTimeout)
+			if berr != nil {
+				return fmt.Errorf("the restart into %s failed: %w; rolled back to %s, but %v", target, err, running.Version, berr)
+			}
+			return fmt.Errorf("the restart into %s failed: %w; rolled back to %s, which pid %d runs", target, err, running.Version, back.PID)
+		}
+	} else if old, now, err = handOff(ctx, *socket); err != nil {
 		if rerr := upgrade.Restore(*binary); rerr != nil {
 			return fmt.Errorf("the handoff to %s failed: %w; and %v, so %s is at %s while the running %s keeps serving", target, err, rerr, target, *binary, running.Version)
 		}
@@ -1477,6 +1502,88 @@ func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) (err e
 	}
 	_, err = fmt.Fprintf(stdout, "upgraded from %s (pid %d) to %s (pid %d)\n", old.Version, old.PID, now.Version, now.PID)
 	return err
+}
+
+// restartPoll is how often a restart looks for the process answering on
+// the socket.
+const restartPoll = 100 * time.Millisecond
+
+// restartInto stops the daemon whose answer on socket is running, with
+// SIGTERM, as a stop of the service would, and waits at most timeout for
+// another process to answer there with version: the one the daemon's
+// supervisor, such as launchd, starts from the binary now in place. Under
+// launchd a handoff does not hold: the successor would be a child of a
+// job that has ended. Another process answering with another version is
+// an error, returned with its answer.
+func restartInto(ctx context.Context, socket string, running local.Response, version string, timeout time.Duration) (local.Response, error) {
+	if err := terminatePID(running.PID); err != nil {
+		return local.Response{}, err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		now, err := do(ctx, socket, local.Request{Cmd: local.Version})
+		switch {
+		case err == nil && now.PID != running.PID && now.Version == version:
+			return now, nil
+		case err == nil && now.PID != running.PID:
+			return now, fmt.Errorf("pid %d answers on %s with %s, not %s", now.PID, socket, now.Version, version)
+		case err == nil:
+			err = fmt.Errorf("the old process (pid %d) still answers on %s", running.PID, socket)
+		}
+		if time.Now().After(deadline) {
+			return local.Response{}, fmt.Errorf("no new process answers on %s within %v: %v", socket, timeout, err)
+		}
+		select {
+		case <-time.After(restartPoll):
+		case <-ctx.Done():
+			return local.Response{}, ctx.Err()
+		}
+	}
+}
+
+// terminatePID sends SIGTERM to pid, which a daemon reported as its own:
+// 0 or less would signal a whole process group, so it is refused.
+func terminatePID(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("refusing to stop pid %d", pid)
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("stopping pid %d: %w", pid, err)
+	}
+	return nil
+}
+
+// rollBack waits, once the old binary is back in place after a restart
+// that failed, at most timeout for a process of version, the old one, to
+// answer on socket, and returns its answer. Each process of another
+// version that answers there instead is stopped with SIGTERM, once, so
+// that the supervisor starts the old binary next.
+func rollBack(ctx context.Context, socket, version string, timeout time.Duration) (local.Response, error) {
+	deadline := time.Now().Add(timeout)
+	stopped := make(map[int]bool)
+	for {
+		now, err := do(ctx, socket, local.Request{Cmd: local.Version})
+		if err == nil && now.Version == version {
+			return now, nil
+		}
+		if err == nil {
+			if !stopped[now.PID] {
+				stopped[now.PID] = true
+				if kerr := terminatePID(now.PID); kerr != nil && !errors.Is(kerr, syscall.ESRCH) {
+					return local.Response{}, fmt.Errorf("pid %d of %s answers on %s: %w", now.PID, now.Version, socket, kerr)
+				}
+			}
+			err = fmt.Errorf("pid %d answers with %s", now.PID, now.Version)
+		}
+		if time.Now().After(deadline) {
+			return local.Response{}, fmt.Errorf("no process of %s answers on %s within %v: %v", version, socket, timeout, err)
+		}
+		select {
+		case <-time.After(restartPoll):
+		case <-ctx.Done():
+			return local.Response{}, ctx.Err()
+		}
+	}
 }
 
 // uplinkAlert returns an alert that goes up to the hub, which sends it to
