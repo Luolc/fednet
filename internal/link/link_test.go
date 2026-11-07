@@ -201,6 +201,29 @@ func TestDownlinkStoresOnceAndAcks(t *testing.T) {
 	}
 }
 
+// The marks of the messages an ack removes go to Acked.
+func TestAckedGetsMarks(t *testing.T) {
+	acked := make(chan []string, 1)
+	h, srv := testHubWith(t, func(h *Hub) { h.Acked = func(marks []string) { acked <- marks } }, nil)
+	cs := openClientStore(t)
+	d, err := h.Send(t.Context(), "a", []byte("marked"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := h.Store.Outbox.Mark(t.Context(), d.MsgID, "C1/1.1"); err != nil || !ok {
+		t.Fatalf("Mark = %v, %v", ok, err)
+	}
+	testClient(t, cs, "a", srv.URL, &cutter{})
+	select {
+	case marks := <-acked:
+		if !slices.Equal(marks, []string{"C1/1.1"}) {
+			t.Fatalf("Acked got %q, want the mark", marks)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Acked was not called")
+	}
+}
+
 func TestDownlinkResumesAfterDisconnect(t *testing.T) {
 	h, srv := testHub(t, nil)
 	cs := openClientStore(t)

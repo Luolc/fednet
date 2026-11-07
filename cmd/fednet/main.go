@@ -95,7 +95,13 @@ commands:
         (an empty list does not limit; they get no direct messages, and
         their own are not taken in; one with channels may not be invited
         to a channel request-channel creates; none may be on the user
-        list, approve or upgrade), names the channel approval cards and
+        list, approve or upgrade), sets the alerts (how long the hub may
+        be cut off from Slack; how long a message may wait for an offline
+        client before an alert and a notice in its thread, which an entry
+        under clients may change for a client, or keep its absence from
+        the alerts; how long a message may wait for any client before it
+        is dropped, with a notice in its thread and an alert: 168h unless
+        set), names the channel approval cards and
         route requests go to and the users, from that list, who may
         approve, bounds the thread history a message that mentions the bot
         carries (how many messages, how many characters in all, how many
@@ -116,7 +122,8 @@ commands:
         {"channels": {"C123": {"machine": "CLIENT-ID", "open_thread": ["CLIENT-ID"]}},
          "dm": {"machine": "CLIENT-ID"}, "users": {"U123": "NAME"},
          "limited_users": {"U789": {"name": "NAME", "machines": ["CLIENT-ID"], "channels": ["C123"]}},
-         "alerts": {"slack_down": "5m", "offline_queued": "10m"},
+         "alerts": {"slack_down": "5m", "offline_queued": "10m", "drop_queued": "168h",
+                    "clients": {"CLIENT-ID": {"offline_queued": "2m", "no_offline_alert": true}}},
          "approvals": {"channel": "C456", "approvers": ["U123"]},
          "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
          "files": {"prefetch_types": ["image/*", "application/pdf"], "prefetch_max_bytes": 20971520,
@@ -536,8 +543,17 @@ type hubConfig struct {
 		// SlackDown is how long the hub may be cut off from Slack.
 		SlackDown duration `json:"slack_down"`
 		// OfflineQueued is how long a message may wait for an offline
-		// client.
+		// client before the alert and the notices in its threads.
 		OfflineQueued duration `json:"offline_queued"`
+		// DropQueued is how long a message may wait in the outbox before
+		// it is dropped.
+		DropQueued duration `json:"drop_queued"`
+		// Clients sets, by client id, OfflineQueued for the client and
+		// whether its absence is kept from the alerts.
+		Clients map[string]struct {
+			OfflineQueued  duration `json:"offline_queued"`
+			NoOfflineAlert bool     `json:"no_offline_alert"`
+		} `json:"clients"`
 	} `json:"alerts"`
 	// Approvals is about approval cards.
 	Approvals struct {
@@ -602,6 +618,15 @@ func (c hubConfig) ops() map[string][]string {
 // auto reports whether the hub upgrades on its own: yes unless the config
 // says no.
 func (c hubConfig) auto() bool { return c.Upgrade.Auto == nil || *c.Upgrade.Auto }
+
+// watchClients is the per-client settings of the alerts, for the watch.
+func (c hubConfig) watchClients() map[string]watch.Client {
+	clients := make(map[string]watch.Client, len(c.Alerts.Clients))
+	for id, a := range c.Alerts.Clients {
+		clients[id] = watch.Client{Offline: time.Duration(a.OfflineQueued), NoAlert: a.NoOfflineAlert}
+	}
+	return clients
+}
 
 // duration is a time.Duration written in JSON as a string such as "5m".
 type duration time.Duration
@@ -856,6 +881,13 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		AcceptVersion: acceptVersion,
 		Uplinked:      poster.Nudge,
 	}
+	// The hourglass on the messages people post for an offline client
+	// needs Slack only, not the webhook.
+	var marks *watch.Marks
+	if sl != nil {
+		marks = &watch.Marks{Store: st, Slack: sl, Online: hub.Online}
+		hub.Acked = marks.Done
+	}
 	// Without Slack the hub runs no approvals, and without the key it
 	// signs none: a request is refused rather than left waiting for a card
 	// that cannot be posted or a signature that cannot be made. A route
@@ -921,7 +953,8 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		r = &inbound.Receiver{Store: st, Slack: sl, Users: cfg.Users, Limited: cfg.LimitedUsers, Bot: bot, History: cfg.history(), Prefetch: cfg.prefetch(), Approvals: approvals, Questions: questions, Commands: upgrades, Stored: func() {
 			hub.WakeAll()
 			poster.Nudge()
-		}}
+		}, Queued: marks.Queued}
+		wg.Go(func() { marks.Run(ctx) })
 		wg.Go(func() {
 			// Run returns before ctx is done only when Slack rejects the
 			// app token.
@@ -994,6 +1027,7 @@ func hubServe(ctx context.Context, args []string, stdout io.Writer) (err error) 
 		w := &watch.Watch{
 			Store: st, Slack: sl, Link: r, Online: hub.Online, AcceptVersion: acceptVersion, Alert: webhook,
 			SlackDown: time.Duration(cfg.Alerts.SlackDown), Offline: time.Duration(cfg.Alerts.OfflineQueued),
+			Clients: cfg.watchClients(), Drop: time.Duration(cfg.Alerts.DropQueued), Marks: marks,
 		}
 		wg.Go(func() { w.Run(ctx) })
 	})

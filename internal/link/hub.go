@@ -56,6 +56,9 @@ type Hub struct {
 	// file's content from body, in order, Size bytes each. Errors are
 	// reported as Fetch's are. Nil means every upload fails.
 	Upload func(ctx context.Context, client string, u Upload, body io.Reader) error
+	// Acked, if set, is called with the marks of the messages an ack
+	// removed from the outbox, when there are any. It must not block.
+	Acked func(marks []string)
 	// UpgradeTo, if set, is asked at each downlink handshake, accepted or
 	// refused, with the version in VersionHeader, and answers the release
 	// the client should upgrade to, or "": that goes to the client in
@@ -330,8 +333,12 @@ func (h *Hub) readAcks(ctx context.Context, client string, conn *websocket.Conn)
 		if err := wsjson.Read(ctx, conn, &a); err != nil {
 			return err
 		}
-		if err := h.Store.Outbox.Ack(ctx, client, a.Seq); err != nil {
+		marks, err := h.Store.Outbox.Ack(ctx, client, a.Seq)
+		if err != nil {
 			return err
+		}
+		if len(marks) > 0 && h.Acked != nil {
+			h.Acked(marks)
 		}
 	}
 }

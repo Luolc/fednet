@@ -70,6 +70,7 @@ func (l Limited) Allow(user, channel, machine string) bool {
 type Router struct {
 	hub     *store.Hub
 	limited Limited
+	queued  func(client string, d store.Downlink)
 }
 
 // New returns a Router that reads the routes from hub and queues into its
@@ -86,6 +87,14 @@ func New(hub *store.Hub) *Router {
 // messages out itself.
 func (r *Router) Limit(l Limited) *Router {
 	r.limited = l
+	return r
+}
+
+// OnQueue makes r call f with each message RouteNew, RouteNewDM and
+// RouteReply queue: the client and the message as queued. f runs in the
+// transaction r queues in, if any, before it commits. It returns r.
+func (r *Router) OnQueue(f func(client string, d store.Downlink)) *Router {
+	r.queued = f
 	return r
 }
 
@@ -146,8 +155,14 @@ func (r *Router) RouteNew(ctx context.Context, channel, channelName, thread stri
 	if err != nil {
 		return "", err
 	}
-	client, _, err := r.hub.ClaimAndEnqueue(ctx, thread, rt.Machine, channelName, rt.Scope, b)
-	return client, err
+	client, d, err := r.hub.ClaimAndEnqueue(ctx, thread, rt.Machine, channelName, rt.Scope, b)
+	if err != nil {
+		return "", err
+	}
+	if r.queued != nil {
+		r.queued(client, d)
+	}
+	return client, nil
 }
 
 // RouteNewDM is RouteNew for a thread in a direct message conversation,
@@ -177,8 +192,12 @@ func (r *Router) RouteReply(ctx context.Context, thread string, m payload.Messag
 	if err != nil {
 		return "", err
 	}
-	if _, err := r.hub.Outbox.Enqueue(ctx, client, b); err != nil {
+	d, err := r.hub.Outbox.Enqueue(ctx, client, b)
+	if err != nil {
 		return "", err
+	}
+	if r.queued != nil {
+		r.queued(client, d)
 	}
 	return client, nil
 }

@@ -198,10 +198,10 @@ func TestOfflineWithQueue(t *testing.T) {
 	f.check()
 	f.check()
 	got := f.hook.got()
-	if len(got) != 1 || !strings.Contains(got[0], "workstation") || !strings.Contains(got[0], "offline") {
+	if len(got) != 1 || !strings.Contains(got[0], "workstation 不在线") {
 		t.Fatalf("alerts = %q, want one about workstation", got)
 	}
-	if told := f.told(t1); len(told) != 1 || !strings.Contains(told[0], "workstation is offline") {
+	if told := f.told(t1); len(told) != 1 || told[0] != "workstation 不在线，消息已排队，回来后按顺序送到" {
 		t.Fatalf("thread got %q, want one notice that workstation is offline", told)
 	}
 
@@ -263,5 +263,55 @@ func TestOutdatedClient(t *testing.T) {
 	}
 	if got := f.hook.got()[0]; !strings.Contains(got, "workstation runs v1") || !strings.Contains(got, "older than v2") {
 		t.Fatalf("alert %q does not name the client, its version and the reason", got)
+	}
+}
+
+// A client's own threshold replaces the hub's, and a client whose absence
+// is kept from the alerts still has its threads told.
+func TestOfflinePerClient(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	for _, c := range []string{"workstation", "laptop"} {
+		if err := f.w.Store.Register(ctx, c, []byte("hash")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.w.Offline = time.Hour
+	f.w.Clients = map[string]Client{"laptop": {Offline: time.Nanosecond, NoAlert: true}}
+	tw := f.queue("workstation")
+	tl := f.queue("laptop")
+	f.check()
+	if got := f.hook.got(); len(got) != 0 {
+		t.Fatalf("alerts = %q, want none: workstation is under the hub's threshold, laptop is kept from the alerts", got)
+	}
+	if told := f.told(tw); len(told) != 0 {
+		t.Fatalf("workstation's thread got %q under the hub's threshold, want nothing", told)
+	}
+	if told := f.told(tl); len(told) != 1 || told[0] != "laptop 不在线，消息已排队，回来后按顺序送到" {
+		t.Fatalf("laptop's thread got %q, want one notice that laptop is offline", told)
+	}
+
+	// With the alert on, laptop's own threshold still decides.
+	f.w.Clients = map[string]Client{"laptop": {Offline: time.Nanosecond}}
+	f.online["laptop"] = true
+	f.check()
+	f.online["laptop"] = false
+	f.check()
+	if got := f.hook.got(); len(got) != 1 || !strings.Contains(got[0], "laptop 不在线") {
+		t.Fatalf("alerts = %q, want one about laptop", got)
+	}
+}
+
+func TestZh(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		7 * 24 * time.Hour:           "7 天",
+		7*24*time.Hour - time.Second: "6 天 23 小时 59 分钟",
+		2*time.Hour + 5*time.Minute:  "2 小时 5 分钟",
+		90 * time.Second:             "1 分钟",
+		30 * time.Second:             "30 秒",
+	} {
+		if got := zh(d); got != want {
+			t.Errorf("zh(%v) = %q, want %q", d, got, want)
+		}
 	}
 }

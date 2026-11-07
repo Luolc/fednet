@@ -86,7 +86,7 @@ func TestHubOutbox(t *testing.T) {
 	}
 
 	// An ack removes everything up to and including its seq, for that client only.
-	if err := o.Ack(ctx, "a", a[1]); err != nil {
+	if _, err := o.Ack(ctx, "a", a[1]); err != nil {
 		t.Fatal(err)
 	}
 	got, err = o.After(ctx, "a", 0)
@@ -114,7 +114,7 @@ func TestHubOutboxSeqNeverGoesBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Empty the outbox, then reopen: the next seq must still be larger.
-	if err := h.Outbox.Ack(ctx, "a", d.Seq); err != nil {
+	if _, err := h.Outbox.Ack(ctx, "a", d.Seq); err != nil {
 		t.Fatal(err)
 	}
 	h.Close()
@@ -376,7 +376,7 @@ func TestQueuedFor(t *testing.T) {
 		t.Fatal("aging client a's queue changed client b's")
 	}
 	// Once acked, the message no longer counts.
-	if err := o.Ack(ctx, "a", d.Seq); err != nil {
+	if _, err := o.Ack(ctx, "a", d.Seq); err != nil {
 		t.Fatal(err)
 	}
 	if queuedFor("a", 30*time.Minute) {

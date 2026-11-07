@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/Luolc/fednet/internal/payload"
 	"github.com/Luolc/fednet/internal/slack"
 	"github.com/Luolc/fednet/internal/store"
+	"github.com/Luolc/fednet/internal/watch"
 )
 
 // The credentials the tests hand the hub; none may show up in any output.
@@ -469,5 +471,64 @@ func TestHubWithSlackNeedsItsWebhookFile(t *testing.T) {
 	args := append([]string{"hub", "-listen", "127.0.0.1:0", "-db", filepath.Join(dir, "hub.db"), "-alert-webhook-file", "/nonexistent/webhook"}, slackFlags...)
 	if code := run(t.Context(), args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "no such file") {
 		t.Fatalf("exit %d, stderr %q; want 1 and the missing file", code, stderr.String())
+	}
+}
+
+// A message for a client that is not connected gets the hourglass, wired
+// without an alerts webhook, and loses it once the client has it.
+func TestHubHourglass(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	hubDB := filepath.Join(dir, "hub.db")
+	credPath := filepath.Join(dir, "credential")
+	f := &slack.Fake{}
+	f.AddChannel("C1", "")
+	slackFlags, runs := fakeSlack(t, dir, f, nil)
+	config := filepath.Join(dir, "hub.json")
+	if err := os.WriteFile(config, []byte(`{"channels": {"C1": {"machine": "workstation"}}, "users": {"U1": "maintainer"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr syncBuffer
+	if code := run(ctx, []string{"client", "init", "-id", "workstation", "-credential", credPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("client init: exit %d", code)
+	}
+	fields := strings.Fields(stdout.String())
+	if code := run(ctx, []string{"hub", "register", "-db", hubDB, fields[0], fields[1]}, &stdout, &stderr); code != 0 {
+		t.Fatalf("hub register: exit %d", code)
+	}
+	stopHub := start(t, append([]string{"hub", "-listen", "127.0.0.1:0", "-db", hubDB, "-config", config}, slackFlags...), &stdout, &stderr)
+	var addr string
+	waitFor(t, "the hub to listen", func() bool {
+		m := listening.FindStringSubmatch(stdout.String())
+		if m != nil {
+			addr = m[1]
+		}
+		return m != nil
+	})
+	var sr slackRun
+	select {
+	case sr = <-runs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hub did not start Socket Mode")
+	}
+
+	text := "<@" + slack.FakeBot + "> please fix the build"
+	ts, err := f.Add("C1", slack.Message{User: "U1", Text: text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sr.r.Handle(ctx, inbound.Event{ID: "Ev1", Channel: "C1", Message: slack.Message{TS: ts, User: "U1", Text: text}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the hourglass on the message", func() bool { return slices.Contains(f.Reactions("C1", ts), watch.Hourglass) })
+
+	stopClient := start(t, []string{"client", "-hub", "http://" + addr, "-db", filepath.Join(dir, "client.db"), "-credential", credPath,
+		"-socket", filepath.Join(dir, "fednet.sock")}, &stdout, &stderr)
+	waitFor(t, "the hourglass to go", func() bool { return len(f.Reactions("C1", ts)) == 0 })
+	if code := stopClient(); code != 0 {
+		t.Errorf("client exited %d", code)
+	}
+	if code := stopHub(); code != 0 {
+		t.Errorf("hub exited %d", code)
 	}
 }

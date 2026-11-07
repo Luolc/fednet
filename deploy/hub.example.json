@@ -6,7 +6,7 @@
   "dm": {"machine": "workstation"},
   "users": {"U0000000001": "maintainer"},
   "limited_users": {"U0000000002": {"name": "collaborator", "machines": ["datamachine"], "channels": ["C0000000002"]}},
-  "alerts": {"slack_down": "5m", "offline_queued": "10m"},
+  "alerts": {"slack_down": "5m", "offline_queued": "10m", "drop_queued": "168h", "clients": {"datamachine": {"offline_queued": "2m", "no_offline_alert": true}}},
   "approvals": {"channel": "C0000000003", "approvers": ["U0000000001"]},
   "history": {"max_messages": 10, "max_chars": 4000, "max_message_chars": 2000},
   "files": {"prefetch_types": ["image/*", "application/pdf"], "prefetch_max_bytes": 20971520, "prefetch_max_total_bytes": 52428800, "fetch_max_bytes": 209715200, "upload_max_bytes": 52428800, "upload_max_files": 10},
