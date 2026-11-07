@@ -1,11 +1,12 @@
 # Release: a pushed vX.Y.Z tag becomes a GitHub release with the binaries
-# fednet_vX.Y.Z_linux_amd64 and fednet_vX.Y.Z_linux_arm64 and a SHA256SUMS
-# file in `sha256sum` format. Deployment and self-upgrade download these
-# names, so they are a contract; see deploy/README.md.
+# fednet_vX.Y.Z_linux_amd64, fednet_vX.Y.Z_linux_arm64 and
+# fednet_vX.Y.Z_darwin_arm64 and a SHA256SUMS file in `sha256sum` format.
+# Deployment and self-upgrade download these names, so they are a contract;
+# see deploy/README.md.
 #
 # Order: the tagged commit must be on main, and its CI run on main (ci.yml,
 # started by the push to main) must have passed at the first attempt; CI is
-# not run again here. Then each architecture is built on its own runner and
+# not run again here. Then each platform is built on its own runner and
 # its binary must report the tag as its version. Only then is the release
 # created.
 #
@@ -60,10 +61,15 @@ jobs:
     strategy:
       matrix:
         include:
-          - goarch: amd64
+          - goos: linux
+            goarch: amd64
             runner: ubuntu-24.04
-          - goarch: arm64
+          - goos: linux
+            goarch: arm64
             runner: ubuntu-24.04-arm
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
     # Native runners, so that each binary can run `fednet version` below.
     runs-on: ${{ matrix.runner }}
     steps:
@@ -76,19 +82,19 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: "0"
-          GOOS: linux
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir dist
           go build -trimpath -ldflags "-X main.version=${VERSION}" \
-            -o "dist/fednet_${VERSION}_linux_${GOARCH}" ./cmd/fednet
+            -o "dist/fednet_${VERSION}_${GOOS}_${GOARCH}" ./cmd/fednet
 
       - name: Version guard
-        run: .github/scripts/release-version.sh "$VERSION" "dist/fednet_${VERSION}_linux_${{ matrix.goarch }}"
+        run: .github/scripts/release-version.sh "$VERSION" "dist/fednet_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fednet-${{ matrix.goarch }}
+          name: fednet-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/
           if-no-files-found: error
 
@@ -109,7 +115,7 @@ jobs:
       - name: SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum "fednet_${VERSION}_linux_amd64" "fednet_${VERSION}_linux_arm64" >SHA256SUMS
+          sha256sum "fednet_${VERSION}_linux_amd64" "fednet_${VERSION}_linux_arm64" "fednet_${VERSION}_darwin_arm64" >SHA256SUMS
           cat SHA256SUMS
 
       - name: Create the release
@@ -118,4 +124,5 @@ jobs:
         run: |
           gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$VERSION" --generate-notes \
-            "dist/fednet_${VERSION}_linux_amd64" "dist/fednet_${VERSION}_linux_arm64" dist/SHA256SUMS
+            "dist/fednet_${VERSION}_linux_amd64" "dist/fednet_${VERSION}_linux_arm64" \
+            "dist/fednet_${VERSION}_darwin_arm64" dist/SHA256SUMS

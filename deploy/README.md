@@ -11,12 +11,12 @@
 
 ## 下载二进制
 
-每个版本是 GitHub 上的一个 release，tag 是 `vX.Y.Z`，由推这个 tag 触发 [`release.yml`](../.github/workflows/release.yml) 发布。release 里有三个文件，部署和自己升级都按这几个名字下载：
+每个版本是 GitHub 上的一个 release，tag 是 `vX.Y.Z`，由推这个 tag 触发 [`release.yml`](../.github/workflows/release.yml) 发布。release 里有四个文件，部署和自己升级都按这几个名字下载：
 
-- `fednet_vX.Y.Z_linux_amd64`、`fednet_vX.Y.Z_linux_arm64`：静态链接的裸二进制 (`CGO_ENABLED=0`)，`fednet version` 打印的就是 `vX.Y.Z`。
+- `fednet_vX.Y.Z_linux_amd64`、`fednet_vX.Y.Z_linux_arm64`、`fednet_vX.Y.Z_darwin_arm64`：静态链接的裸二进制 (`CGO_ENABLED=0`)，`fednet version` 打印的就是 `vX.Y.Z`。
 - `SHA256SUMS`：`sha256sum` 的标准格式，每行是哈希、两个空格、文件名。
 
-发布之前流水线先确认 tag 指向的 commit 已经在 `main` 上，而且这个 commit 推上 `main` 时触发的 CI 第一次就通过 (还在跑就等它跑完，不在发版时重跑)；每个架构的二进制在同架构的 runner 上构建，跑一遍 `fednet version`，打出的版本不等于 tag 就不发布。
+发布之前流水线先确认 tag 指向的 commit 已经在 `main` 上，而且这个 commit 推上 `main` 时触发的 CI 第一次就通过 (还在跑就等它跑完，不在发版时重跑)；每个系统和架构的二进制在同系统同架构的 runner 上构建，跑一遍 `fednet version`，打出的版本不等于 tag 就不发布。
 
 在要装的机器上下载、校验，再放到单元模板用的 `/usr/local/bin/fednet`：
 
@@ -29,7 +29,7 @@ sha256sum -c --ignore-missing SHA256SUMS
 sudo install -m 0755 "fednet_${v}_linux_${arch}" /usr/local/bin/fednet
 ```
 
-`sha256sum -c` 要打出 `fednet_vX.Y.Z_linux_<arch>: OK` 并退出 0；不是这样就不装。
+`sha256sum -c` 要打出 `fednet_vX.Y.Z_linux_<arch>: OK` 并退出 0；不是这样就不装。darwin/arm64 的二进制按 `fednet_vX.Y.Z_darwin_arm64` 下载，用 `shasum -a 256 -c --ignore-missing SHA256SUMS` 校验；这里的 systemd 单元只适用于 linux，darwin 上的服务单元不在这个目录里。
 
 ## hub 要的文件
 
@@ -74,13 +74,15 @@ sudo -u fednet fednet hub register -db /var/lib/fednet-hub/hub.db CLIENT-ID HASH
 
 client 那边不需要 webhook：钩子放弃的消息由 client 经上行告诉 hub，由 hub 报警；client 还会用类型为 `dead_letter` 的事件再调一次钩子，格式见 [`internal/hook/hook.go`](../internal/hook/hook.go) 的 `DeadLetter`。
 
+`-socket` 不是必给的：没给时 `fednet client` 的各命令和 `fednet upgrade` 取环境变量 `FEDNET_SOCKET`，再没有就取按系统定的默认值，linux 是 `/run/fednet-client/fednet.sock`，darwin 是 `~/.local/state/fednet-client/fednet.sock`；client 自己监听时用同一个值。显式的 `-socket` 优先。hub 的管理 socket 没有默认值，`fednet hub handoff` 一定要给 `-socket`；`fednet upgrade` 升级 hub 时也要给它。
+
 ## 升级
 
 先升 client，再升 hub：新版本的 client 要能连旧版本的 hub，反过来不保证。hub 不给版本过旧的 client 派消息，消息留在它的 outbox 里，报警里会说明是哪台、跑的什么版本。
 
 ### 从 Slack 升级，或者让 hub 自己升
 
-hub 和 client 都不改自己的二进制。要升级时它们只写一个升级请求文件，内容是目标版本 (`vX.Y.Z` 加换行)；每台机器上一对 root 的 systemd 单元监视这个文件：path 单元看到文件就起 oneshot 单元，oneshot 跑 `fednet upgrade`，它先把请求文件删掉，再经 socket 问正在跑的进程是什么版本，目标不比它新就拒绝；然后从 GitHub release 下载本机架构的二进制和 `SHA256SUMS`，校验通过才用一次 rename 换掉 `/usr/local/bin/fednet` (旧的留作 `/usr/local/bin/fednet.prev`)，最后经同一个 socket 交接 (hub 是管理 socket，client 是本机 socket)。下载不对、校验不过都不换二进制；新进程起不来、交接失败，就把 `.prev` 换回去，这样下次重启仍跑能起来的那个；成功才删 `.prev`。原因在 `journalctl -u fednet-hub-upgrade` (client 上是 `fednet-client-upgrade`) 里，结局也写在请求文件旁边的 `.result` 文件里。
+hub 和 client 都不改自己的二进制。要升级时它们只写一个升级请求文件，内容是目标版本 (`vX.Y.Z` 加换行)；每台机器上一对 root 的 systemd 单元监视这个文件：path 单元看到文件就起 oneshot 单元，oneshot 跑 `fednet upgrade`，它先把请求文件删掉，再经 socket 问正在跑的进程是什么版本，目标不比它新就拒绝；然后从 GitHub release 下载本机系统和架构的二进制和 `SHA256SUMS`，校验通过才用一次 rename 换掉 `/usr/local/bin/fednet` (旧的留作 `/usr/local/bin/fednet.prev`)，最后经同一个 socket 交接 (hub 是管理 socket，client 是本机 socket)。下载不对、校验不过都不换二进制；新进程起不来、交接失败，就把 `.prev` 换回去，这样下次重启仍跑能起来的那个；成功才删 `.prev`。原因在 `journalctl -u fednet-hub-upgrade` (client 上是 `fednet-client-upgrade`) 里，结局也写在请求文件旁边的 `.result` 文件里。
 
 每台机器要装的东西：
 

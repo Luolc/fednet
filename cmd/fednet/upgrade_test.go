@@ -42,7 +42,7 @@ func (f *fakeReleases) publish(t *testing.T, version, binary string, sum []byte)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	asset := upgrade.Asset(version, runtime.GOARCH)
+	asset := upgrade.Asset(version, runtime.GOOS, runtime.GOARCH)
 	copyFile(t, binary, filepath.Join(dir, asset), 0o644)
 	if err := os.WriteFile(filepath.Join(dir, upgrade.Sums), []byte(fmt.Sprintf("%x  %s\n", sum, asset)), 0o644); err != nil {
 		t.Fatal(err)
@@ -181,7 +181,7 @@ func TestUpgradeCommand(t *testing.T) {
 	if code := run(ctx, args, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "does not match its sum") {
 		t.Fatalf("upgrade with a bad sum: exit %d, stderr %q", code, stderr.String())
 	}
-	unchanged(t, "a download that does not match", "failed v0.2.0: upgrade: "+upgrade.Asset("v0.2.0", runtime.GOARCH)+" does not match")
+	unchanged(t, "a download that does not match", "failed v0.2.0: upgrade: "+upgrade.Asset("v0.2.0", runtime.GOOS, runtime.GOARCH)+" does not match")
 
 	// The release's binary cannot start: the handoff fails, the old binary
 	// is put back, and it still starts.

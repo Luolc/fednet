@@ -778,3 +778,11 @@ func (r *delayed) Read(p []byte) (int, error) {
 type failing struct{ err error }
 
 func (f *failing) Read([]byte) (int, error) { return 0, f.err }
+
+// BindPathLen is the length of the path Listen binds at, for the longest
+// name os.MkdirTemp makes.
+func TestBindPathLen(t *testing.T) {
+	if got, want := BindPathLen("/a/b/fednet.sock"), len("/a/b/.fednet-socket-4294967295/socket"); got != want {
+		t.Fatalf("BindPathLen = %d, want %d", got, want)
+	}
+}

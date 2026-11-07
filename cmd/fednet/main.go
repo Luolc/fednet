@@ -67,6 +67,11 @@ var newProcess = func(timeout time.Duration) (handoff.Process, error) { return h
 
 const usage = `usage: fednet <command> [flags]
 
+-socket, where a command takes it in [], defaults to $FEDNET_SOCKET, else
+/run/fednet-client/fednet.sock on linux and ~/.local/state/fednet-client/fednet.sock
+on darwin; only the hub's admin socket (hub handoff, upgrade of a hub) is
+always given.
+
 commands:
   hub -listen ADDR -db PATH [-config PATH] [-admin-socket PATH] [-handoff-timeout D]
       [-slack-app-token-file PATH -slack-bot-token-file PATH] [-alert-webhook-file PATH]
@@ -141,7 +146,7 @@ commands:
         retire a client: its credential stops working
   hub reassign -db PATH FROM-ID TO-ID
         move every thread FROM-ID owns to TO-ID; prints how many moved
-  client -hub URL -db PATH -credential PATH -socket PATH [-socket-group GROUP]
+  client -hub URL -db PATH -credential PATH [-socket PATH] [-socket-group GROUP]
          [-hook-timeout D] [-hook-env NAME]... [-handoff-timeout D] [-upgrade-request PATH]
          [-files-dir DIR] [-files-retention D] [-files-max-total-bytes N] [-files-prune-interval D]
          [-prefetch-timeout D]
@@ -170,10 +175,10 @@ commands:
         -files-retention after it was last fetched (default 168h) and the
         files are kept under N bytes in all (default 2 GiB), pruned every
         -files-prune-interval (default 1h)
-  client handoff -socket PATH [-json]
+  client handoff [-socket PATH] [-json]
         replace the running client with a new process of the binary now at
         its path, without a gap; prints the versions handed off from and to
-  client post -socket PATH -thread KEY [-file PATH]... [-footer] [-mention USER-ID]... [-deliver] [-json] [--] [TEXT]
+  client post [-socket PATH] -thread KEY [-file PATH]... [-footer] [-mention USER-ID]... [-deliver] [-json] [--] [TEXT]
         post TEXT to a thread; prints the msg_id once the client has queued it;
         put -- before a TEXT that starts with -; with -file (repeatable) the
         files are uploaded to the thread with TEXT, which may then be left
@@ -207,14 +212,14 @@ commands:
         not delivered, and the hub tells this machine with a message of
         trigger refused, says so in the thread and alerts; -deliver takes
         no -footer or -file
-  client delete -socket PATH [-json] MSG-ID
+  client delete [-socket PATH] [-json] MSG-ID
         delete from Slack the post that client post queued under MSG-ID,
         every message it went out as; only a post from this machine; exits
         1 when the hub knows no such post in Slack (one from before the hub
         recorded where its posts go included), 3 for a post from another
         machine, and 5 for a post not in Slack yet: try again later
-  client progress -socket PATH -thread KEY -title TITLE [-item TEXT:STATE]... [-json]
-  client progress -socket PATH -thread KEY (-done | -error) [-title TITLE] [-item TEXT:STATE]... [-json]
+  client progress [-socket PATH] -thread KEY -title TITLE [-item TEXT:STATE]... [-json]
+  client progress [-socket PATH] -thread KEY (-done | -error) [-title TITLE] [-item TEXT:STATE]... [-json]
         show what the agent is doing in a progress card in the thread; the
         card is queued with the posts, in order, and prints the msg_id; a
         thread has one open card at a time, which each call replaces whole
@@ -225,9 +230,9 @@ commands:
         still doing then done, -error in error instead, with TITLE and the
         items given in place of the card's own; with no open card -done and
         -error do nothing
-  client read-thread -socket PATH [-json] THREAD-KEY
+  client read-thread [-socket PATH] [-json] THREAD-KEY
         print the messages of a thread, read by the hub
-  client react -socket PATH [-remove] [-json] THREAD-KEY NAME
+  client react [-socket PATH] [-remove] [-json] THREAD-KEY NAME
         add the bot's reaction NAME, an emoji's name without colons such as
         hourglass_flowing_sand, to the first message of a thread, or with
         -remove take it off; adding one the bot has there already, or
@@ -235,7 +240,7 @@ commands:
         never one a person added; the hub's bot token needs the
         reactions:write scope, else exits 3; exits 1 when Slack has no such
         message
-  client open-thread -socket PATH -channel CHANNEL [-owner route [-from-thread KEY]] [-json] [--] TEXT
+  client open-thread [-socket PATH] -channel CHANNEL [-owner route [-from-thread KEY]] [-json] [--] TEXT
         start a thread in CHANNEL with TEXT and print its key; this machine
         owns it; TEXT is standard Markdown, as with post, and goes out as one
         message of at most 4000 characters: for more, start the thread with
@@ -247,44 +252,44 @@ commands:
         3 when the route has no machine, the hub's relay list does not let
         this machine deliver to it or this machine does not own the
         -from-thread thread, and 1 when that thread has no owner
-  client whoami -socket PATH [-json]
+  client whoami [-socket PATH] [-json]
         print this machine's client id
-  client threads -socket PATH [-json]
+  client threads [-socket PATH] [-json]
         print the keys of the threads this machine owns
-  client threads -socket PATH -channel CHANNEL [-limit N] [-json]
+  client threads [-socket PATH] -channel CHANNEL [-limit N] [-json]
         print the threads in a channel that some machine owns, latest first,
         at most N (default 20): each a line of its key, the client id of
         its owner, when it started (RFC 3339, UTC) and the channel's name
         when the hub has it, all from the hub's database; exits 2 when the
         hub runs a fednet too old to list them
-  client adopt -socket PATH [-json] THREAD-KEY
+  client adopt [-socket PATH] [-json] THREAD-KEY
         make this machine the owner of a thread: people's replies in it come here
-  client channel-context get -socket PATH [-json] CHANNEL
+  client channel-context get [-socket PATH] [-json] CHANNEL
         print a channel's description (its Slack purpose)
-  client channel-context set -socket PATH -body-file FILE [-json] CHANNEL
+  client channel-context set [-socket PATH] -body-file FILE [-json] CHANNEL
         replace a channel's description with the contents of FILE
-  client users -socket PATH [-json]
+  client users [-socket PATH] [-json]
         print the user list, then the limited users: each user's Slack id
         and name, and for a limited user the clients and channels on their
         list
-  client dm -socket PATH -user USER-ID [-json] [--] TEXT
+  client dm [-socket PATH] -user USER-ID [-json] [--] TEXT
         send TEXT as a direct message to a user on the user list; TEXT is
         standard Markdown, as with post, at most 4000 characters, in one
         message
-  client fetch-file -socket PATH [-json] FILE-ID
+  client fetch-file [-socket PATH] [-json] FILE-ID
         fetch the Slack file with FILE-ID (the id in a message's files)
         through the hub into the client's files directory, unless it is
         there already, and print its path
-  client request-approval -socket PATH -agent NAME -action FILE [-requester USER-ID] [-json] [--] TEXT
+  client request-approval [-socket PATH] -agent NAME -action FILE [-requester USER-ID] [-json] [--] TEXT
         ask for approval of an action: TEXT says what it does, FILE holds
         its parameters as JSON, NAME is the agent that will act; prints the
         approval id once the hub has posted the card; the outcome comes as
         a message of type approval through the hook, signed when approved;
         an action the card cannot show whole is refused; -requester is a
         note on the card, not checked
-  client request-route -socket PATH -agent NAME (-channel CHANNEL | -dm) [-machine CLIENT-ID]
+  client request-route [-socket PATH] -agent NAME (-channel CHANNEL | -dm) [-machine CLIENT-ID]
          [-scope SCOPE] [-open-thread CLIENT-ID,...] [-requester USER-ID] [-json] [--] TEXT
-  client request-route -socket PATH -agent NAME (-channel CHANNEL | -dm) -delete [-requester USER-ID] [-json] [--] TEXT
+  client request-route [-socket PATH] -agent NAME (-channel CHANNEL | -dm) -delete [-requester USER-ID] [-json] [--] TEXT
         ask for approval of a change of one route, the channel's or that of
         direct messages: TEXT says why, NAME is the agent that asks; the
         route becomes MACHINE taking the threads people start there, their
@@ -298,7 +303,7 @@ commands:
         approval through the hook, unsigned; -requester is a note on the
         card, not checked; exits 5 while the route has a request waiting
         for approval: ask again once it is decided
-  client request-channel -socket PATH -agent NAME -name NAME -machine CLIENT-ID [-private]
+  client request-channel [-socket PATH] -agent NAME -name NAME -machine CLIENT-ID [-private]
          [-purpose TEXT] [-invite USER-ID,...] [-scope SCOPE] [-open-thread CLIENT-ID,...]
          [-requester USER-ID] [-json] [--] TEXT
         ask for approval to create a Slack channel and give it a route, as
@@ -311,11 +316,11 @@ commands:
         has already, a scope the bot token lacks); a purpose or an invite
         that fails leaves the channel and its route; exits 5 while a request
         for the same name waits for approval
-  client routes -socket PATH [-json]
+  client routes [-socket PATH] [-json]
         print the routes: each channel (dm for direct messages), the client
         that takes its new threads, the scope, who may open threads, and
         the channel's name as Slack gives it
-  client ask -socket PATH -thread THREAD-KEY -ref REF -card FILE [-mention USER-ID]... [-json]
+  client ask [-socket PATH] -thread THREAD-KEY -ref REF -card FILE [-mention USER-ID]... [-json]
         post a question card in a thread and print its id (with -json: id,
         channel, ts and permalink); FILE, - for standard input, is the
         question as JSON:
@@ -347,11 +352,11 @@ commands:
          null for "other", "note": "...", "snooze_until": RFC 3339,
          "by": USER-ID, "at": RFC 3339}, with no choice, note or by on
         resurfaced; the card then shows that JSON at its bottom
-  client ask-close -socket PATH [-note TEXT] [-json] ID
+  client ask-close [-socket PATH] [-note TEXT] [-json] ID
         take back a question card this machine asked that still waits, or
         is snoozed: it shows the note and no buttons, and nothing comes
         through the hook
-  client read-answer -socket PATH [-json] ID
+  client read-answer [-socket PATH] [-json] ID
         print a question card as the hub keeps it: its status (open,
         snoozed, answered, closed or withdrawn), then, once a press has
         counted, the last such press as the JSON that came through the hook;
@@ -362,7 +367,7 @@ commands:
         from a client; a snooze is replaced by the press after it, and once
         answered or closed the card takes no more presses; any machine may
         read any card; exits 1 when the hub has no such card
-  client ops -socket PATH [-json] (upgrade | version)
+  client ops [-socket PATH] [-json] (upgrade | version)
         ask the hub for one of two fixed operations, as this machine; once
         a release is out under the rules for releasing, an agent may run
         upgrade itself to move the machines to it, without waiting for a
@@ -387,7 +392,7 @@ commands:
         it as used; exit 0 to act, 5 bad signature, 6 expired, 7 the target or
         the action differs, 8 already used, 1 a file cannot be read or the
         public key is not an ssh-ed25519 line, 2 the approval is not well formed
-  upgrade -request PATH -binary PATH -socket PATH
+  upgrade -request PATH -binary PATH [-socket PATH]
         carry out the upgrade request at PATH, then delete it: download the
         release it names for this machine from fednet's releases, check it
         against the release's SHA256SUMS, put it at the binary's PATH in one
@@ -503,7 +508,7 @@ func hubCommand(ctx context.Context, args []string, stdout io.Writer) error {
 		case "reassign":
 			return hubReassign(ctx, args[1:], stdout)
 		case "handoff":
-			return handoffCommand(ctx, "fednet hub handoff", args[1:], stdout)
+			return handoffCommand(ctx, "fednet hub handoff", "", args[1:], stdout)
 		}
 	}
 	return hubServe(ctx, args, stdout)
@@ -1166,7 +1171,7 @@ func clientCommand(ctx context.Context, args []string, stdout io.Writer) error {
 		case "dm":
 			return clientDM(ctx, args[1:], stdout)
 		case "handoff":
-			return handoffCommand(ctx, "fednet client handoff", args[1:], stdout)
+			return handoffCommand(ctx, "fednet client handoff", defaultSocket(), args[1:], stdout)
 		case "request-approval":
 			return clientRequestApproval(ctx, args[1:], stdout)
 		case "request-route":
@@ -1204,7 +1209,7 @@ func clientServe(ctx context.Context, args []string) (err error) {
 	hubURL := fs.String("hub", "", "hub base URL, such as http://hub.example.test:8080 (required)")
 	dbPath := fs.String("db", "", "client database file (required)")
 	credPath := fs.String("credential", "", "credential file written by client init (required)")
-	socket := fs.String("socket", "", "unix socket for the agents (required)")
+	socket := fs.String("socket", defaultSocket(), "unix socket for the agents; default: $"+socketEnv+", else "+socketDefaultsDoc)
 	group := fs.String("socket-group", "", "group whose members may use the socket")
 	hookTimeout := fs.Duration("hook-timeout", hook.DefaultTimeout, "how long one run of the hook may take")
 	handoffTimeout := fs.Duration("handoff-timeout", handoff.DefaultTimeout, "how long a new process may take to become ready at a handoff")
@@ -1223,7 +1228,15 @@ func clientServe(ctx context.Context, args []string) (err error) {
 		return err
 	}
 	if *hubURL == "" || *dbPath == "" || *credPath == "" || *socket == "" {
-		return usageError("fednet client: -hub, -db, -credential and -socket are required")
+		return usageError("fednet client: -hub, -db, -credential and -socket are required (or $" + socketEnv + " or a default socket for this system)")
+	}
+	explicit := os.Getenv(socketEnv) != ""
+	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "socket" })
+	if !explicit {
+		// Nothing creates the directory of the default socket on darwin.
+		if err := os.MkdirAll(filepath.Dir(*socket), 0o700); err != nil {
+			return err
+		}
 	}
 	if *filesRetention <= 0 || *filesMaxTotal <= 0 || *pruneInterval <= 0 || *prefetchTimeout <= 0 {
 		return usageError("fednet client: -files-retention, -files-max-total-bytes, -files-prune-interval and -prefetch-timeout must be positive")
@@ -1348,9 +1361,9 @@ func clientServe(ctx context.Context, args []string) (err error) {
 // process, waits for the new process to answer on the socket, and prints
 // the versions handed off from and to. A handoff that failed is an error:
 // the old process is still serving.
-func handoffCommand(ctx context.Context, name string, args []string, stdout io.Writer) error {
+func handoffCommand(ctx context.Context, name, defaultSocket string, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	socket, asJSON := socketFlags(fs)
+	socket, asJSON := socketFlagsDefault(fs, defaultSocket)
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
@@ -1414,7 +1427,7 @@ func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) (err e
 	fs := flag.NewFlagSet("fednet upgrade", flag.ContinueOnError)
 	request := fs.String("request", "", "the upgrade request file (required)")
 	binary := fs.String("binary", "", "the binary to replace, which the daemon runs (required)")
-	socket := fs.String("socket", "", "the socket the daemon hands off on: the hub's admin socket or the client's socket (required)")
+	socket := fs.String("socket", defaultSocket(), "the socket the daemon hands off on: the hub's admin socket, or the client's, which is the default: $"+socketEnv+", else "+socketDefaultsDoc)
 	if err := parseFlags(fs, args, 0); err != nil {
 		return err
 	}
@@ -1448,7 +1461,7 @@ func upgradeCommand(ctx context.Context, args []string, stdout io.Writer) (err e
 	if !release.Newer(target, running.Version) {
 		return fmt.Errorf("refusing to upgrade: %s is not newer than the running %s", target, running.Version)
 	}
-	if err := releases.Install(ctx, target, runtime.GOARCH, *binary); err != nil {
+	if err := releases.Install(ctx, target, runtime.GOOS, runtime.GOARCH, *binary); err != nil {
 		return err
 	}
 	slog.Info("upgrade: installed", "version", target, "binary", *binary)
@@ -1626,8 +1639,17 @@ func do(ctx context.Context, socket string, req local.Request, files ...io.Reade
 // socketFlags declares the flags every command that talks to the client
 // daemon takes.
 func socketFlags(fs *flag.FlagSet) (socket *string, asJSON *bool) {
-	return fs.String("socket", "", "the client daemon's socket (required)"),
-		fs.Bool("json", false, "print the reply as JSON")
+	return socketFlagsDefault(fs, defaultSocket())
+}
+
+// socketFlagsDefault is socketFlags with def as the socket when -socket
+// is not given; without one, "" has -socket required.
+func socketFlagsDefault(fs *flag.FlagSet, def string) (socket *string, asJSON *bool) {
+	usage := "the daemon's socket (required)"
+	if def != "" {
+		usage = "the client daemon's socket; default: $" + socketEnv + ", else " + socketDefaultsDoc
+	}
+	return fs.String("socket", def, usage), fs.Bool("json", false, "print the reply as JSON")
 }
 
 // clientReadThread prints the messages of a thread, which the hub reads
