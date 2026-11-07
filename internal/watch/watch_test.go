@@ -301,3 +301,17 @@ func TestOfflinePerClient(t *testing.T) {
 		t.Fatalf("alerts = %q, want one about laptop", got)
 	}
 }
+
+func TestZh(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		7 * 24 * time.Hour:           "7 天",
+		7*24*time.Hour - time.Second: "6 天 23 小时 59 分钟",
+		2*time.Hour + 5*time.Minute:  "2 小时 5 分钟",
+		90 * time.Second:             "1 分钟",
+		30 * time.Second:             "30 秒",
+	} {
+		if got := zh(d); got != want {
+			t.Errorf("zh(%v) = %q, want %q", d, got, want)
+		}
+	}
+}

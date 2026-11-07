@@ -77,20 +77,42 @@ type Dropped struct {
 	Told, Alerted bool
 }
 
-// DropQueued moves the messages queued at or before cutoff out of the
-// outbox and records them as dropped at now, in one transaction; it
-// returns the marks of the messages no longer queued, forgetting them.
-func (h *Hub) DropQueued(ctx context.Context, cutoff, now time.Time) ([]string, error) {
+// Overdue returns the clients with a message queued at or before cutoff,
+// in order of their ids.
+func (o HubOutbox) Overdue(ctx context.Context, cutoff time.Time) ([]string, error) {
+	rows, err := o.db.QueryContext(ctx,
+		"SELECT DISTINCT client_id FROM outbox WHERE enqueued_at <= ? ORDER BY client_id", cutoff.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var clients []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		clients = append(clients, c)
+	}
+	return clients, rows.Err()
+}
+
+// DropQueued moves the messages of clients queued at or before cutoff out
+// of the outbox and records them as dropped at now, in one transaction;
+// it returns the marks of the messages no longer queued, forgetting them.
+func (h *Hub) DropQueued(ctx context.Context, clients []string, cutoff, now time.Time) ([]string, error) {
 	var ms []string
 	err := h.transact(ctx, func(tx *Hub) error {
-		if _, err := tx.db.ExecContext(ctx,
-			`INSERT INTO dropped (seq, client_id, msg_id, payload, enqueued_at, dropped_at)
-			 SELECT seq, client_id, msg_id, payload, enqueued_at, ? FROM outbox WHERE enqueued_at <= ?`,
-			now.UnixMilli(), cutoff.UnixMilli()); err != nil {
-			return err
-		}
-		if _, err := tx.db.ExecContext(ctx, "DELETE FROM outbox WHERE enqueued_at <= ?", cutoff.UnixMilli()); err != nil {
-			return err
+		for _, c := range clients {
+			if _, err := tx.db.ExecContext(ctx,
+				`INSERT INTO dropped (seq, client_id, msg_id, payload, enqueued_at, dropped_at)
+				 SELECT seq, client_id, msg_id, payload, enqueued_at, ? FROM outbox WHERE client_id = ? AND enqueued_at <= ?`,
+				now.UnixMilli(), c, cutoff.UnixMilli()); err != nil {
+				return err
+			}
+			if _, err := tx.db.ExecContext(ctx, "DELETE FROM outbox WHERE client_id = ? AND enqueued_at <= ?", c, cutoff.UnixMilli()); err != nil {
+				return err
+			}
 		}
 		var err error
 		ms, err = tx.Outbox.sweepMarks(ctx)

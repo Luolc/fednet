@@ -128,14 +128,26 @@ func (w *Watch) now() time.Time {
 	return w.Now()
 }
 
-// checkDropped drops the messages queued Drop ago or earlier and sends
-// the notices of each dropped message not sent yet: one in its thread, if
-// it has one, and one alert. A notice that fails is tried again on the
-// next Check; one that went out is not sent again.
+// checkDropped drops the messages queued Drop ago or earlier for the
+// clients offline now, and sends the notices of each dropped message not
+// sent yet: one in its thread, if it has one, and one alert. A client
+// online may have a message already and its ack on the way, so its
+// messages are left until it is offline. A notice that fails is tried
+// again on the next Check; one recorded as sent is not sent again.
 func (w *Watch) checkDropped(ctx context.Context) error {
 	limit := or(w.Drop, DefaultDrop)
 	now := w.now()
-	marks, err := w.Store.DropQueued(ctx, now.Add(-limit), now)
+	overdue, err := w.Store.Outbox.Overdue(ctx, now.Add(-limit))
+	if err != nil {
+		return err
+	}
+	var offline []string
+	for _, c := range overdue {
+		if !w.Online(c) {
+			offline = append(offline, c)
+		}
+	}
+	marks, err := w.Store.DropQueued(ctx, offline, now.Add(-limit), now)
 	if err != nil {
 		return err
 	}
@@ -183,14 +195,23 @@ func (w *Watch) tellDropped(ctx context.Context, d store.Dropped, waited string)
 		return nil
 	}
 	text := fmt.Sprintf("给 %s 的一条消息排队 %s仍没送到，已丢弃。", d.Client, waited)
-	if _, err := w.Slack.PostReply(ctx, channel, ts, text); err != nil && !errors.Is(err, slack.ErrNotFound) {
-		return fmt.Errorf("tell thread %s of a dropped message: %w", m.Thread, err)
+	_, err := w.Slack.PostReply(ctx, channel, ts, text)
+	switch {
+	case err == nil, errors.Is(err, slack.ErrNotFound):
+		return nil
+	case closed[slack.Code(err)]:
+		slog.Warn("watch: the thread of a dropped message takes no posts, not told", "thread", m.Thread, "err", err)
+		return nil
 	}
-	return nil
+	return fmt.Errorf("tell thread %s of a dropped message: %w", m.Thread, err)
 }
 
+// closed are the Slack errors for a thread the bot can no longer post in,
+// whatever it tries later.
+var closed = map[string]bool{"is_archived": true, "not_in_channel": true}
+
 // zh says d, to the minute, in Chinese, such as "7 天 3 小时"; under a
-// minute is "不到 1 分钟".
+// minute it says the seconds.
 func zh(d time.Duration) string {
 	day := 24 * time.Hour
 	var parts []string
@@ -204,7 +225,7 @@ func zh(d time.Duration) string {
 		}
 	}
 	if len(parts) == 0 {
-		return "不到 1 分钟"
+		return fmt.Sprintf("%d 秒", d/time.Second)
 	}
 	return strings.Join(parts, " ")
 }

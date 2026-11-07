@@ -15,8 +15,8 @@ func setEnqueued(t *testing.T, h *Hub, msgID string, at time.Time) {
 	}
 }
 
-// DropQueued moves exactly the messages queued at or before the cutoff,
-// of every client, into the dropped messages, with when they were queued
+// DropQueued moves exactly the messages of the clients it names queued at
+// or before the cutoff into the dropped messages, with when they were queued
 // and dropped, until both their notices are recorded.
 func TestDropQueued(t *testing.T) {
 	ctx := t.Context()
@@ -32,13 +32,26 @@ func TestDropQueued(t *testing.T) {
 		ds = append(ds, d)
 	}
 	now := at.Add(7 * 24 * time.Hour)
-	if _, err := h.DropQueued(ctx, at.Add(-time.Millisecond), now); err != nil {
+	if over, err := h.Outbox.Overdue(ctx, at.Add(-time.Millisecond)); err != nil || len(over) != 0 {
+		t.Fatalf("Overdue before the cutoff = %q, %v; want none", over, err)
+	}
+	if over, err := h.Outbox.Overdue(ctx, at.Add(time.Millisecond)); err != nil || !slices.Equal(over, []string{"a", "b"}) {
+		t.Fatalf("Overdue = %q, %v; want a and b", over, err)
+	}
+	if _, err := h.DropQueued(ctx, []string{"a", "b"}, at.Add(-time.Millisecond), now); err != nil {
 		t.Fatal(err)
 	}
 	if dropped, err := h.Dropped(ctx); err != nil || len(dropped) != 0 {
 		t.Fatalf("Dropped before the cutoff = %+v, %v; want none", dropped, err)
 	}
-	if _, err := h.DropQueued(ctx, at.Add(time.Millisecond), now); err != nil {
+	// Only the clients named lose their messages.
+	if _, err := h.DropQueued(ctx, []string{"a"}, at.Add(time.Millisecond), now); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := h.Outbox.After(ctx, "b", 0); err != nil || len(left) != 1 {
+		t.Fatalf("b's queue after dropping a's = %+v, %v; want b's message kept", left, err)
+	}
+	if _, err := h.DropQueued(ctx, []string{"b"}, at.Add(time.Millisecond), now); err != nil {
 		t.Fatal(err)
 	}
 	dropped, err := h.Dropped(ctx)
@@ -93,7 +106,7 @@ func TestMarks(t *testing.T) {
 		t.Fatalf("Mark of an acked message = %v, %v; want nothing recorded", ok, err)
 	}
 	setEnqueued(t, h, ds[1].MsgID, at)
-	marks, err = h.DropQueued(ctx, at, at.Add(time.Hour))
+	marks, err = h.DropQueued(ctx, []string{"a"}, at, at.Add(time.Hour))
 	if err != nil || !slices.Equal(marks, []string{"C1/2"}) {
 		t.Fatalf("DropQueued = %q, %v; want the second mark", marks, err)
 	}

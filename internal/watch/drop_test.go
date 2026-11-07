@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	slackgo "github.com/slack-go/slack"
+
 	"github.com/Luolc/fednet/internal/slack"
 )
 
@@ -125,5 +127,57 @@ func TestDropNoticesRetried(t *testing.T) {
 	f.check()
 	if told := f.told(ts); len(told) != 1 {
 		t.Fatalf("thread got %q, want the notice once", told)
+	}
+}
+
+// A client online keeps its messages past the limit, as it may have them
+// already with its ack on the way; once it is offline they are dropped.
+func TestDropOnlyOffline(t *testing.T) {
+	f := newFixture(t)
+	f.w.Offline = time.Hour
+	f.online["laptop"] = true
+	ts, _, after := f.queueAt("laptop")
+	f.w.Now = func() time.Time { return after.Add(DefaultDrop + time.Second) }
+	f.check()
+	if n := f.queued("laptop"); n != 1 || len(f.told(ts)) != 0 || len(f.hook.got()) != 0 {
+		t.Fatalf("online past the limit: %d queued, told %q, alerts %q; want it kept, nothing said", n, f.told(ts), f.hook.got())
+	}
+	f.online["laptop"] = false
+	f.check()
+	if n := f.queued("laptop"); n != 0 || len(f.told(ts)) != 1 {
+		t.Fatalf("offline past the limit: %d queued, told %q; want it dropped and told", n, f.told(ts))
+	}
+}
+
+// slackError is a Slack whose replies fail with the error code.
+type slackError struct {
+	*slack.Fake
+	code string
+}
+
+func (s *slackError) PostReply(context.Context, string, string, string) (string, error) {
+	return "", slackgo.SlackErrorResponse{Err: s.code}
+}
+
+// A thread Slack will never take a post in again counts as told; one that
+// failed for any other reason is tried again.
+func TestDropNoticeInClosedThread(t *testing.T) {
+	for _, c := range []struct {
+		code  string
+		retry bool
+	}{{"is_archived", false}, {"not_in_channel", false}, {"ratelimited", true}} {
+		f := newFixture(t)
+		f.w.Offline = time.Hour
+		f.w.Slack = &slackError{Fake: f.fake, code: c.code}
+		_, _, after := f.queueAt("laptop")
+		f.w.Now = func() time.Time { return after.Add(DefaultDrop + time.Second) }
+		err := f.w.Check(t.Context())
+		ds, derr := f.w.Store.Dropped(t.Context())
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		if c.retry != (err != nil) || c.retry != (len(ds) == 1) {
+			t.Fatalf("%s: Check = %v, %d dropped messages still waiting for notices; want retry %v", c.code, err, len(ds), c.retry)
+		}
 	}
 }
