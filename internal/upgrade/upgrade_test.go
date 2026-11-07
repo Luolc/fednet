@@ -65,8 +65,8 @@ func (f *fakeReleases) publish(version string, binaries map[string][]byte) {
 	defer f.mu.Unlock()
 	var sums strings.Builder
 	for arch, b := range binaries {
-		f.assets[version+"/"+Asset(version, arch)] = b
-		fmt.Fprintf(&sums, "%x  %s\n", sha256.Sum256(b), Asset(version, arch))
+		f.assets[version+"/"+Asset(version, "linux", arch)] = b
+		fmt.Fprintf(&sums, "%x  %s\n", sha256.Sum256(b), Asset(version, "linux", arch))
 	}
 	f.assets[version+"/"+Sums] = []byte(sums.String())
 	f.latest = version
@@ -125,16 +125,18 @@ func TestInstall(t *testing.T) {
 			t.Fatal("a failed Install kept a previous binary")
 		}
 	}
-	old(t, f.releases().Install(ctx, "v0.2.0", "riscv64", path))
-	old(t, f.releases().Install(ctx, "v0.3.0", "amd64", path))
-	old(t, f.releases().Install(ctx, "nightly", "amd64", path))
-	f.set("v0.2.0", Asset("v0.2.0", "arm64"), []byte("tampered"))
-	old(t, f.releases().Install(ctx, "v0.2.0", "arm64", path))
+	old(t, f.releases().Install(ctx, "v0.2.0", "linux", "riscv64", path))
+	old(t, f.releases().Install(ctx, "v0.3.0", "linux", "amd64", path))
+	old(t, f.releases().Install(ctx, "nightly", "linux", "amd64", path))
+	f.set("v0.2.0", Asset("v0.2.0", "linux", "arm64"), []byte("tampered"))
+	old(t, f.releases().Install(ctx, "v0.2.0", "linux", "arm64", path))
+	// The release has no darwin binary for amd64: only the platform asked for counts.
+	old(t, f.releases().Install(ctx, "v0.2.0", "darwin", "amd64", path))
 	f.set("v0.2.0", Sums, []byte("nonsense\n"))
-	old(t, f.releases().Install(ctx, "v0.2.0", "amd64", path))
+	old(t, f.releases().Install(ctx, "v0.2.0", "linux", "amd64", path))
 
 	f.publish("v0.2.0", map[string][]byte{"amd64": []byte("binary for amd64")})
-	if err := f.releases().Install(ctx, "v0.2.0", "amd64", path); err != nil {
+	if err := f.releases().Install(ctx, "v0.2.0", "linux", "amd64", path); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -160,12 +162,12 @@ func TestInstall(t *testing.T) {
 	if err := Restore(path); err == nil {
 		t.Fatal("Restore without a previous binary did not fail")
 	}
-	if err := f.releases().Install(ctx, "v0.2.0", "amd64", path); err != nil {
+	if err := f.releases().Install(ctx, "v0.2.0", "linux", "amd64", path); err != nil {
 		t.Fatal(err)
 	}
 	// A sums file written with sha256sum -b names the file with a star.
-	f.set("v0.2.0", Sums, []byte(fmt.Sprintf("%x *%s\n", sha256.Sum256([]byte("binary for amd64")), Asset("v0.2.0", "amd64"))))
-	if err := f.releases().Install(ctx, "v0.2.0", "amd64", path); err != nil {
+	f.set("v0.2.0", Sums, []byte(fmt.Sprintf("%x *%s\n", sha256.Sum256([]byte("binary for amd64")), Asset("v0.2.0", "linux", "amd64"))))
+	if err := f.releases().Install(ctx, "v0.2.0", "linux", "amd64", path); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -184,7 +186,7 @@ func TestInstallIsAtomic(t *testing.T) {
 	seen := make(chan string, 1)
 	resume := make(chan struct{})
 	content := []byte("new binary, in two halves")
-	sums := fmt.Sprintf("%x  %s\n", sha256.Sum256(content), Asset("v0.2.0", "amd64"))
+	sums := fmt.Sprintf("%x  %s\n", sha256.Sum256(content), Asset("v0.2.0", "linux", "amd64"))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, Sums) {
 			fmt.Fprint(w, sums)
@@ -200,7 +202,7 @@ func TestInstallIsAtomic(t *testing.T) {
 	defer srv.Close()
 	rel := Releases{Download: srv.URL + "/download"}
 	done := make(chan error, 1)
-	go func() { done <- rel.Install(ctx, "v0.2.0", "amd64", path) }()
+	go func() { done <- rel.Install(ctx, "v0.2.0", "linux", "amd64", path) }()
 	if got := <-seen; got != "old binary" {
 		t.Fatalf("during the download the binary is %q, want the old one whole", got)
 	}
@@ -274,5 +276,19 @@ func TestRequestFile(t *testing.T) {
 	}
 	if got := ReadResult(path); got != "ok v0.4.0" {
 		t.Fatalf("ReadResult = %q, want ok v0.4.0", got)
+	}
+}
+
+// Asset names the binary by operating system and architecture, as the
+// release workflow does.
+func TestAsset(t *testing.T) {
+	for _, c := range []struct{ goos, goarch, want string }{
+		{"linux", "amd64", "fednet_v1.2.3_linux_amd64"},
+		{"linux", "arm64", "fednet_v1.2.3_linux_arm64"},
+		{"darwin", "arm64", "fednet_v1.2.3_darwin_arm64"},
+	} {
+		if got := Asset("v1.2.3", c.goos, c.goarch); got != c.want {
+			t.Errorf("Asset(%s, %s) = %q, want %q", c.goos, c.goarch, got, c.want)
+		}
 	}
 }

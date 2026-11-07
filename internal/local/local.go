@@ -18,6 +18,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -262,6 +263,21 @@ func (s *Socket) Close() error {
 }
 
 // listen creates the socket at path; the caller holds the lock.
+const (
+	tmpDirPrefix  = ".fednet-socket-"
+	tmpSocketName = "socket"
+	// maxTmpDirSuffix is the most digits os.MkdirTemp adds to the prefix.
+	maxTmpDirSuffix = 10
+)
+
+// BindPathLen is the length of the longest path Listen binds a socket
+// at, for a socket that ends up at path: not path itself, but the socket
+// it creates in a temporary directory next to it. It is what has to fit
+// the limit of the system on the length of a socket's path.
+func BindPathLen(path string) int {
+	return len(filepath.Join(filepath.Dir(path), tmpDirPrefix+strings.Repeat("0", maxTmpDirSuffix), tmpSocketName))
+}
+
 func listen(path string, mode os.FileMode, gid int) (net.Listener, error) {
 	if fi, err := os.Lstat(path); err == nil && fi.Mode().Type() != os.ModeSocket {
 		return nil, fmt.Errorf("local: %s exists and is not a socket", path)
@@ -271,12 +287,12 @@ func listen(path string, mode os.FileMode, gid int) (net.Listener, error) {
 	// The socket is created in a private directory and moved into place
 	// once its mode and group are set, so no one else can ever connect to
 	// it with the looser mode it is created with.
-	dir, err := os.MkdirTemp(filepath.Dir(path), ".fednet-socket-")
+	dir, err := os.MkdirTemp(filepath.Dir(path), tmpDirPrefix)
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(dir)
-	tmp := filepath.Join(dir, "socket")
+	tmp := filepath.Join(dir, tmpSocketName)
 	ln, err := net.Listen("unix", tmp)
 	if err != nil {
 		return nil, err

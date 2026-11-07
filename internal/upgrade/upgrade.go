@@ -2,7 +2,7 @@
 // client process never changes its own binary: it writes an upgrade
 // request, a file naming the release, and a root unit on the machine runs
 // `fednet upgrade`, which is Install here followed by a handoff: it
-// downloads the release's binary for this architecture and its SHA256SUMS,
+// downloads the release's binary for this platform and its SHA256SUMS,
 // checks the sum, puts the binary in place atomically, and hands the
 // running process off to it. Hub, in hub.go, decides when: on `/fednet
 // upgrade` in Slack and on its check for a new release every few
@@ -35,8 +35,10 @@ import (
 const Sums = "SHA256SUMS"
 
 // Asset is the name of the release asset holding the binary of version
-// for arch, a GOARCH such as amd64.
-func Asset(version, arch string) string { return "fednet_" + version + "_linux_" + arch }
+// for goos and goarch, such as linux and amd64.
+func Asset(version, goos, goarch string) string {
+	return "fednet_" + version + "_" + goos + "_" + goarch
+}
 
 // Limits on what is downloaded: a sums file is a few lines, a binary a
 // few tens of megabytes.
@@ -143,17 +145,17 @@ func (r Releases) sum(ctx context.Context, version, asset string) ([]byte, error
 // link to it next to path, for Restore.
 func Previous(path string) string { return path + ".prev" }
 
-// Install downloads the binary of version for arch and puts it at path,
+// Install downloads the binary of version for goos and goarch and puts it at path,
 // in place of what is there, once its SHA-256 matches the release's sums
 // file. The binary there before is kept at Previous(path). The file at
 // path is replaced in one rename, so a reader sees the old binary or the
 // new one, never a part; nothing is replaced when the sum does not match,
-// when the release has no binary for arch, or when the download fails.
-func (r Releases) Install(ctx context.Context, version, arch, path string) error {
+// when the release has no binary for them, or when the download fails.
+func (r Releases) Install(ctx context.Context, version, goos, goarch, path string) error {
 	if !release.IsRelease(version) {
 		return fmt.Errorf("upgrade: %q is not a release", version)
 	}
-	asset := Asset(version, arch)
+	asset := Asset(version, goos, goarch)
 	want, err := r.sum(ctx, version, asset)
 	if err != nil {
 		return fmt.Errorf("upgrade: %w", err)
