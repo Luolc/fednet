@@ -401,3 +401,32 @@ func TestPostDenied(t *testing.T) {
 		t.Fatalf("exit code = %d, want 3; stderr %q", code, stderr.String())
 	}
 }
+
+// A connection that has opened and sent nothing, such as a pooled
+// connection its client dialed ahead and never used, does not hold the
+// hub's shutdown up: the hub stops at once, with exit 0.
+func TestHubStopsWithAnUnusedConnection(t *testing.T) {
+	dir := t.TempDir()
+	var stdout, stderr syncBuffer
+	stopHub := start(t, []string{"hub", "-listen", "127.0.0.1:0", "-db", filepath.Join(dir, "hub.db")}, &stdout, &stderr)
+	var addr string
+	waitFor(t, "the hub to listen", func() bool {
+		m := listening.FindStringSubmatch(stdout.String())
+		if m != nil {
+			addr = m[1]
+		}
+		return m != nil
+	})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	began := time.Now()
+	if code := stopHub(); code != 0 {
+		t.Errorf("hub exited %d, stderr: %s", code, stderr.String())
+	}
+	if d := time.Since(began); d > 2*time.Second {
+		t.Errorf("the hub took %v to stop", d)
+	}
+}
